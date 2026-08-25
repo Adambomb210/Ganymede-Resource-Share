@@ -45,6 +45,10 @@ Everything else below is a gap to fill, not a mistake.
 | Storage | **Self-hosted, S3-compatible (MinIO)** on the coordinator VM, with R2 or S3 reachable by config change later. |
 | Run concurrency | **Sequential** for v1 — one active run at a time. Eligibility model written so concurrency is a later scheduling change, not a redesign. |
 | Fleet | Wide heterogeneity expected: Apple Silicon, 12 GB consumer cards, A100s. Handled as three tiers — see Architecture v2 §6.7. |
+| Compatibility | **A project goal** (§0). The worker is a package; the container is one delivery path. Linux, macOS, and Windows all supported natively. |
+| Base model | Latest **dense** Qwen in the 7–8B range. Not MoE — see roadmap open question 1. |
+| Data | Sensitivity **varies by run**; handled as a per-run classification gating eligibility (§6.9). |
+| v1 audience | Your group now, opening later — operator tooling, but install path and eligibility diagnostics kept honest from the start. |
 
 These are assumed throughout the revised architecture (`02-architecture-v2.md`).
 

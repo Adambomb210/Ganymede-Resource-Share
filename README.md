@@ -20,7 +20,7 @@ and disappear when it isn't.
 
 ## v1 scope
 
-- **Job type:** `llm_finetune` only — LoRA on a 7–8B base model
+- **Job type:** `llm_finetune` only — LoRA on a dense 7–8B Qwen base
 - **Sync:** central aggregation (weighted mean + DiLoCo outer step), behind a
   `SyncBackend` seam so peer-to-peer can be swapped in later
 - **Hosts:** own hardware first; donated and rented platform hosts behind the same
@@ -32,6 +32,8 @@ and disappear when it isn't.
   runs on almost any hardware; the container is one delivery path among several.
   Capabilities are probed, not enumerated, so unanticipated devices work without a
   coordinator change
+
+- **Data:** sensitivity varies by run; a per-run classification gates who is eligible
 
 **Platform compatibility and run eligibility are separate concerns.** A machine that
 can't serve a particular run still joins the fleet and waits for one that suits it.

@@ -145,8 +145,10 @@ Deliverables:
 
 Exit criteria:
 - One real GPU claims from a real coordinator, trains, submits, loops
-- **The same package runs natively on macOS/MPS and on Linux/CUDA**, registering with
-  a correct probe on both. The Mac need not be fast; it needs to be a real participant
+- **The same package runs natively on Linux/CUDA, macOS/MPS, and Windows/CUDA**,
+  registering with a correct probe on each. The Mac need not be fast; it needs to be a
+  real participant. Windows is where `nf4` availability is least predictable — the
+  §6.8 probe is what keeps that from becoming a support burden
 - The probe correctly reports a machine as ineligible (too little memory, no nf4)
   without failing registration (§6.8)
 - Read-only rootfs works with the declared writable mounts (expect to discover one or
@@ -162,15 +164,17 @@ Exit criteria:
 
 ## M3 — Host agent
 
-**~3 days** (was 2; a second OS means a second scheduler and a second install path).
+**~4 days** (was 2; three OSes means three schedulers, three install paths, and three
+idle probes).
 
 `IdleBackend` protocol with the `local` implementation (§7.1), manifest reconciliation,
 systemd timer + unit, the `/etc/ganymede/pause` kill switch.
 
 Deliverables:
 - `ganymede/host/` — agent, idle backends
-- `packaging/ganymede-host.service` + `.timer` (Linux)
+- `packaging/ganymede-host.service` + `.timer` (Linux systemd)
 - `packaging/com.ganymede.host.plist` (macOS launchd)
+- `packaging/ganymede-host-task.xml` (Windows Scheduled Task)
 - HF cache size cap with LRU eviction (§6.6) — many runs means many ~16 GB base
   models, and a disk that fills silently is a bad first experience for a volunteer
 - `INSTALL.md` — the contributor-facing document. This is the actual product surface
@@ -223,9 +227,17 @@ Per-round loss and per-contributor throughput surfaced on the read-only `/status
 page, coordinator alerting (round stalled, quorum missed repeatedly, gate rejection
 rate spiking), a runbook, and verified restore-from-backup.
 
+Scope note: v1 targets **your group now, opening later**. So this builds the operator
+view, not a contributor-facing product — no leaderboards, no public stats. The two
+things kept honest from the start, because they're what opening up later depends on,
+are the **install path** (M3's "second person installs unaided" test) and **eligibility
+diagnostics** — a contributor who never gets work must be able to find out why.
+
 Exit criteria:
 - You can answer "is it training, and who is contributing?" in one glance
 - You get alerted about a stalled run without having to look
+- A registered worker that is never leased can be told *why*: insufficient memory,
+  missing `nf4`, below the throughput floor, or clearance (§6.8, §6.9)
 - **A full restore has been performed at least once**, not merely configured: rebuild
   the coordinator from the off-box SQLite dump plus the latest round adapter, and
   resume the run. §6.4 names the shared VM as the system's single point of failure,
@@ -289,14 +301,30 @@ In rough order of when they'll start to hurt:
 
 Blocking or near-blocking. Rough order of urgency.
 
-1. **Base model and license.** Llama 3.1 8B, Qwen 2.5 7B, Mistral 7B? The license
-   governs whether you can redistribute merged weights or adapters to contributors,
-   which is an architectural constraint, not a legal footnote. *Needed for M0.*
+1. **Base model — Qwen, latest generation. Two things to settle at M0.**
 
-2. **The dataset.** What is it, how large, where does it live? Two things matter
-   beyond size: it must be shardable into ~1000 stable buckets, and **every worker
-   sees it in plaintext**. If any of it is sensitive, that changes the trust model
-   materially and pulls Phase 2 items forward. *Needed for M0.*
+   **Pick the newest dense Qwen in the 7–8B range** and confirm the exact model ID on
+   HuggingFace when you start M0 — the family moves quickly and my knowledge of what's
+   current has a cutoff. Apache 2.0 across most of the family is why this is the
+   cleanest choice for a project that ships adapters to many machines.
+
+   **Dense, not MoE — this one matters.** Recent Qwen generations include MoE variants,
+   and MoE interacts badly with DiLoCo-style averaging: which experts a worker trains
+   depends on how *its* data shard routes, so different workers update different
+   experts and averaging them is not the same operation it is for a dense model.
+   Router state adds a second divergence path. Treat MoE + collaborative averaging as
+   a research project, not a v1 default.
+
+   **Check the chat template before generating any SFT data.** Recent Qwen models use a
+   hybrid thinking/non-thinking template. Fine-tuning against the wrong template
+   degrades behavior in ways that don't show up in training loss — you see it only in
+   generation, which would silently invalidate M0's baseline. Verify it round-trips
+   first. *Needed for M0.*
+
+2. **The dataset(s).** What are they, how large, where do they live? Must shard into
+   ~1000 stable buckets. Sensitivity is now handled per-run by §6.9's classification,
+   so the remaining question is narrower: **which classification does the first run
+   get, and who holds `internal` / `restricted` clearance?** *Needed for M0.*
 
 3. ~~**Object store.**~~ **Resolved: self-hosted MinIO on the coordinator VM**, S3
    config in env vars so R2 is a later config swap (§6.5). Two follow-ons this raises:
@@ -324,5 +352,12 @@ Blocking or near-blocking. Rough order of urgency.
    running your own workload on a GPU listed for rent affect reliability or
    availability scoring on Vast/TensorDock? This determines whether the donated-host
    model works as designed (Review Finding M).
+
+8. **Contributor agreement.** §6.9 gates `internal` and `restricted` runs on clearance,
+   which implies contributors accept *something* before receiving non-public data. It
+   needn't be elaborate, but it needs to exist before the first non-`open` run, and
+   it's the natural place to also settle who owns the resulting adapters. Cheap now,
+   awkward once data has already moved. *Needed before the first `internal` run, not
+   for M0.*
 
 Items 1, 2, and 5 gate M0, which gates everything. They're worth settling first.
