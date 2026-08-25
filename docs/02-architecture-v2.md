@@ -10,6 +10,25 @@ summarized rather than restated.
 
 ---
 
+## 0. Goals
+
+Carried from v1 §1, with one addition made explicit:
+
+- One deployment story for contributors, regardless of what's being trained
+- Job configuration is data, not code — most changes require zero rebuilds
+- Container footprint stays small even as supported job types grow
+- Reuse existing open-source infrastructure rather than rebuilding distributed-systems
+  primitives
+- **Run on almost any hardware.** A contributor's machine should be able to join the
+  platform even when it can't serve every run. Platform compatibility and run
+  eligibility are separate concerns (§6.7, §6.8), and only the second is allowed to
+  exclude anyone.
+
+That last goal is why the worker is a package rather than a container (§4.1), and why
+capabilities are probed rather than enumerated (§6.8).
+
+---
+
 ## 1. What changed from v1
 
 | v1 | v2 | Why |
@@ -30,6 +49,8 @@ summarized rather than restated.
 | Uniform `local_steps_per_sync` | **Per-worker step budgets** sized to a common deadline | §3.4 |
 | (single run assumed) | Multi-run cache affinity + per-run calibration | §6.6 |
 | Uniform hardware assumed | **Three-tier heterogeneity model**; `compute_profile` eligibility | §6.7 |
+| Container = the worker | **Package = the worker**; container is one delivery path | §4.1 |
+| (absent) | Capability **probing** rather than hardware enumeration | §6.8 |
 
 ---
 
@@ -242,14 +263,27 @@ nvidia/cuda:12.4.1-runtime-ubuntu22.04
 PyTorch. Rebuild it deliberately and rarely; a silent PyTorch bump across a running
 swarm is a genuinely nasty class of bug.
 
-**`worker-core` is a pip-installable package; the image is a thin wrapper around it.**
-The container is a packaging choice, not the architecture. This keeps a native path
-open for platforms where containers can't reach the GPU — Apple Silicon, principally
-(§6.7) — at no cost today.
+#### The worker is a package; the image is one way to ship it
 
-The pinned-digest guarantee applies within a backend. A CUDA fleet shares one PyTorch
-build; a future native MPS worker necessarily won't, which is one more reason §6.7
-treats Apple Silicon as a separate platform rather than another GPU.
+**Broad hardware compatibility is a project goal** (§1), so the container is *a*
+packaging option rather than *the* architecture. `worker-core` is a pip-installable
+package, and every delivery path wraps the same code:
+
+| Host | Path | Isolation |
+|---|---|---|
+| Linux + NVIDIA, third-party host | Container | Full §4.5 hardening |
+| Linux + NVIDIA, own hardware | Container or `pip` + systemd | Contributor's choice |
+| macOS + Apple Silicon | `pip` + launchd (**no container** — §6.7) | OS-level only |
+| Windows + NVIDIA | WSL2 container, or `pip` | Varies |
+| Anything else | `pip` | OS-level only |
+
+The pinned-digest guarantee (above) applies *within* a backend. A CUDA container fleet
+shares one bit-identical PyTorch build; native installs necessarily won't. That is
+acceptable because §6.7 Tier 1 establishes that cross-hardware numerical differences
+don't meaningfully affect adapter averaging — but it does mean native installs should
+pin a **version range** in the package metadata and report the resolved version in
+their `compute_profile`, so a genuinely incompatible build is visible rather than
+silently averaged in.
 
 ### 4.2 Entrypoint loop
 
@@ -328,6 +362,16 @@ correctness path is abandon-and-exit.
   allowlist is two hosts — but keep them as separate config entries, or moving storage
   to R2 later becomes an edit to every contributor's firewall rules instead of one
   manifest field.
+
+**Isolation posture follows the packaging path**, and that's a deliberate trade rather
+than an oversight. A native `pip` install has none of the above — no container, no
+cap-drop, no read-only rootfs. That is acceptable when the person installing it owns
+the machine and has chosen to run your code; it is *not* acceptable on a third-party
+rented host, where the container path stays mandatory.
+
+So: **own hardware may install natively; donated and rented third-party hosts run the
+container.** Say this plainly in `INSTALL.md` rather than leaving contributors to
+infer it.
 
 Stronger sandboxing (gVisor/Kata) stays deferred to Phase 2 — but note it's the host
 that's being protected here, and every v1 host is either yours or a person you vouch
@@ -438,9 +482,11 @@ POST /v1/workers/register
      body { compute_profile, image_tag }
      → { worker_id, heartbeat_interval_sec }
 
-     compute_profile = { backend: "cuda" | "mps", device_name, vram_mb,
-                         compute_capability, driver, torch_ver,
-                         supports: ["bf16", "fp16", "nf4", "flash_attn"] }
+     compute_profile = { backend: "cuda" | "mps" | "rocm" | "cpu",
+                         device_name, vram_mb, compute_capability,
+                         driver, torch_ver, package_version,
+                         supports: ["bf16", "fp16", "nf4", "flash_attn"],
+                         probe: { alloc_max_mb, bench_score, probed_at } }
 
 POST /v1/tasks/claim
      body { worker_id, capabilities, cached_base_models: [...] }
@@ -476,6 +522,10 @@ work in seconds and starting it after a 16 GB download.
 what make §6.7's eligibility rules expressible: a run requiring `nf4` must not be
 offered to a worker that can't provide it, and silently falling back to a different
 precision would break §5.2's shared-frozen-base assumption without erroring.
+
+**`probe` is measured, not declared** — see §6.8. Given the goal of running on almost
+any hardware, the coordinator cannot hold a table of known devices; it has to accept
+what the worker demonstrates.
 
 ### 6.3 Auth (Finding F)
 
@@ -701,20 +751,58 @@ does not work on a Mac at all.**
   Max at 64 GB+ genuinely can hold it — but MPS training throughput is far below a
   comparable discrete GPU, so §3.4's floor may exclude it from larger runs anyway.
 
-**Recommendation: defer Mac support until after M4**, and be honest that its compute
-contribution will be modest. The argument for building it is social — people have
-Macs, and a contributor who can participate is a contributor — not throughput.
+**Apple Silicon is supported in v1, via the native package path** (§4.1). A Mac joins
+the platform, registers, probes, and appears in the fleet like anything else. It is
+simply ineligible for nf4 runs — which is the intended shape: *the platform is
+compatible; a given run may not be.*
 
-**But make one architectural decision now, because it's free now and expensive later:**
-`worker-core` is a **pip-installable Python package**, and the Docker image is a thin
-wrapper around it (§4.1). If the worker is written as "the container *is* the worker",
-Mac support means a rewrite. If it's a package, Mac support is `pip install` plus a
-launchd agent, sharing ~95% of the code.
+Two deliberate limits, worth stating so nobody is surprised:
 
-If Mac support later proves worth doing properly, the real path is **MLX** rather than
-PyTorch MPS — it's Apple's own framework and much better suited to training on this
-hardware. That means a second trainer implementation interoperating through
-safetensors, which is a genuine cost. Worth scoping deliberately, not drifting into.
+- **PyTorch MPS, not MLX, for v1.** MLX is Apple's own framework and is the genuinely
+  good path for training on this hardware, but it's a second trainer implementation
+  interoperating through safetensors — a real build. PyTorch MPS is slow and works,
+  which is what compatibility requires. Revisit MLX only if Mac *throughput* becomes
+  the point rather than Mac participation.
+- **Expect modest contribution.** An M2 Air won't clear §3.4's floor on an 8B run. An
+  M-series Max with 64 GB+ will participate in bf16 runs at a fraction of a discrete
+  GPU's rate. That's fine — it's a contributor who can participate.
+
+### 6.8 Capability probing, not hardware enumeration
+
+Supporting almost any hardware rules out the obvious implementation. The coordinator
+cannot keep a table mapping device names to capabilities — the table would be wrong
+the first time someone shows up with a card nobody anticipated, and the failure would
+be a silently-excluded contributor rather than a loud error.
+
+**So the worker measures and reports, and the coordinator believes it.** On
+registration, and whenever the package or driver changes, the worker runs a short
+self-test (target: under a minute):
+
+1. **Allocation ceiling** — how much device memory can actually be reserved. This is
+   the number that matters, not the spec-sheet figure: unified memory is shared with
+   the OS, and a desktop card may already be driving displays.
+2. **Precision support** — attempt a small bf16 matmul, an fp16 matmul, and an nf4
+   load. Record what genuinely worked rather than what the hardware theoretically
+   supports.
+3. **Benchmark score** — a fixed tiny transformer forward+backward at a set shape,
+   producing a normalized throughput number.
+
+That last item does real work for §3.4. It replaces "conservative default for an
+unseen GPU class" with an actual measurement, so a brand-new device gets a sensible
+step budget on its *first* round rather than after one wasted one.
+
+Consequences worth naming:
+
+- **Registration always succeeds.** A CPU-only machine, or a 6 GB card, registers
+  fine and simply never matches a run's requirements. Turning someone away at the door
+  is the wrong behavior for a platform whose goal is broad compatibility — and it
+  costs nothing to let them sit in the fleet until a run suits them.
+- **New hardware needs no coordinator change.** Someone appears with an Arc card or a
+  ROCm box; if the probe passes and the numbers are good, they're eligible. No
+  allowlist to update, no deploy.
+- **The probe is also the diagnostic.** When a contributor asks why they're never
+  getting work, the answer is in their stored profile: not enough memory, no nf4, or
+  below the floor. That is a far better support experience than silence.
 
 #### Why this raises the value of concurrent runs
 

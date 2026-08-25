@@ -28,9 +28,13 @@ and disappear when it isn't.
 - **Storage:** self-hosted, S3-compatible (MinIO), with Cloudflare R2 or S3 reachable
   by a config change rather than a rewrite
 - **Runs:** one active run at a time; concurrent runs deferred
-- **Fleet:** heterogeneous by design — per-worker step budgets absorb the speed
-  spread, and runs declare what hardware they require. Apple Silicon needs a native
-  worker and is deferred (containers on macOS can't reach the GPU)
+- **Fleet:** heterogeneous by design. The worker is a pip-installable package that
+  runs on almost any hardware; the container is one delivery path among several.
+  Capabilities are probed, not enumerated, so unanticipated devices work without a
+  coordinator change
+
+**Platform compatibility and run eligibility are separate concerns.** A machine that
+can't serve a particular run still joins the fleet and waits for one that suits it.
 - **Trust:** trusted circle, with safetensors-only artifacts and sanity gates on every
   submission
 

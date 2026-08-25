@@ -126,18 +126,29 @@ vastly faster than testing it against real GPUs.
 
 ## M2 — Worker container
 
-**~3–4 days.**
+**~4–5 days** (was 3–4; the native path and the probe are new scope).
 
-Image stack (§4.1), entrypoint loop (§4.2), SIGTERM/abandon (§4.4), isolation flags
-(§4.5). The trainer is M0's, unchanged.
+The worker **package** first, then the image around it (§4.1). Entrypoint loop (§4.2),
+SIGTERM/abandon (§4.4), capability probe (§6.8), isolation flags (§4.5). The trainer is
+M0's, unchanged.
+
+Broad hardware compatibility is a goal (§0), so this milestone delivers `pip install
+ganymede-worker` working standalone, with the container as a wrapper — not the other
+way round.
 
 Deliverables:
+- `ganymede/worker/` — loop, client, signals; installable as `ganymede-worker`
+- `ganymede/worker/probe.py` — the §6.8 self-test: allocation ceiling, precision
+  support, benchmark score. Backend-dispatched (cuda / mps / rocm / cpu)
 - `docker/torch-base.Dockerfile`, `worker-core.Dockerfile`, `worker-llm.Dockerfile`
-- `ganymede/worker/` — loop, client, GPU probe, signals
 - CI that builds and pushes all three, pinning `torch-base` **by digest**
 
 Exit criteria:
 - One real GPU claims from a real coordinator, trains, submits, loops
+- **The same package runs natively on macOS/MPS and on Linux/CUDA**, registering with
+  a correct probe on both. The Mac need not be fast; it needs to be a real participant
+- The probe correctly reports a machine as ineligible (too little memory, no nf4)
+  without failing registration (§6.8)
 - Read-only rootfs works with the declared writable mounts (expect to discover one or
   two more cache paths here — that's normal, add them explicitly rather than
   reverting to a writable rootfs)
@@ -151,14 +162,15 @@ Exit criteria:
 
 ## M3 — Host agent
 
-**~2 days.**
+**~3 days** (was 2; a second OS means a second scheduler and a second install path).
 
 `IdleBackend` protocol with the `local` implementation (§7.1), manifest reconciliation,
 systemd timer + unit, the `/etc/ganymede/pause` kill switch.
 
 Deliverables:
 - `ganymede/host/` — agent, idle backends
-- `packaging/ganymede-host.service` + `.timer`
+- `packaging/ganymede-host.service` + `.timer` (Linux)
+- `packaging/com.ganymede.host.plist` (macOS launchd)
 - HF cache size cap with LRU eviction (§6.6) — many runs means many ~16 GB base
   models, and a disk that fills silently is a bad first experience for a volunteer
 - `INSTALL.md` — the contributor-facing document. This is the actual product surface
@@ -253,12 +265,10 @@ In rough order of when they'll start to hurt:
    bf16 8B run idles every 3060. Needs run selection, priority, and starvation
    handling in claim. The eligibility model is already written so this is a
    scheduling change, not a redesign.
-3. **Apple Silicon native worker.** Containers on macOS cannot reach the GPU, so this
-   is a native `pip install` + launchd path, not a new image (§6.7). Cheap *because*
-   `worker-core` is a package from day one; still a real build, and honestly a modest
-   throughput contribution. Doing it properly likely means MLX rather than PyTorch
-   MPS — a second trainer implementation interoperating via safetensors. Scope it
-   deliberately.
+3. **MLX trainer for Apple Silicon.** Macs participate from v1 via PyTorch MPS
+   (§6.7) — slow but real. MLX is the fast path and a second trainer implementation
+   interoperating via safetensors. Only worth it if Mac *throughput* becomes the
+   point rather than Mac participation.
 4. **`vast` / `tensordock` `IdleBackend`s** — needed when you move past own hardware.
    Small, given M3's interface. Verify the platform-policy question first (§7).
 5. **Postgres migration** — when workers exceed a few hundred (§6.1).
