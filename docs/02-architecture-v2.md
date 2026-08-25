@@ -46,6 +46,7 @@ capabilities are probed rather than enumerated (§6.9).
 | (absent) | Dataset bucket sharding | Finding I |
 | (absent) | Pinned `base_precision` | Finding J |
 | (absent) | Bearer auth | Finding F |
+| Worker-count quorum | **Work-based round close**, robust to unscheduled fleets | §3.2 |
 | Uniform `local_steps_per_sync` | **Per-worker step budgets** sized to a common deadline | §3.4 |
 | (single run assumed) | Multi-run cache affinity + per-run calibration | §6.7 |
 | Uniform hardware assumed | **Three-tier heterogeneity model**; `compute_profile` eligibility | §6.8 |
@@ -123,8 +124,8 @@ local step budget.
       ┌─────────────────────────────────────────────────────┐
       │                                                     │
       ▼                                                     │
- ┌─────────┐  quorum met OR    ┌─────────────┐  gates+   ┌──┴────────┐
- │  OPEN   │  deadline+≥1 sub  │ AGGREGATING │  outer    │  CLOSED   │
+ ┌─────────┐  Σsteps ≥ target  ┌─────────────┐  gates+   ┌──┴────────┐
+ │  OPEN   │  OR backstop+≥1   │ AGGREGATING │  outer    │  CLOSED   │
  │         │──────────────────►│             │  step     │  round N  │
  │ round N │                   │  round N    │──────────►│  result   │
  └─────────┘                   └─────────────┘           └───────────┘
@@ -145,12 +146,81 @@ local step budget.
 3. A worker fetches the base adapter, trains its buckets for `local_steps` (or until
    `max_runtime_sec`, whichever first), uploads a safetensors adapter via presigned
    PUT, and submits the reference plus metrics.
-4. The round closes when `submissions ≥ quorum_min`, or when the deadline passes with
-   at least one submission. A submission arriving after close gets `409 Conflict`
-   carrying the current round number; the worker re-claims into it and moves on.
+4. The round closes on **accumulated work**, not on a worker count — see §3.2. A
+   submission arriving after close gets `409 Conflict` carrying the current round
+   number; the worker re-claims into it and moves on.
 5. Aggregation runs (§5). The result becomes round N+1's base.
 
-### 3.2 Why this solves several problems at once
+### 3.2 Closing a round when availability is unpredictable
+
+Contributor machines come and go without a schedule. Nobody can say in advance whether
+two or eight will be up. That rules out the obvious close condition — a fixed worker
+quorum — because any value you pick is wrong most of the time: too high and the round
+never closes, too low and it fires on the first submission, which defeats the point.
+
+**So the round closes on accumulated work, not on how many machines showed up:**
+
+```
+close round N when:
+     Σ steps_completed ≥ round_target_steps   AND   elapsed ≥ min_round_sec
+  OR elapsed ≥ max_round_sec                  AND   submissions ≥ 1
+```
+
+- **`round_target_steps`** is the real trigger. What matters for aggregation quality
+  is total work across distinct shards, not the number of distinct machines: two
+  workers doing 500 steps each is roughly two doing 250 plus two more doing 250. This
+  degrades smoothly at *any* fleet size — eight machines close the round quickly, two
+  take longer and still get there.
+- **`min_round_sec`** stops a large fleet from churning through rounds faster than
+  aggregation overhead can justify.
+- **`max_round_sec`** is a backstop, not the primary mechanism. Set it generously.
+
+Zero submissions at the backstop simply reopens the round with a fresh deadline.
+Nothing is lost and nothing degrades — an idle fleet means the run pauses, which is
+the correct behavior, not an error. **Do not alert on it**; with a volatile fleet it
+is the normal overnight state.
+
+#### Single-contributor rounds: accept, but surface
+
+Nothing above prevents one machine from supplying all of `round_target_steps` while
+everyone else is offline. That round is not *wrong* — with outer momentum it behaves
+like an ordinary training step — but it is single-node training paying distributed
+overhead.
+
+Blocking it would stall the run for no benefit, so accept it and **record the distinct
+contributor count per round**. If most rounds are closing with one contributor, the
+system isn't earning its complexity, and that should be visible in `/status` rather
+than inferred months later. It's a health metric, not an error condition.
+
+#### Claim against time remaining, not a full round
+
+A machine that is up for twenty minutes should still contribute. If step budgets
+(§3.5) are always sized to a *full* round, a worker joining mid-round gets work it
+cannot finish, and the round closes underneath it — its effort wasted entirely.
+
+So budget from **time remaining in the current round**:
+
+```
+local_steps_i = throughput_i × minutes_remaining × safety_factor
+```
+
+with a cutoff: if less than ~5 minutes remain, return `204` with a `Retry-After`
+pointing past the round boundary rather than handing out work that can't land. This
+makes opportunistic, short-lived participation productive, which matters much more when
+machines appear at random than when they're on a schedule.
+
+#### Volatility argues for shorter rounds
+
+§3.4's 30–45 minute target assumes reasonably stable hosts. A volatile fleet inverts
+the trade: shorter rounds mean more chances to contribute and less work lost when a
+machine disappears mid-round.
+
+Start nearer **15–20 minutes**. The cost of shorter rounds is aggregation overhead and
+more artifact round-trips — and at bring-up scale a 1.7B LoRA adapter is only ~10–15 MB,
+so that cost is negligible. Revisit when scaling to 8B, where adapters are ~85 MB and
+round-trip overhead starts to matter.
+
+### 3.3 Why this solves several problems at once
 
 - **Averaging is well-defined.** Every contribution to round N provably started from
   the same weights.
@@ -159,19 +229,23 @@ local step budget.
   an architecture change" becomes: start a new run. No coordination ritual.
 - **Stragglers degrade gracefully.** Weighting by steps actually completed (§5) means
   a slow worker contributes proportionally less rather than blocking or corrupting.
+- **Fleet size is irrelevant to correctness.** Because closing is work-based (§3.2),
+  the same run behaves sensibly with two machines or twenty, which is required when
+  nobody can say which will be up.
 - **Preemption costs exactly one round.** Which is why round sizing is a safety
   parameter, not just a tuning knob (§3.3).
 
-### 3.3 Round sizing
+### 3.4 Round sizing
 
-Target **30–45 minutes of work per round** on the slowest supported GPU.
+Target **15–20 minutes** for a volatile fleet (§3.2), extending toward 30–45 only if
+hosts turn out to be stable and adapters get large.
 
 - Too long: a flaky host may be preempted before it ever completes a round, so it
   contributes nothing, ever.
 - Too short: aggregation overhead and the ~170 MB per-worker round trip dominate the
   useful compute.
 
-### 3.4 Per-worker step budgets
+### 3.5 Per-worker step budgets
 
 Uniform `local_steps` across heterogeneous hardware means the slowest card sets the
 deadline for everyone. A 3090 paired with a 4090 straggles every round, and either
@@ -185,7 +259,8 @@ local_steps_i = throughput_i × target_round_minutes × safety_factor
 ```
 
 Everyone finishes near the same deadline, and §5.2's weighting by steps actually
-completed then reflects real contribution rather than hardware luck.
+completed then reflects real contribution rather than hardware luck. Note the input is
+*minutes remaining in the round*, not full round duration — §3.2.
 
 `throughput_i` comes from three places, in order of preference:
 
@@ -457,15 +532,17 @@ FastAPI + SQLite on one small VM. No GPU.
 ```
 contributors  id, name, key_hash, enabled, clearance, created_at  -- §6.10
 workers       id, contributor_id, compute_profile_json, image_tag,
-              first_seen, last_seen                                   -- §6.8
+              first_seen, last_seen, rounds_joined, steps_total       -- §6.8
+              -- availability is measured here, never declared up-front
 runs          id, status, base_model, base_precision, lora_cfg_json,
               dataset_ref, hyperparams_json, current_round, target_rounds,
               outer_momentum_ref, requires_json, data_classification,
               created_at
               -- requires_json: { backend, min_vram_mb, needs: [...] }  §6.7
               -- data_classification: open | internal | restricted     §6.9
-rounds        run_id, idx, base_adapter_ref, status, quorum_min, deadline_at,
-              opened_at, closed_at, result_adapter_ref, mean_loss
+rounds        run_id, idx, base_adapter_ref, status, target_steps,
+              min_round_sec, max_round_sec, opened_at, closed_at,
+              result_adapter_ref, mean_loss, distinct_contributors   -- §3.2
 tasks         id, run_id, round_idx, buckets_json, local_steps, status,
               worker_id, lease_expires_at, attempts, created_at
 submissions   task_id, artifact_ref, steps_completed, tokens_seen,
@@ -553,7 +630,7 @@ what the worker demonstrates.
 |---|---|
 | Worker preempted mid-round | Lease expires or is abandoned; shard re-leased. Lost: that worker's steps this round (≤ ~45 min by §3.3) |
 | Worker submits garbage | Rejected by §5.1 gates, recorded, round proceeds with remaining submissions |
-| Round misses quorum | Closes on deadline with ≥1 submission. Zero submissions → round reopens with a fresh deadline |
+| Round misses its step target | Closes at `max_round_sec` with ≥1 submission. Zero submissions → reopens quietly with a fresh deadline; an idle fleet is normal, not an error (§3.2) |
 | Coordinator down | No claims, no submissions, no aggregation. In-flight workers finish, fail to submit, retry with backoff. **Nothing is lost that was already submitted** |
 | Artifact store down | Same as coordinator down, from the worker's side. In v1 they share a VM, so in practice these fail together |
 | Coordinator VM lost | **The failure that matters.** In v1 the database and every checkpoint are on one machine, so this loses both unless backups are genuinely off-box. See §6.6 — separate volume, off-box SQLite dump each round close, off-box copy of the latest round adapter |

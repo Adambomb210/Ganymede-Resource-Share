@@ -118,12 +118,20 @@ means your plumbing is wrong rather than your data. All of these are `open` clas
 **Verify the current licence on each dataset card before use** — these change, and
 this table is a starting point rather than an authority.
 
-**Suggested pairing:**
+**Decided:**
 
-- **M0–M2 smoke tests:** Qwen 1.7B + Dolly 15k. Fast, tiny, everything fits.
-- **M4 convergence test:** Qwen 1.7B (or 4B) + UltraChat 200k. Enough data for real
-  sharding across many rounds, still fast enough to iterate.
-- **First real run:** your dataset, 8B, whichever classification it warrants.
+- **Bring-up (M0–M4): Qwen 1.7B (dense, bf16) + Dolly 15k.** Confirm the exact model
+  ID at M0. No `nf4` anywhere in the bring-up path, so every contributor — Macs and
+  3060s included — is eligible from the first run.
+- **Buckets: 64** for Dolly (~230 samples each), per the sizing rule below.
+- **Later:** scale to 7–8B and your own dataset, as a run-config change.
+
+One caveat on Dolly worth knowing at M4: at 15k samples a round of any real size
+covers a meaningful fraction of the set, so workers will repeat data across rounds
+sooner than they would on a larger corpus. That's fine for proving the *machinery* —
+it just means Dolly measures whether aggregation works, not how far the model can get.
+If M4's convergence result looks suspiciously flat, dataset exhaustion is the first
+thing to check, and swapping to UltraChat 200k is the test.
 
 ### Bucket count should scale with dataset size
 
@@ -170,7 +178,7 @@ Deliverables:
 - `scripts/gc.py` — drop worker submissions older than 3 closed rounds
 - `scripts/newrun.py`, `scripts/issue-key.py` — admin CLI
 - Test suite with a **fake worker**: concurrent claims, lease expiry, late submission,
-  gate rejection, quorum-vs-deadline close, zero-submission reopen
+  gate rejection, work-target-vs-backstop close, zero-submission reopen
 
 Exit criteria:
 - N fake workers concurrently claim, train (with stub adapters), and submit; rounds
@@ -180,6 +188,9 @@ Exit criteria:
 - A NaN adapter, a wrong-shape adapter, and a pickle file are each rejected with the
   right reason
 - Killing the coordinator mid-round loses nothing already submitted
+- A round closes on accumulated steps with 1, 2, and 8 fake workers — same run config,
+  no quorum retuning (§3.2). With zero workers it reopens quietly and does not alert
+- A worker claiming with 3 minutes left in a round gets `204`, not unfinishable work
 - Two fake workers with 3× different throughput both finish a round near the deadline,
   receive bucket counts scaled to their budgets, and are weighted by actual steps (§3.4)
 - A run requiring `nf4` is never offered to a worker whose profile lacks it, and a
@@ -295,8 +306,11 @@ outcome, not a signal to abandon the approach.
 **~2 days.**
 
 Per-round loss and per-contributor throughput surfaced on the read-only `/status`
-page, coordinator alerting (round stalled, quorum missed repeatedly, gate rejection
-rate spiking), a runbook, and verified restore-from-backup.
+page, coordinator alerting (gate rejection rate spiking, no submissions accepted in
+N rounds despite workers being active), a runbook, and verified restore-from-backup.
+
+Alert on *broken*, not on *idle* — with an unscheduled fleet, "no workers right now"
+is the normal overnight state and paging on it trains you to ignore the alerts (§3.2).
 
 Scope note: v1 targets **your group now, opening later**. So this builds the operator
 view, not a contributor-facing product — no leaderboards, no public stats. The two
@@ -309,6 +323,9 @@ Exit criteria:
 - You get alerted about a stalled run without having to look
 - A registered worker that is never leased can be told *why*: insufficient memory,
   missing `nf4`, below the throughput floor, or clearance (§6.9, §6.10)
+- **Distinct contributors per round is visible** (§3.2). If most rounds are closing
+  with one machine, the swarm isn't earning its overhead — that should be a number you
+  can see, not something you infer months later
 - **A full restore has been performed at least once**, not merely configured: rebuild
   the coordinator from the off-box SQLite dump plus the latest round adapter, and
   resume the run. §6.4 names the shared VM as the system's single point of failure,
@@ -420,14 +437,19 @@ Blocking or near-blocking. Rough order of urgency.
    | OS | Picks the packaging path — container, launchd, or Scheduled Task (§4.1) |
    | GPU / chip | With Apple Silicon, the chip variant matters (Air vs Max) |
    | VRAM or unified RAM | The main eligibility gate (§6.8 Tier 2) |
-   | Typical availability | Always-on, nights only, occasional? Sets round deadlines and quorum |
+   | ~~Typical availability~~ | **Don't bother** — no reliable schedule exists. The coordinator measures participation instead (§3.2, §6.1) |
    | Upload bandwidth | An 85 MB adapter on a 1 Mbit/s uplink is 11 minutes of a 35-minute round — that machine needs longer rounds or a smaller model |
    | Who administers it | Decides `restricted`-run eligibility (§6.10) |
 
    Three eligible machines is the minimum for a meaningful M4 — and note "eligible"
    is per-run, so the count that matters is how many clear the bar for *that* run.
    Upload bandwidth is the field people forget and the one that quietly wrecks round
-   pacing. *Needed for M3/M4.*
+   pacing.
+
+   **Availability is deliberately absent.** Machines come and go unscheduled, so the
+   design treats fleet size as unknown at all times (§3.2) rather than planning around
+   a roster. The coordinator measures who actually showed up; you don't predict it.
+   *Needed for M3/M4.*
 
 7. **Platform policy check** (deferrable to Phase 2, but cheap to do early): does
    running your own workload on a GPU listed for rent affect reliability or
