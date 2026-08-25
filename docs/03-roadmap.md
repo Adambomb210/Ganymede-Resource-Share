@@ -9,36 +9,68 @@ questions in §7 are answered. They are for sequencing, not for promising dates.
 
 ---
 
-## M0 — Single-node training, no infrastructure
+## M0 — Trainer + calibration harness
 
-**~2–3 days. The most important milestone. Do not skip or compress it.**
+**~2–3 days, of which the trainer is most of it and is unskippable regardless.**
 
-One script, one GPU, no coordinator, no Docker, no network:
+Because Ganymede will run **many** models and fine-tunes rather than one, this
+milestone is not a one-time gate you pass and forget. Nearly everything in it is
+per-run work that recurs on every new base model, dataset, or hardware mix. So it gets
+built as **a tool you run per run**, not a script you run once.
+
+That reframing is what makes it cheap. The alternative — measuring throughput and
+baselines by hand each time — is the thing that doesn't scale to a lot of models.
+
+### What's in it
+
+**1. The trainer.** Not skippable under any plan: the worker has to call *something*,
+and §4.3's `run_task` is that something. If you already have a working fine-tuning
+setup, this is a **port into the `run_task` shape**, not a discovery exercise — pull
+the loop in, make it stop cleanly at N steps, and emit safetensors.
+
+**2. The calibration harness** — the part that pays for itself once there are many
+runs. One command against a run config, on one GPU:
 
 ```
-train_task.py --task task.json --base-adapter in.safetensors --out out.safetensors
+ganymede-calibrate --run-config run.json --gpu-class 4090
+  → fits: {bf16: false, nf4: true}   max_seq_len at each
+  → throughput: 4.1 steps/min, 6.2k tok/s
+  → recommended local_steps: 143  (for a 35-min round)
+  → baseline: eval_loss 1.84 after 2000 steps
 ```
 
-This is exactly the §4.3 trainer, driven by a hand-written task spec file. It is the
-same code path the worker will call — not a throwaway prototype.
+Its output is a `calibration.json` the coordinator stores alongside the run. It feeds
+three things directly:
 
-Deliverables:
-- `ganymede/train/lora.py` — the ~250-line trainer
-- `ganymede/train/data.py` — bucket sharding, deterministic given `(seed, buckets)`
-- A held-out eval set and a `baseline.json` recording single-node loss/metrics
+- **Round sizing** (§3.3) — per-worker step budgets, so a 3090 and a 4090 in the same
+  round both finish near the deadline instead of the 3090 straggling every time
+- **Capability filtering** (§6.2) — which GPUs are eligible for this run at all
+- **The M4 comparison** — the single-node number the distributed run must beat
 
-Exit criteria:
-- Trains, loss descends, adapter saves and reloads as safetensors
-- Fits the target 24 GB card at the chosen `base_precision` with headroom
-- **Measured throughput (steps/min, tokens/s) recorded** — this is what sets
-  `local_steps_per_sync` for §3.3, and guessing it instead is how you end up with
-  6-hour rounds nobody ever completes
-- **A single-node baseline result exists.** Without it, M4 cannot tell whether
-  distribution helped, hurt, or did nothing
+**3. The baseline.** One held-out eval set and a recorded single-node result per run.
 
-Why this dominates everything: if 8B LoRA doesn't fit comfortably, or throughput makes
-30-minute rounds impractical, that invalidates round sizing, bandwidth estimates, and
-possibly the model choice. Find out with one script, not with a deployed swarm.
+### Exit criteria
+
+- Trainer runs, loss descends, adapter round-trips through safetensors
+- `ganymede-calibrate` produces a valid `calibration.json` for the first run config
+- The run fits the target card at the chosen `base_precision`, with headroom
+- A single-node `baseline.json` exists for that run
+
+### Why the baseline can't be dropped
+
+This is the one part with no substitute, and *many models* is what makes it
+non-negotiable rather than optional.
+
+A distributed run that is quietly **worse than one GPU** looks exactly like one that's
+working. The loss curve descends in both cases. Nothing errors. You find out months
+later, or never. The §5.2 research risk — DiLoCo's outer step is characterized over
+full-parameter training, not LoRA adapters — means this is a live possibility, not a
+hypothetical.
+
+One un-baselined run is a gamble you might get away with. Twenty of them is a
+platform whose output nobody can trust and nobody can debug, because there is no
+reference point to debug against. The habit is cheap; acquiring it after the fact
+means re-running everything.
 
 ---
 
@@ -60,6 +92,8 @@ Deliverables:
   and DiLoCo outer momentum), selectable per run — M4 needs to A/B them
 - `ganymede/coordinator/store.py` — thin S3 wrapper, `boto3` with `endpoint_url` from
   env. Restricted to the portable API subset in §6.5
+- `ganymede/coordinator/budget.py` — per-worker step budgets from observed and
+  calibrated throughput (§3.4), plus cache-affinity run selection (§6.6)
 - `deploy/` — MinIO service unit, reverse proxy + TLS config, separate volume mount
 - `scripts/backup.py` — off-box SQLite dump + latest-adapter copy, on round close
 - `scripts/gc.py` — drop worker submissions older than 3 closed rounds
@@ -75,6 +109,8 @@ Exit criteria:
 - A NaN adapter, a wrong-shape adapter, and a pickle file are each rejected with the
   right reason
 - Killing the coordinator mid-round loses nothing already submitted
+- Two fake workers with 3× different throughput both finish a round near the deadline,
+  and the aggregate weights them by actual steps (§3.4)
 - **A presigned URL minted by the coordinator is fetchable by an external client**
   over the public hostname. This is the §6.5 signing footgun; catch it here, with one
   integration test, rather than in M2 against a real GPU
@@ -121,6 +157,8 @@ systemd timer + unit, the `/etc/ganymede/pause` kill switch.
 Deliverables:
 - `ganymede/host/` — agent, idle backends
 - `packaging/ganymede-host.service` + `.timer`
+- HF cache size cap with LRU eviction (§6.6) — many runs means many ~16 GB base
+  models, and a disk that fills silently is a bad first experience for a volunteer
 - `INSTALL.md` — the contributor-facing document. This is the actual product surface
   for everyone who isn't you; treat it as a deliverable, not an afterthought
 
@@ -130,6 +168,8 @@ Exit criteria:
 - Manifest tag bump → agent pulls and restarts on the new tag with no manual step
 - **A second person installs it from `INSTALL.md` alone, with no help from you.** That
   test is the milestone; a working agent that only you can install isn't done
+- `INSTALL.md` states a minimum free-disk figure, and cache eviction demonstrably
+  holds the cache under its cap across two runs with different base models
 
 ---
 
@@ -149,6 +189,8 @@ Exit criteria:
   negative result
 - A worker killed mid-round costs one round and nothing else
 - Per-round loss curve is visible and smooth; no divergence, no silent degradation
+- Mixed-speed workers (at least two GPU classes) both land near the round deadline,
+  confirming §3.4's budgets rather than truncating the slower card every round
 
 Everything before this is plumbing. This is where you find out whether the idea works.
 Budget for it to fail the first time and need a tuning pass — that is the normal
@@ -186,6 +228,9 @@ M0 ─────────► M2 ─┐
 
 M1 depends on M0 only for the LoRA config shape (needed by the acceptance gates), so
 the two tracks can overlap if there's a second person. M4 needs all four.
+
+If you already have a fine-tuning pipeline to port, M0's trainer is a day rather than
+two, and the calibration harness is the only genuinely new build.
 
 Solo and sequential: roughly **16–20 focused days** to M4, plus training wall-clock.
 

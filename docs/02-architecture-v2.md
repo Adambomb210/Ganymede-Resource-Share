@@ -27,6 +27,8 @@ summarized rather than restated.
 | (absent) | Dataset bucket sharding | Finding I |
 | (absent) | Pinned `base_precision` | Finding J |
 | (absent) | Bearer auth | Finding F |
+| Uniform `local_steps_per_sync` | **Per-worker step budgets** sized to a common deadline | §3.4 |
+| (single run assumed) | Multi-run cache affinity + per-run calibration | §6.6 |
 
 ---
 
@@ -146,8 +148,37 @@ Target **30–45 minutes of work per round** on the slowest supported GPU.
 - Too short: aggregation overhead and the ~170 MB per-worker round trip dominate the
   useful compute.
 
-`local_steps_per_sync` should be derived from measured throughput during M0 (see
-`03-roadmap.md`), not guessed. Recalibrate when the slowest supported card changes.
+### 3.4 Per-worker step budgets
+
+Uniform `local_steps` across heterogeneous hardware means the slowest card sets the
+deadline for everyone. A 3090 paired with a 4090 straggles every round, and either
+blocks the close or gets truncated — wasting a fraction of its work each time,
+forever.
+
+Instead, **fix the round deadline and vary the step budget per worker**:
+
+```
+local_steps_i = throughput_i × target_round_minutes × safety_factor
+```
+
+Everyone finishes near the same deadline, and §5.2's weighting by steps actually
+completed then reflects real contribution rather than hardware luck.
+
+`throughput_i` comes from three places, in order of preference:
+
+1. **Measured** — the coordinator stores observed steps/min per `(run, gpu_model)`
+   from submitted metrics, and uses it for subsequent assignments
+2. **Calibrated** — `calibration.json` for the run, produced in M0 (see
+   `03-roadmap.md`), keyed by GPU class
+3. **Conservative default** — first ever worker of an unseen GPU class on an
+   uncalibrated run; deliberately low, corrected after one round
+
+`max_runtime_sec` becomes a safety net against a wedged worker rather than the primary
+control.
+
+This matters more as the number of runs grows: a 3B and a 70B fine-tune need step
+budgets an order of magnitude apart, and hand-setting `local_steps_per_sync` per run
+is exactly the kind of manual step that stops scaling once there are many runs.
 
 ---
 
@@ -336,6 +367,8 @@ tasks         id, run_id, round_idx, buckets_json, local_steps, status,
 submissions   task_id, artifact_ref, steps_completed, tokens_seen,
               metrics_json, accepted, reject_reason, received_at
 buckets       run_id, bucket_idx, times_trained, last_round
+throughput    run_id, gpu_model, steps_per_min, samples, updated_at   -- §3.4
+calibration   run_id, calibration_json, created_at                    -- §6.6, M0
 ```
 
 **Concurrency (Finding L2):** WAL mode, and every claim wrapped in `BEGIN IMMEDIATE`
@@ -355,7 +388,7 @@ POST /v1/workers/register
      → { worker_id, heartbeat_interval_sec }
 
 POST /v1/tasks/claim
-     body { worker_id, capabilities }
+     body { worker_id, capabilities, cached_base_models: [...] }
      → 200 { task spec — §8 }
      | 204 No Content + Retry-After   (no eligible work)
 
@@ -378,6 +411,11 @@ GET  /healthz    GET /metrics     GET /status   (read-only HTML)
 Differences from v1 §4.3: capability-aware claim (L3), explicit `204` for no work
 (L4), `409` vs `410` distinguished, `upload-url` and `abandon` added, artifact bytes
 gone from every request body.
+
+`cached_base_models` exists because base models are ~16 GB each and Ganymede will run
+many of them (§6.6). Given two eligible runs, the coordinator should prefer the one
+whose base model the worker already holds — that's the difference between starting
+work in seconds and starting it after a 16 GB download.
 
 ### 6.3 Auth (Finding F)
 
@@ -521,6 +559,32 @@ So the rule for v1 is stricter than it was:
 Off-box means a different machine, not a different directory. That distinction is the
 entire value of the item.
 
+### 6.6 Running many models
+
+Ganymede is intended to carry a lot of runs over time, not one. Three consequences
+that don't exist with a single run:
+
+**Base-model cache pressure on contributors.** Each base model is ~16 GB in the
+host-persistent HF cache (§4.1). Ten runs across five base models means a contributor's
+disk fills quietly until something breaks at an unhelpful moment. Required:
+
+- A cache size cap with LRU eviction, configured host-side and defaulting to something
+  conservative
+- A stated **minimum free disk** in `INSTALL.md` — the contributor-facing number, and
+  the one people will actually check before volunteering a machine
+- Workers report `cached_base_models` on claim (§6.2) so the coordinator can prefer
+  work they can start immediately
+
+**Cache affinity beats naive scheduling.** Handing a worker a run whose base model it
+lacks costs a 16 GB pull before any useful work happens — potentially longer than the
+round itself. Prefer cached matches; fall back to a cold pull only when there's no
+cached work available, or when a run would otherwise starve.
+
+**Calibration is per-run, not global.** Round sizing, GPU eligibility, and the M4
+comparison all depend on the specific base model, precision, sequence length, and LoRA
+config. §3.4's step budgets read from a per-run `calibration.json`, which is why M0
+builds calibration as a repeatable command rather than a one-time measurement.
+
 ---
 
 ## 7. Host agent
@@ -595,8 +659,8 @@ GPU affects platform reliability scoring (Review Finding M).
     "seed": 20260825
   },
 
-  "local_steps": 250,
-  "max_runtime_sec": 2700,
+  "local_steps": 250,          // derived per-worker from throughput — §3.4
+  "max_runtime_sec": 2700,     // safety net, not the primary control
   "heartbeat_interval_sec": 60,
   "lease_seconds": 3600
 }
@@ -604,7 +668,8 @@ GPU affects platform reliability scoring (Review Finding M).
 
 Changes from v1 §5: round binding, bucket sharding (I), pinned `base_precision` (J),
 explicit `lora_cfg` (needed by the §5.1 shape gate), presigned base adapter URL, seed
-(L6), lease and heartbeat intervals (L1).
+(L6), lease and heartbeat intervals (L1), and a per-worker `local_steps` budget rather
+than a run-wide constant (§3.4).
 
 **Still true, and still the point:** everything here except `required_image` is
 mutable without a rebuild. v1 §8's change-management table holds unchanged — with the
