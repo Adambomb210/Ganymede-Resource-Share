@@ -74,13 +74,84 @@ means re-running everything.
 
 ---
 
+## Bring-up model and dataset
+
+**Separate the model you're proving the system with from the model you actually want
+to train.** Using your real target data for M0–M4 conflates two failure modes that
+look identical from the outside: "the infrastructure is broken" and "this fine-tune
+doesn't work." You want to eliminate the first before investigating the second.
+
+### Model: start much smaller than 8B
+
+**Bring up on a ~1.5–4B dense Qwen in bf16, then scale to 8B once M4 passes.**
+
+This is worth more than it sounds:
+
+- **No `nf4` needed.** A 1.7B model in bf16 is ~3.4 GB of weights — it fits a 12 GB
+  3060 and a 16 GB Mac comfortably. That removes the entire nf4/MPS exclusion problem
+  (§6.8 Tier 3) during bring-up, so **every contributor is eligible for the bring-up
+  run**, including the Macs.
+- **You exercise the heterogeneity paths early**, which is where the interesting bugs
+  are. On an 8B nf4 run the Macs sit idle and you'd find their bugs months later.
+- **Rounds are minutes, not hours.** You can iterate the whole pipeline several times
+  a day instead of once. Use ~10-minute rounds for bring-up rather than §3.3's 30–45.
+- **Adapters are ~10–15 MB**, so the storage and bandwidth plumbing gets tested
+  without waiting on transfers.
+
+Then scale: same code, new run, `base_model` and `base_precision` changed in the run
+config. That's the whole point of config-over-code, and scaling the model is a good
+first proof that the property actually holds.
+
+### Dataset: public and permissive for bring-up
+
+You want something well-understood with a known-good outcome, so that a bad result
+means your plumbing is wrong rather than your data. All of these are `open` class
+(§6.10), which also keeps clearance out of the bring-up path.
+
+| Dataset | Size | Notes |
+|---|---|---|
+| **Databricks Dolly 15k** | 15k | Human-written, tiny, CC-BY-SA. Best for the very first end-to-end loop — a full run takes minutes |
+| **HuggingFace No Robots** | 10k | High-quality human-written SFT. Non-commercial licence — fine for bring-up, check before anything else |
+| **UltraChat 200k** | 200k | The Zephyr SFT set. Big enough for meaningful bucket sharding and multi-round convergence |
+| **Tulu 3 SFT mixture** | ~940k | Modern, strong, well-documented mixture. More than you need for bring-up |
+
+**Verify the current licence on each dataset card before use** — these change, and
+this table is a starting point rather than an authority.
+
+**Suggested pairing:**
+
+- **M0–M2 smoke tests:** Qwen 1.7B + Dolly 15k. Fast, tiny, everything fits.
+- **M4 convergence test:** Qwen 1.7B (or 4B) + UltraChat 200k. Enough data for real
+  sharding across many rounds, still fast enough to iterate.
+- **First real run:** your dataset, 8B, whichever classification it warrants.
+
+### Bucket count should scale with dataset size
+
+§6.10 and the task spec assume ~1000 buckets. That was a placeholder, and it's wrong
+for small datasets: 15k samples across 1000 buckets is 15 samples each, so a worker's
+"shard" is statistical noise.
+
+**Target ~100–500 samples per bucket**, so bucket count is roughly
+`dataset_size / 200`, clamped to a sane range:
+
+| Dataset size | Buckets | Samples/bucket |
+|---|---|---|
+| 15k | 64 | ~230 |
+| 200k | 1000 | 200 |
+| 940k | 2048 | ~460 |
+
+Bucket count is fixed **per run** at prep time and never changes mid-run — worker
+count varies freely against it, which is the property that matters (§6.10).
+
+---
+
 ## M1 — Coordinator
 
 **~5–6 days** (was 4–5; self-hosted storage adds MinIO standup, TLS, GC, and backup).
 
 FastAPI + SQLite: schema (§6.1), API (§6.2), auth (§6.3), round state machine (§3.1),
 lease manager, aggregator with acceptance gates (§5), and self-hosted MinIO with
-presigned URL minting (§6.5).
+presigned URL minting (§6.6).
 
 Storage is self-hosted on the coordinator VM, on a **separate volume from the OS
 disk**, with S3 config kept in environment variables so the later R2 swap is a config
@@ -91,9 +162,9 @@ Deliverables:
 - `ganymede/coordinator/aggregate.py` with **both** combine modes (plain weighted mean
   and DiLoCo outer momentum), selectable per run — M4 needs to A/B them
 - `ganymede/coordinator/store.py` — thin S3 wrapper, `boto3` with `endpoint_url` from
-  env. Restricted to the portable API subset in §6.5
+  env. Restricted to the portable API subset in §6.6
 - `ganymede/coordinator/budget.py` — per-worker step budgets from observed and
-  calibrated throughput (§3.4), plus cache-affinity run selection (§6.6)
+  calibrated throughput (§3.4), plus cache-affinity run selection (§6.7)
 - `deploy/` — MinIO service unit, reverse proxy + TLS config, separate volume mount
 - `scripts/backup.py` — off-box SQLite dump + latest-adapter copy, on round close
 - `scripts/gc.py` — drop worker submissions older than 3 closed rounds
@@ -112,9 +183,9 @@ Exit criteria:
 - Two fake workers with 3× different throughput both finish a round near the deadline,
   receive bucket counts scaled to their budgets, and are weighted by actual steps (§3.4)
 - A run requiring `nf4` is never offered to a worker whose profile lacks it, and a
-  worker below the throughput floor is not leased work for that run (§6.7)
+  worker below the throughput floor is not leased work for that run (§6.8)
 - **A presigned URL minted by the coordinator is fetchable by an external client**
-  over the public hostname. This is the §6.5 signing footgun; catch it here, with one
+  over the public hostname. This is the §6.6 signing footgun; catch it here, with one
   integration test, rather than in M2 against a real GPU
 - Backup lands **off-box** and GC actually deletes. An untested backup script is
   indistinguishable from no backup script
@@ -124,12 +195,12 @@ vastly faster than testing it against real GPUs.
 
 ---
 
-## M2 — Worker container
+## M2 — Worker package + container
 
 **~4–5 days** (was 3–4; the native path and the probe are new scope).
 
 The worker **package** first, then the image around it (§4.1). Entrypoint loop (§4.2),
-SIGTERM/abandon (§4.4), capability probe (§6.8), isolation flags (§4.5). The trainer is
+SIGTERM/abandon (§4.4), capability probe (§6.9), isolation flags (§4.5). The trainer is
 M0's, unchanged.
 
 Broad hardware compatibility is a goal (§0), so this milestone delivers `pip install
@@ -138,7 +209,7 @@ way round.
 
 Deliverables:
 - `ganymede/worker/` — loop, client, signals; installable as `ganymede-worker`
-- `ganymede/worker/probe.py` — the §6.8 self-test: allocation ceiling, precision
+- `ganymede/worker/probe.py` — the §6.9 self-test: allocation ceiling, precision
   support, benchmark score. Backend-dispatched (cuda / mps / rocm / cpu)
 - `docker/torch-base.Dockerfile`, `worker-core.Dockerfile`, `worker-llm.Dockerfile`
 - CI that builds and pushes all three, pinning `torch-base` **by digest**
@@ -148,9 +219,9 @@ Exit criteria:
 - **The same package runs natively on Linux/CUDA, macOS/MPS, and Windows/CUDA**,
   registering with a correct probe on each. The Mac need not be fast; it needs to be a
   real participant. Windows is where `nf4` availability is least predictable — the
-  §6.8 probe is what keeps that from becoming a support burden
+  §6.9 probe is what keeps that from becoming a support burden
 - The probe correctly reports a machine as ineligible (too little memory, no nf4)
-  without failing registration (§6.8)
+  without failing registration (§6.9)
 - Read-only rootfs works with the declared writable mounts (expect to discover one or
   two more cache paths here — that's normal, add them explicitly rather than
   reverting to a writable rootfs)
@@ -175,7 +246,7 @@ Deliverables:
 - `packaging/ganymede-host.service` + `.timer` (Linux systemd)
 - `packaging/com.ganymede.host.plist` (macOS launchd)
 - `packaging/ganymede-host-task.xml` (Windows Scheduled Task)
-- HF cache size cap with LRU eviction (§6.6) — many runs means many ~16 GB base
+- HF cache size cap with LRU eviction (§6.7) — many runs means many ~16 GB base
   models, and a disk that fills silently is a bad first experience for a volunteer
 - `INSTALL.md` — the contributor-facing document. This is the actual product surface
   for everyone who isn't you; treat it as a deliverable, not an afterthought
@@ -237,7 +308,7 @@ Exit criteria:
 - You can answer "is it training, and who is contributing?" in one glance
 - You get alerted about a stalled run without having to look
 - A registered worker that is never leased can be told *why*: insufficient memory,
-  missing `nf4`, below the throughput floor, or clearance (§6.8, §6.9)
+  missing `nf4`, below the throughput floor, or clearance (§6.9, §6.10)
 - **A full restore has been performed at least once**, not merely configured: rebuild
   the coordinator from the off-box SQLite dump plus the latest round adapter, and
   resume the run. §6.4 names the shared VM as the system's single point of failure,
@@ -273,12 +344,12 @@ In rough order of when they'll start to hurt:
    contributor pool outgrows people you personally vouch for. The audit data
    accumulates from M1 (§6.3), so this is analysis, not instrumentation.
 2. **Concurrent runs.** Deferred from v1 by decision, but wide hardware diversity
-   raises its value (§6.7): with sequential runs, an nf4 run idles every Mac and a
+   raises its value (§6.8): with sequential runs, an nf4 run idles every Mac and a
    bf16 8B run idles every 3060. Needs run selection, priority, and starvation
    handling in claim. The eligibility model is already written so this is a
    scheduling change, not a redesign.
 3. **MLX trainer for Apple Silicon.** Macs participate from v1 via PyTorch MPS
-   (§6.7) — slow but real. MLX is the fast path and a second trainer implementation
+   (§6.8) — slow but real. MLX is the fast path and a second trainer implementation
    interoperating via safetensors. Only worth it if Mac *throughput* becomes the
    point rather than Mac participation.
 4. **`vast` / `tensordock` `IdleBackend`s** — needed when you move past own hardware.
@@ -322,12 +393,12 @@ Blocking or near-blocking. Rough order of urgency.
    first. *Needed for M0.*
 
 2. **The dataset(s).** What are they, how large, where do they live? Must shard into
-   ~1000 stable buckets. Sensitivity is now handled per-run by §6.9's classification,
+   ~1000 stable buckets. Sensitivity is now handled per-run by §6.10's classification,
    so the remaining question is narrower: **which classification does the first run
    get, and who holds `internal` / `restricted` clearance?** *Needed for M0.*
 
 3. ~~**Object store.**~~ **Resolved: self-hosted MinIO on the coordinator VM**, S3
-   config in env vars so R2 is a later config swap (§6.5). Two follow-ons this raises:
+   config in env vars so R2 is a later config swap (§6.6). Two follow-ons this raises:
    **where do off-box backups go?** (needs to be a different machine — a free
    object-storage tier is fine and is a painless way to start an R2 account early),
    and **how much volume to provision?** 200 GB is generous for 10 workers × 100
@@ -341,19 +412,29 @@ Blocking or near-blocking. Rough order of urgency.
    Define it during M0 while the baseline is being established, not after. *Needed
    for M0's exit criteria.*
 
-6. **Contributor hardware inventory.** Not just a count — the actual list, with VRAM
-   and backend per machine. It determines which runs each machine is eligible for
-   (§6.7), where the §3.4 throughput floor should sit, and whether a given run has
-   enough eligible workers to be worth starting at all. Three eligible machines is the
-   minimum for a meaningful M4. Worth writing down once and keeping current; with this
-   much spread it stops being memorable. *Needed for M3/M4.*
+6. **Contributor hardware inventory.** Concretely, a row per machine:
+
+   | Field | Why it's needed |
+   |---|---|
+   | Label / owner | Who to ask when it misbehaves |
+   | OS | Picks the packaging path — container, launchd, or Scheduled Task (§4.1) |
+   | GPU / chip | With Apple Silicon, the chip variant matters (Air vs Max) |
+   | VRAM or unified RAM | The main eligibility gate (§6.8 Tier 2) |
+   | Typical availability | Always-on, nights only, occasional? Sets round deadlines and quorum |
+   | Upload bandwidth | An 85 MB adapter on a 1 Mbit/s uplink is 11 minutes of a 35-minute round — that machine needs longer rounds or a smaller model |
+   | Who administers it | Decides `restricted`-run eligibility (§6.10) |
+
+   Three eligible machines is the minimum for a meaningful M4 — and note "eligible"
+   is per-run, so the count that matters is how many clear the bar for *that* run.
+   Upload bandwidth is the field people forget and the one that quietly wrecks round
+   pacing. *Needed for M3/M4.*
 
 7. **Platform policy check** (deferrable to Phase 2, but cheap to do early): does
    running your own workload on a GPU listed for rent affect reliability or
    availability scoring on Vast/TensorDock? This determines whether the donated-host
    model works as designed (Review Finding M).
 
-8. **Contributor agreement.** §6.9 gates `internal` and `restricted` runs on clearance,
+8. **Contributor agreement.** §6.10 gates `internal` and `restricted` runs on clearance,
    which implies contributors accept *something* before receiving non-public data. It
    needn't be elaborate, but it needs to exist before the first non-`open` run, and
    it's the natural place to also settle who owns the resulting adapters. Cheap now,

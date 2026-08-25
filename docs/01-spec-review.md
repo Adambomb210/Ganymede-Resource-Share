@@ -44,10 +44,10 @@ Everything else below is a gap to fill, not a mistake.
 | Host model | All three (own hardware, donated rented hosts, paid instances) — **starting with own hardware**, so idle detection ships as a pluggable backend with `local` first. |
 | Storage | **Self-hosted, S3-compatible (MinIO)** on the coordinator VM, with R2 or S3 reachable by config change later. |
 | Run concurrency | **Sequential** for v1 — one active run at a time. Eligibility model written so concurrency is a later scheduling change, not a redesign. |
-| Fleet | Wide heterogeneity expected: Apple Silicon, 12 GB consumer cards, A100s. Handled as three tiers — see Architecture v2 §6.7. |
+| Fleet | Wide heterogeneity expected: Apple Silicon, 12 GB consumer cards, A100s. Handled as three tiers — see Architecture v2 §6.8. |
 | Compatibility | **A project goal** (§0). The worker is a package; the container is one delivery path. Linux, macOS, and Windows all supported natively. |
 | Base model | Latest **dense** Qwen in the 7–8B range. Not MoE — see roadmap open question 1. |
-| Data | Sensitivity **varies by run**; handled as a per-run classification gating eligibility (§6.9). |
+| Data | Sensitivity **varies by run**; handled as a per-run classification gating eligibility (§6.10). |
 | v1 audience | Your group now, opening later — operator tooling, but install path and eligibility diagnostics kept honest from the start. |
 
 These are assumed throughout the revised architecture (`02-architecture-v2.md`).
@@ -142,7 +142,7 @@ makes the bandwidth math work (Finding H).
 **Per the storage decision**, the store is self-hosted MinIO on the coordinator VM in
 v1, so two of those three destinations are the same machine. Keep them as separate
 config entries anyway — otherwise moving storage to R2 later means editing every
-contributor's firewall rules instead of one manifest field. Architecture v2 §6.5
+contributor's firewall rules instead of one manifest field. Architecture v2 §6.6
 covers the sizing, the retention policy, and the backup consequence, which is the one
 thing co-location genuinely breaks.
 
@@ -230,7 +230,7 @@ This is also what makes self-hosted storage a sensible default rather than a
 compromise: the access pattern is egress-dominated, which is precisely where metered
 object storage prices worst. A VM with a bundled traffic allowance and R2's
 zero-egress model are both fine; S3-class egress pricing is the option to avoid.
-Architecture v2 §6.5 has the numbers and names the worker count at which to revisit.
+Architecture v2 §6.6 has the numbers and names the worker count at which to revisit.
 
 ### I. Missing: dataset sharding
 

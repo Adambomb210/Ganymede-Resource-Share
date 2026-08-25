@@ -21,11 +21,11 @@ Carried from v1 §1, with one addition made explicit:
   primitives
 - **Run on almost any hardware.** A contributor's machine should be able to join the
   platform even when it can't serve every run. Platform compatibility and run
-  eligibility are separate concerns (§6.7, §6.8), and only the second is allowed to
+  eligibility are separate concerns (§6.8, §6.9), and only the second is allowed to
   exclude anyone.
 
 That last goal is why the worker is a package rather than a container (§4.1), and why
-capabilities are probed rather than enumerated (§6.8).
+capabilities are probed rather than enumerated (§6.9).
 
 ---
 
@@ -47,11 +47,11 @@ capabilities are probed rather than enumerated (§6.8).
 | (absent) | Pinned `base_precision` | Finding J |
 | (absent) | Bearer auth | Finding F |
 | Uniform `local_steps_per_sync` | **Per-worker step budgets** sized to a common deadline | §3.4 |
-| (single run assumed) | Multi-run cache affinity + per-run calibration | §6.6 |
-| Uniform hardware assumed | **Three-tier heterogeneity model**; `compute_profile` eligibility | §6.7 |
+| (single run assumed) | Multi-run cache affinity + per-run calibration | §6.7 |
+| Uniform hardware assumed | **Three-tier heterogeneity model**; `compute_profile` eligibility | §6.8 |
 | Container = the worker | **Package = the worker**; container is one delivery path | §4.1 |
-| (absent) | Capability **probing** rather than hardware enumeration | §6.8 |
-| (absent) | Per-run **data classification** as a second eligibility axis | §6.9 |
+| (absent) | Capability **probing** rather than hardware enumeration | §6.9 |
+| (absent) | Per-run **data classification** as a second eligibility axis | §6.10 |
 
 ---
 
@@ -73,7 +73,7 @@ capabilities are probed rather than enumerated (§6.8).
   │                                      │ app never proxies bytes
   │                                      ▼
   │                      ┌──────────────────────────────┐
-  │                      │  MinIO  (self-hosted, §6.5)  │
+  │                      │  MinIO  (self-hosted, §6.6)  │
   │                      │   · round base adapters      │
   │                      │   · worker submissions       │
   │                      │   · sharded dataset buckets  │
@@ -98,7 +98,7 @@ references, metrics, and control flow.
 
 In v1 the artifact store is **self-hosted MinIO on the same VM**, so that VM does
 serve the bytes at the network level even though the application doesn't touch them.
-That is a deliberate, and cheap, trade — see §6.5 for the sizing that justifies it and
+That is a deliberate, and cheap, trade — see §6.6 for the sizing that justifies it and
 the one consequence that genuinely bites (backups).
 
 ---
@@ -274,7 +274,7 @@ package, and every delivery path wraps the same code:
 |---|---|---|
 | Linux + NVIDIA, third-party host | Container | Full §4.5 hardening |
 | Linux + NVIDIA, own hardware | Container or `pip` + systemd | Contributor's choice |
-| macOS + Apple Silicon | `pip` + launchd (**no container** — §6.7) | OS-level only |
+| macOS + Apple Silicon | `pip` + launchd (**no container** — §6.8) | OS-level only |
 | Windows + NVIDIA | `pip` + Scheduled Task, or Docker Desktop/WSL2 | Weakest natively |
 | Anything else | `pip` | OS-level only |
 
@@ -282,11 +282,11 @@ Windows is supported natively, not only through WSL2 — it's where most consume
 actually live, and requiring WSL2 is a real hurdle for a volunteer. Note that unlike
 macOS, Docker Desktop on Windows *can* reach the GPU through WSL2, so the container
 path stays available for anyone who wants it (and is required for restricted runs —
-§6.9).
+§6.10).
 
 The pinned-digest guarantee (above) applies *within* a backend. A CUDA container fleet
 shares one bit-identical PyTorch build; native installs necessarily won't. That is
-acceptable because §6.7 Tier 1 establishes that cross-hardware numerical differences
+acceptable because §6.8 Tier 1 establishes that cross-hardware numerical differences
 don't meaningfully affect adapter averaging — but it does mean native installs should
 pin a **version range** in the package metadata and report the resolved version in
 their `compute_profile`, so a genuinely incompatible build is visible rather than
@@ -455,9 +455,9 @@ FastAPI + SQLite on one small VM. No GPU.
 ### 6.1 Schema
 
 ```
-contributors  id, name, key_hash, enabled, clearance, created_at  -- §6.9
+contributors  id, name, key_hash, enabled, clearance, created_at  -- §6.10
 workers       id, contributor_id, compute_profile_json, image_tag,
-              first_seen, last_seen                                   -- §6.7
+              first_seen, last_seen                                   -- §6.8
 runs          id, status, base_model, base_precision, lora_cfg_json,
               dataset_ref, hyperparams_json, current_round, target_rounds,
               outer_momentum_ref, requires_json, data_classification,
@@ -472,7 +472,7 @@ submissions   task_id, artifact_ref, steps_completed, tokens_seen,
               metrics_json, accepted, reject_reason, received_at
 buckets       run_id, bucket_idx, times_trained, last_round
 throughput    run_id, gpu_model, steps_per_min, samples, updated_at   -- §3.4
-calibration   run_id, calibration_json, created_at                    -- §6.6, M0
+calibration   run_id, calibration_json, created_at                    -- §6.7, M0
 ```
 
 **Concurrency (Finding L2):** WAL mode, and every claim wrapped in `BEGIN IMMEDIATE`
@@ -523,16 +523,16 @@ Differences from v1 §4.3: capability-aware claim (L3), explicit `204` for no wo
 gone from every request body.
 
 `cached_base_models` exists because base models are ~16 GB each and Ganymede will run
-many of them (§6.6). Given two eligible runs, the coordinator should prefer the one
+many of them (§6.7). Given two eligible runs, the coordinator should prefer the one
 whose base model the worker already holds — that's the difference between starting
 work in seconds and starting it after a 16 GB download.
 
 `compute_profile` replaces v1's loose capability fields. `backend` and `supports` are
-what make §6.7's eligibility rules expressible: a run requiring `nf4` must not be
+what make §6.8's eligibility rules expressible: a run requiring `nf4` must not be
 offered to a worker that can't provide it, and silently falling back to a different
 precision would break §5.2's shared-frozen-base assumption without erroring.
 
-**`probe` is measured, not declared** — see §6.8. Given the goal of running on almost
+**`probe` is measured, not declared** — see §6.9. Given the goal of running on almost
 any hardware, the coordinator cannot hold a table of known devices; it has to accept
 what the worker demonstrates.
 
@@ -556,10 +556,44 @@ what the worker demonstrates.
 | Round misses quorum | Closes on deadline with ≥1 submission. Zero submissions → round reopens with a fresh deadline |
 | Coordinator down | No claims, no submissions, no aggregation. In-flight workers finish, fail to submit, retry with backoff. **Nothing is lost that was already submitted** |
 | Artifact store down | Same as coordinator down, from the worker's side. In v1 they share a VM, so in practice these fail together |
-| Coordinator VM lost | **The failure that matters.** In v1 the database and every checkpoint are on one machine, so this loses both unless backups are genuinely off-box. See §6.5 — separate volume, off-box SQLite dump each round close, off-box copy of the latest round adapter |
+| Coordinator VM lost | **The failure that matters.** In v1 the database and every checkpoint are on one machine, so this loses both unless backups are genuinely off-box. See §6.6 — separate volume, off-box SQLite dump each round close, off-box copy of the latest round adapter |
 | Artifact volume lost, VM survives | Recoverable from the off-box dump + latest adapter: resume the run rather than restart it. Loses older checkpoint history |
 
-### 6.5 Artifact storage — self-hosted now, portable later
+### 6.5 Deployment
+
+The coordinator is **containerized from day one**, because it moves through three
+environments and should be the same artifact in all of them:
+
+| Stage | Shape |
+|---|---|
+| Development | `docker compose up` — coordinator + MinIO + N fake workers, all local |
+| Bring-up | Same compose file on your server, reachable on the LAN |
+| Production | Same image, own container on your server, behind two subdomains |
+
+"Emulated for now" is therefore just the first column, and M1's fake-worker harness is
+the emulation. Nothing needs rewriting when it moves to the server — the compose file
+gains a reverse-proxy front end and stops binding to localhost.
+
+**Two subdomains, not one.** Something like `ganymede-api.<domain>` for the
+coordinator and `ganymede-storage.<domain>` for MinIO. Path-routing both under one
+host fights the S3 client, which expects to own its URL space.
+
+**Use path-style S3 addressing** (`storage.<domain>/bucket/key`), not virtual-host
+style (`bucket.storage.<domain>/key`). Virtual-host style needs wildcard DNS and a
+wildcard certificate for what is one bucket. Path-style is one A record and one cert:
+
+```python
+boto3.client("s3", endpoint_url=..., config=Config(s3={"addressing_style": "path"}))
+```
+
+R2 supports path-style too, so this costs nothing in portability (§6.6).
+
+**TLS terminates at your existing reverse proxy**, which makes the presigned-URL host
+footgun in §6.6 a certainty rather than a risk — the coordinator will be signing for a
+public subdomain while talking to MinIO over the internal network. Set MinIO's
+`MINIO_SERVER_URL` to the public storage subdomain and sign with that exact value.
+
+### 6.6 Artifact storage — self-hosted now, portable later
 
 **Decision: self-hosted MinIO on the coordinator VM for v1, with a documented path to
 Cloudflare R2 or plain S3.**
@@ -678,7 +712,7 @@ So the rule for v1 is stricter than it was:
 Off-box means a different machine, not a different directory. That distinction is the
 entire value of the item.
 
-### 6.6 Running many models
+### 6.7 Running many models
 
 Ganymede is intended to carry a lot of runs over time, not one. Three consequences
 that don't exist with a single run:
@@ -704,7 +738,7 @@ comparison all depend on the specific base model, precision, sequence length, an
 config. §3.4's step budgets read from a per-run `calibration.json`, which is why M0
 builds calibration as a repeatable command rather than a one-time measurement.
 
-### 6.7 Hardware heterogeneity
+### 6.8 Hardware heterogeneity
 
 The expected fleet spans Apple Silicon laptops, 12 GB consumer cards, and datacenter
 A100s. Speed differences are handled by §3.4 and are not a problem. **Capability
@@ -752,7 +786,7 @@ does not work on a Mac at all.**
   containerized worker on a Mac gets CPU only. This is a platform property, not a
   configuration problem — there is no flag that fixes it.
 - **No nf4.** `bitsandbytes` is CUDA-oriented; quantized bases should not be assumed
-  available on MPS. So a Mac **cannot join any nf4 run** — and §6.5's Tier-2 table
+  available on MPS. So a Mac **cannot join any nf4 run** — and the Tier-2 table
   above shows nf4 is exactly what makes larger models reachable for small cards. The 3060
   needs nf4; the Mac can't do nf4. They are mutually exclusive on the same run.
 - **No flash-attn**, and MPS operator coverage and bf16 behavior lag CUDA.
@@ -790,7 +824,7 @@ turning on concurrency later is a scheduling change, not a redesign.
 
 ---
 
-### 6.8 Capability probing, not hardware enumeration
+### 6.9 Capability probing, not hardware enumeration
 
 Supporting almost any hardware rules out the obvious implementation. The coordinator
 cannot keep a table mapping device names to capabilities — the table would be wrong
@@ -827,11 +861,11 @@ Consequences worth naming:
   getting work, the answer is in their stored profile: not enough memory, no nf4, or
   below the floor. That is a far better support experience than silence.
 
-### 6.9 Per-run data classification
+### 6.10 Per-run data classification
 
 Data sensitivity varies by run, and **every eligible contributor receives the dataset
 in plaintext** — now including personal laptops, not only machines you administer. So
-sensitivity becomes a second eligibility dimension alongside capability (§6.7):
+sensitivity becomes a second eligibility dimension alongside capability (§6.8):
 
 ```
 eligible(worker, run) = capability_match(worker, run)
@@ -924,6 +958,7 @@ GPU affects platform reliability scoring (Review Finding M).
 
   "dataset_ref": "s3://ganymede/data/combat-robot-sim-v2",
   "buckets": [17, 143, 288, 401, 655],   // count scales with the budget — §3.4
+                                         // bucket total scales with dataset size
 
   "hyperparams": {
     "lr": 2e-4,

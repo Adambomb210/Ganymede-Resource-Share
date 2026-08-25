@@ -20,7 +20,7 @@ and disappear when it isn't.
 
 ## v1 scope
 
-- **Job type:** `llm_finetune` only — LoRA on a dense 7–8B Qwen base
+- **Job type:** `llm_finetune` only — LoRA on a dense Qwen base (bring up on ~1.7B, scale to 7–8B)
 - **Sync:** central aggregation (weighted mean + DiLoCo outer step), behind a
   `SyncBackend` seam so peer-to-peer can be swapped in later
 - **Hosts:** own hardware first; donated and rented platform hosts behind the same
