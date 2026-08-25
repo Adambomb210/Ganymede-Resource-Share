@@ -27,6 +27,10 @@ and disappear when it isn't.
   `IdleBackend` interface
 - **Storage:** self-hosted, S3-compatible (MinIO), with Cloudflare R2 or S3 reachable
   by a config change rather than a rewrite
+- **Runs:** one active run at a time; concurrent runs deferred
+- **Fleet:** heterogeneous by design — per-worker step budgets absorb the speed
+  spread, and runs declare what hardware they require. Apple Silicon needs a native
+  worker and is deferred (containers on macOS can't reach the GPU)
 - **Trust:** trusted circle, with safetensors-only artifacts and sanity gates on every
   submission
 

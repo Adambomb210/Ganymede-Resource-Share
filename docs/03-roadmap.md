@@ -110,7 +110,9 @@ Exit criteria:
   right reason
 - Killing the coordinator mid-round loses nothing already submitted
 - Two fake workers with 3× different throughput both finish a round near the deadline,
-  and the aggregate weights them by actual steps (§3.4)
+  receive bucket counts scaled to their budgets, and are weighted by actual steps (§3.4)
+- A run requiring `nf4` is never offered to a worker whose profile lacks it, and a
+  worker below the throughput floor is not leased work for that run (§6.7)
 - **A presigned URL minted by the coordinator is fetchable by an external client**
   over the public hostname. This is the §6.5 signing footgun; catch it here, with one
   integration test, rather than in M2 against a real GPU
@@ -189,8 +191,11 @@ Exit criteria:
   negative result
 - A worker killed mid-round costs one round and nothing else
 - Per-round loss curve is visible and smooth; no divergence, no silent degradation
-- Mixed-speed workers (at least two GPU classes) both land near the round deadline,
-  confirming §3.4's budgets rather than truncating the slower card every round
+- Mixed-speed workers (at least two GPU classes, ideally the widest spread you have —
+  a 3060 alongside an A100) both land near the round deadline, confirming §3.4's
+  budgets rather than truncating the slower card every round
+- No single worker exceeds the §3.4 dominance cap; removing the fastest worker
+  mid-run degrades the round rather than wrecking it
 
 Everything before this is plumbing. This is where you find out whether the idea works.
 Budget for it to fail the first time and need a tuning pass — that is the normal
@@ -243,17 +248,28 @@ In rough order of when they'll start to hurt:
 1. **Spot-check redundancy and reputation scoring** — the first thing needed when the
    contributor pool outgrows people you personally vouch for. The audit data
    accumulates from M1 (§6.3), so this is analysis, not instrumentation.
-2. **`vast` / `tensordock` `IdleBackend`s** — needed when you move past own hardware.
+2. **Concurrent runs.** Deferred from v1 by decision, but wide hardware diversity
+   raises its value (§6.7): with sequential runs, an nf4 run idles every Mac and a
+   bf16 8B run idles every 3060. Needs run selection, priority, and starvation
+   handling in claim. The eligibility model is already written so this is a
+   scheduling change, not a redesign.
+3. **Apple Silicon native worker.** Containers on macOS cannot reach the GPU, so this
+   is a native `pip install` + launchd path, not a new image (§6.7). Cheap *because*
+   `worker-core` is a package from day one; still a real build, and honestly a modest
+   throughput contribution. Doing it properly likely means MLX rather than PyTorch
+   MPS — a second trainer implementation interoperating via safetensors. Scope it
+   deliberately.
+4. **`vast` / `tensordock` `IdleBackend`s** — needed when you move past own hardware.
    Small, given M3's interface. Verify the platform-policy question first (§7).
-3. **Postgres migration** — when workers exceed a few hundred (§6.1).
-4. **Hivemind `SyncBackend`** — when central bandwidth genuinely binds. At ~3.4 GB/hr
+5. **Postgres migration** — when workers exceed a few hundred (§6.1).
+6. **Hivemind `SyncBackend`** — when central bandwidth genuinely binds. At ~3.4 GB/hr
    for ten workers, that is a long way off. Do not do this early; it buys nothing at
    current scale and costs NAT traversal work.
-5. **`rl_rollout`** — needs its own spec review. Isaac Lab's image size and PyTorch
+7. **`rl_rollout`** — needs its own spec review. Isaac Lab's image size and PyTorch
    pinning break the shared-layer story (Review Finding B), and shipping raw
    trajectories over WAN is a heavier data path than shipping weight deltas. Worth
    evaluating whether workers can send gradients or advantages instead of trajectories.
-6. **gVisor/Kata, TOPLOC verification, Byzantine-robust aggregation** — when the pool
+8. **gVisor/Kata, TOPLOC verification, Byzantine-robust aggregation** — when the pool
    includes people you don't know. §5.2's weighted mean is the drop-in point for
    trimmed-mean/median.
 
@@ -287,9 +303,12 @@ Blocking or near-blocking. Rough order of urgency.
    Define it during M0 while the baseline is being established, not after. *Needed
    for M0's exit criteria.*
 
-6. **Contributor count and hardware at M4.** Three is the minimum for a meaningful
-   convergence test. Which specific cards? The slowest one sets round sizing (§3.3).
-   *Needed for M3/M4.*
+6. **Contributor hardware inventory.** Not just a count — the actual list, with VRAM
+   and backend per machine. It determines which runs each machine is eligible for
+   (§6.7), where the §3.4 throughput floor should sit, and whether a given run has
+   enough eligible workers to be worth starting at all. Three eligible machines is the
+   minimum for a meaningful M4. Worth writing down once and keeping current; with this
+   much spread it stops being memorable. *Needed for M3/M4.*
 
 7. **Platform policy check** (deferrable to Phase 2, but cheap to do early): does
    running your own workload on a GPU listed for rent affect reliability or

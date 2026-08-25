@@ -29,6 +29,7 @@ summarized rather than restated.
 | (absent) | Bearer auth | Finding F |
 | Uniform `local_steps_per_sync` | **Per-worker step budgets** sized to a common deadline | §3.4 |
 | (single run assumed) | Multi-run cache affinity + per-run calibration | §6.6 |
+| Uniform hardware assumed | **Three-tier heterogeneity model**; `compute_profile` eligibility | §6.7 |
 
 ---
 
@@ -180,6 +181,46 @@ This matters more as the number of runs grows: a 3B and a 70B fine-tune need ste
 budgets an order of magnitude apart, and hand-setting `local_steps_per_sync` per run
 is exactly the kind of manual step that stops scaling once there are many runs.
 
+#### Scale buckets with the budget, not just steps
+
+A subtlety that bites specifically on wide hardware spreads. If every worker gets the
+same number of dataset buckets but a different step budget, the fast worker simply
+does **more epochs over the same small shard** — overfitting it. That is worse than
+useless: it earns a large aggregation weight while contributing a narrower view of the
+data than the slow worker beside it.
+
+So bucket count scales with the budget too. A worker receives roughly enough buckets
+that its step budget amounts to a comparable number of passes over its assigned data,
+whatever its speed. An A100 gets more steps *and* proportionally more of the dataset.
+
+This converts hardware heterogeneity into **data coverage** rather than weight
+concentration, which is the outcome you want: extra capacity buys diversity, not a
+louder vote on the same shard.
+
+#### Guard against one worker dominating
+
+Even with bucket scaling, an A100 among 3060s may carry a large share of a round's
+weight. Proportional weighting is *correct* — it reflects work actually done — but
+past a point the round becomes "one worker's trajectory plus a small correction",
+which has different convergence behavior from balanced averaging, and craters when
+that worker drops out.
+
+Cap any single worker's share at roughly **2× the median** contribution. The cost is a
+little efficiency; the benefit is a run that degrades gracefully when its best machine
+is preempted. Revisit the cap once §5.2's A/B has real data — this is a knob with a
+defensible default, not a settled number.
+
+#### Minimum viable throughput
+
+Below some speed, a worker costs more than it contributes: it consumes a lease slot
+and a full ~170 MB round trip to add noise-level weight.
+
+Set a floor — a worker must be able to complete some minimum fraction (start with
+~10%) of the median budget within the round window, or it isn't offered work **for
+that run**. It stays eligible for others. This is the mechanism that lets a very wide
+hardware spread coexist without silently wasting bandwidth on machines that can't
+keep up with a given model.
+
 ---
 
 ## 4. Worker
@@ -200,6 +241,15 @@ nvidia/cuda:12.4.1-runtime-ubuntu22.04
 `torch-base` is pinned by digest, not tag, so every worker in a run has a bit-identical
 PyTorch. Rebuild it deliberately and rarely; a silent PyTorch bump across a running
 swarm is a genuinely nasty class of bug.
+
+**`worker-core` is a pip-installable package; the image is a thin wrapper around it.**
+The container is a packaging choice, not the architecture. This keeps a native path
+open for platforms where containers can't reach the GPU — Apple Silicon, principally
+(§6.7) — at no cost today.
+
+The pinned-digest guarantee applies within a backend. A CUDA fleet shares one PyTorch
+build; a future native MPS worker necessarily won't, which is one more reason §6.7
+treats Apple Silicon as a separate platform rather than another GPU.
 
 ### 4.2 Entrypoint loop
 
@@ -355,11 +405,12 @@ FastAPI + SQLite on one small VM. No GPU.
 
 ```
 contributors  id, name, key_hash, enabled, created_at
-workers       id, contributor_id, gpu_name, vram_mb, driver, torch_ver,
-              image_tag, first_seen, last_seen
+workers       id, contributor_id, compute_profile_json, image_tag,
+              first_seen, last_seen                                   -- §6.7
 runs          id, status, base_model, base_precision, lora_cfg_json,
               dataset_ref, hyperparams_json, current_round, target_rounds,
-              outer_momentum_ref, created_at
+              outer_momentum_ref, requires_json, created_at
+              -- requires_json: { backend, min_vram_mb, needs: [...] }  §6.7
 rounds        run_id, idx, base_adapter_ref, status, quorum_min, deadline_at,
               opened_at, closed_at, result_adapter_ref, mean_loss
 tasks         id, run_id, round_idx, buckets_json, local_steps, status,
@@ -384,8 +435,12 @@ GET  /v1/manifest
          min_worker_core: "v2", object_store_host: "...", active_runs: [...] }
 
 POST /v1/workers/register
-     body { gpu_name, vram_mb, driver, torch_ver, image_tag }
+     body { compute_profile, image_tag }
      → { worker_id, heartbeat_interval_sec }
+
+     compute_profile = { backend: "cuda" | "mps", device_name, vram_mb,
+                         compute_capability, driver, torch_ver,
+                         supports: ["bf16", "fp16", "nf4", "flash_attn"] }
 
 POST /v1/tasks/claim
      body { worker_id, capabilities, cached_base_models: [...] }
@@ -416,6 +471,11 @@ gone from every request body.
 many of them (§6.6). Given two eligible runs, the coordinator should prefer the one
 whose base model the worker already holds — that's the difference between starting
 work in seconds and starting it after a 16 GB download.
+
+`compute_profile` replaces v1's loose capability fields. `backend` and `supports` are
+what make §6.7's eligibility rules expressible: a run requiring `nf4` must not be
+offered to a worker that can't provide it, and silently falling back to a different
+precision would break §5.2's shared-frozen-base assumption without erroring.
 
 ### 6.3 Auth (Finding F)
 
@@ -585,6 +645,89 @@ comparison all depend on the specific base model, precision, sequence length, an
 config. §3.4's step budgets read from a per-run `calibration.json`, which is why M0
 builds calibration as a repeatable command rather than a one-time measurement.
 
+### 6.7 Hardware heterogeneity
+
+The expected fleet spans Apple Silicon laptops, 12 GB consumer cards, and datacenter
+A100s. Speed differences are handled by §3.4 and are not a problem. **Capability
+differences are**, and they fall into three tiers.
+
+#### Tier 1 — different speed, same capability (3060 ↔ 3090 ↔ 4090 ↔ A100)
+
+Not a problem. All CUDA, all Ampere-or-later, all bf16-capable. Per-worker step
+budgets absorb a 20× spread without stragglers.
+
+Worth knowing but not worth acting on: different GPUs produce slightly different
+numerics (kernel selection, reduction order, TF32 accumulation). This does **not**
+meaningfully affect adapter averaging — the variance between workers from training on
+*different data shards* dwarfs it, which is the same reason DiLoCo works at all.
+
+One cheap precaution: **pin TF32 matmul settings in the run config**. TF32 changes the
+forward pass through the frozen base, so leaving it to each worker's defaults is a
+mild version of the precision-mismatch problem below. One line to fix, annoying to
+diagnose.
+
+#### Tier 2 — VRAM decides which runs a worker can serve
+
+A 12 GB 3060 and an 80 GB A100 aren't the same class of participant. For an 8B model:
+
+| | bf16 base (~16 GB weights) | nf4 base (~5.5 GB weights) |
+|---|---|---|
+| 3060 12 GB | no | yes, short sequences |
+| 3090 / 4090 24 GB | tight | comfortable |
+| A100 40/80 GB | comfortable | comfortable |
+
+This is ordinary capability filtering (§6.2) — a run declares required precision and
+minimum VRAM, workers declare what they have, the coordinator matches. It's already in
+the design.
+
+The consequence to internalize: **not every worker serves every run, and that's
+normal, not a failure.** A 3060 fleet can carry small models and quantized larger
+ones; an A100 can carry anything.
+
+#### Tier 3 — Apple Silicon is a different platform, not a slower GPU
+
+This is the structural one, and it's worth being blunt: **the container-based worker
+does not work on a Mac at all.**
+
+- **No GPU in containers.** Docker on macOS runs a Linux VM with no MPS passthrough. A
+  containerized worker on a Mac gets CPU only. This is a platform property, not a
+  configuration problem — there is no flag that fixes it.
+- **No nf4.** `bitsandbytes` is CUDA-oriented; quantized bases should not be assumed
+  available on MPS. So a Mac **cannot join any nf4 run** — and §6.5's Tier-2 table
+  above shows nf4 is exactly what makes larger models reachable for small cards. The 3060
+  needs nf4; the Mac can't do nf4. They are mutually exclusive on the same run.
+- **No flash-attn**, and MPS operator coverage and bf16 behavior lag CUDA.
+- **Unified memory cuts both ways.** An M2 Air at 8–16 GB is not doing 8B. An M2/M3
+  Max at 64 GB+ genuinely can hold it — but MPS training throughput is far below a
+  comparable discrete GPU, so §3.4's floor may exclude it from larger runs anyway.
+
+**Recommendation: defer Mac support until after M4**, and be honest that its compute
+contribution will be modest. The argument for building it is social — people have
+Macs, and a contributor who can participate is a contributor — not throughput.
+
+**But make one architectural decision now, because it's free now and expensive later:**
+`worker-core` is a **pip-installable Python package**, and the Docker image is a thin
+wrapper around it (§4.1). If the worker is written as "the container *is* the worker",
+Mac support means a rewrite. If it's a package, Mac support is `pip install` plus a
+launchd agent, sharing ~95% of the code.
+
+If Mac support later proves worth doing properly, the real path is **MLX** rather than
+PyTorch MPS — it's Apple's own framework and much better suited to training on this
+hardware. That means a second trainer implementation interoperating through
+safetensors, which is a genuine cost. Worth scoping deliberately, not drifting into.
+
+#### Why this raises the value of concurrent runs
+
+With **sequential** runs — the v1 decision — a run that requires nf4 excludes every
+Mac, and a bf16 8B run excludes every 3060. Those contributors idle until the next run
+happens to suit them.
+
+Wide hardware diversity therefore makes concurrency worth more than it would be
+otherwise: two active runs with different requirements keep the whole fleet busy where
+one cannot. Sequential is still right for v1 — it avoids scheduling, priority, and
+starvation entirely — but the eligibility model above is deliberately written so that
+turning on concurrency later is a scheduling change, not a redesign.
+
 ---
 
 ## 7. Host agent
@@ -649,7 +792,7 @@ GPU affects platform reliability scoring (Review Finding M).
   "base_adapter_url": "https://…presigned-GET…",
 
   "dataset_ref": "s3://ganymede/data/combat-robot-sim-v2",
-  "buckets": [17, 143, 288, 401, 655],
+  "buckets": [17, 143, 288, 401, 655],   // count scales with the budget — §3.4
 
   "hyperparams": {
     "lr": 2e-4,

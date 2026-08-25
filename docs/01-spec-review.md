@@ -43,6 +43,8 @@ Everything else below is a gap to fill, not a mistake.
 | First job | LoRA on a 7–8B base model. |
 | Host model | All three (own hardware, donated rented hosts, paid instances) — **starting with own hardware**, so idle detection ships as a pluggable backend with `local` first. |
 | Storage | **Self-hosted, S3-compatible (MinIO)** on the coordinator VM, with R2 or S3 reachable by config change later. |
+| Run concurrency | **Sequential** for v1 — one active run at a time. Eligibility model written so concurrency is a later scheduling change, not a redesign. |
+| Fleet | Wide heterogeneity expected: Apple Silicon, 12 GB consumer cards, A100s. Handled as three tiers — see Architecture v2 §6.7. |
 
 These are assumed throughout the revised architecture (`02-architecture-v2.md`).
 
