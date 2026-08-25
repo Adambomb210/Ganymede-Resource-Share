@@ -93,13 +93,16 @@ written here. Scale to 7–8B after M4 passes, as a run-config change.
 
 Two constraints that apply at **every** size, not just bring-up:
 
-**Dense, not MoE.** Recent Qwen generations include MoE variants, and MoE interacts
-badly with DiLoCo-style averaging: which experts a worker trains depends on how *its
-own* data shard routes, so different workers update different experts and averaging
-them is not the operation it is for a dense model. Router state adds a second
-divergence path on top. Treat MoE + collaborative averaging as a research project,
-not a default — and re-check this when scaling to 7–8B, where MoE options are more
-tempting.
+**Dense, not MoE — for now.** Recent Qwen generations include MoE variants, and
+training the *experts* interacts badly with averaging: which experts a worker trains
+depends on how its own shard routes, so sparsely-activated experts get diluted by a
+uniform mean. Router state adds a second divergence path.
+
+This is deferred, **not foreclosed** — §5.4 records exactly what MoE would need, and
+the one design accommodation for it (per-tensor aggregation weights) is already in
+§5.2. Worth knowing now: **an MoE base with attention-only LoRA works on the current
+design unchanged**, since frozen experts and a frozen router reduce it to the dense
+case. Re-check when scaling to 7–8B, where MoE options get more tempting.
 
 **Verify the chat template before generating any SFT data.** Recent Qwen models use a
 hybrid thinking/non-thinking template. Fine-tuning against the wrong template degrades
@@ -508,11 +511,16 @@ In rough order of when they'll start to hurt:
 6. **Hivemind `SyncBackend`** — when central bandwidth genuinely binds. At ~3.4 GB/hr
    for ten workers, that is a long way off. Do not do this early; it buys nothing at
    current scale and costs NAT traversal work.
-7. **`rl_rollout`** — needs its own spec review. Isaac Lab's image size and PyTorch
+7. **MoE expert training.** Deferred, not blocked (§5.4). Needs per-expert routed-token
+   counts in submit metrics and the per-tensor weighting already provided for in §5.2;
+   no schema change. Keep the router frozen longest — averaging routers trained on
+   different shard distributions is the genuinely hard part. Note the cheap
+   intermediate step: an MoE base with attention-only LoRA needs nothing new at all.
+8. **`rl_rollout`** — needs its own spec review. Isaac Lab's image size and PyTorch
    pinning break the shared-layer story (Review Finding B), and shipping raw
    trajectories over WAN is a heavier data path than shipping weight deltas. Worth
    evaluating whether workers can send gradients or advantages instead of trajectories.
-8. **gVisor/Kata, TOPLOC verification, Byzantine-robust aggregation** — when the pool
+9. **gVisor/Kata, TOPLOC verification, Byzantine-robust aggregation** — when the pool
    includes people you don't know. §5.2's weighted mean is the drop-in point for
    trimmed-mean/median.
 

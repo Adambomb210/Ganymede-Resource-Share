@@ -46,7 +46,7 @@ Everything else below is a gap to fill, not a mistake.
 | Run concurrency | **Sequential** for v1 — one active run at a time. Eligibility model written so concurrency is a later scheduling change, not a redesign. |
 | Fleet | Wide heterogeneity expected: Apple Silicon, 12 GB consumer cards, A100s. Three tiers — Architecture v2 §6.8. **No reliable schedule**, so rounds close on accumulated work (§3.2) and the inventory is derived (§6.11). |
 | Compatibility | **A project goal** (§0). The worker is a package; the container is one delivery path. Linux, macOS, and Windows all supported natively. |
-| Base model | Latest **dense** Qwen — not MoE, and verify the chat template. Rationale in `03-roadmap.md` → *Model*. |
+| Base model | Latest **dense** Qwen — not MoE, and verify the chat template. Rationale in `03-roadmap.md` → *Model*. MoE is deferred, not foreclosed (Architecture v2 §5.4). |
 | Data | Sensitivity **varies by run**; handled as a per-run classification gating eligibility (§6.10). |
 | v1 audience | Your group now, opening later — operator tooling, but install path and eligibility diagnostics kept honest from the start. |
 | Deployment | Coordinator containerized from day one; two subdomains; all hosts as config variables (§6.5). |

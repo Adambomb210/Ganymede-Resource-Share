@@ -491,12 +491,27 @@ which is also the raw material for Phase 2 reputation scoring.
 ### 5.2 Combine
 
 ```
-w_i      = steps_completed_i / Σ steps_completed        # straggler-tolerant weighting
-A_mean   = Σ w_i · A_i                                  # weighted mean of adapters
-outer_g  = A_base − A_mean                              # pseudo-gradient
-m        ← β·m + outer_g                                # persisted per run, β = 0.9
-A_next   = A_base − lr_outer · (outer_g + β·m)          # Nesterov
+w_i[t]   = weight of worker i for tensor t,  Σ_i w_i[t] = 1     # see below
+A_mean[t]= Σ_i w_i[t] · A_i[t]                                  # per-tensor mean
+outer_g  = A_base − A_mean                                      # pseudo-gradient
+m        ← β·m + outer_g                                        # per run, β = 0.9
+A_next   = A_base − lr_outer · (outer_g + β·m)                  # Nesterov
 ```
+
+**Weights are per-tensor, not per-worker — write it this way from the start.** For
+dense models every tensor gets the same scalar:
+
+```
+w_i[t] = steps_completed_i / Σ steps_completed      # identical for all t
+```
+
+which is exactly the straggler-tolerant weighting you want, and behaves identically to
+a scalar implementation. The reason for the extra index is §5.4: it is the one thing
+that would otherwise have to be rewritten to support MoE, and it costs nothing today.
+
+Guard: if `Σ_i w_i[t] == 0` — no worker contributed to tensor `t` — pass `A_base[t]`
+through **unchanged**. Never divide by zero, and never let an untouched tensor decay
+toward zero.
 
 Two things worth stating plainly:
 
@@ -531,6 +546,72 @@ class SyncBackend(Protocol):
 `HivemindBackend` implements the same two methods over a DHT and averaging group. The
 worker's training code never learns which is in use — that is the whole point of the
 seam, and it's cheap to maintain precisely because the interface is this narrow.
+
+---
+
+### 5.4 Forward compatibility: what MoE would need
+
+Nothing in this design forecloses MoE. It's worth recording exactly what would and
+wouldn't have to change, because the answer determines one decision worth taking now
+(§5.2's per-tensor weights) and leaves the rest genuinely deferrable.
+
+#### Works today, unchanged: MoE base + attention-only LoRA
+
+If LoRA targets only the attention projections (`q/k/v/o`) and leaves the experts and
+the router frozen, **there is no MoE interaction at all**. Every worker computes deltas
+against the same frozen function, routing is identical everywhere, and every adapter
+tensor receives gradient from every token. That is precisely the dense case, and it
+runs on the current design with a `lora_cfg` change and nothing else.
+
+So if MoE becomes attractive before the expert-training questions are settled, this
+path is available immediately. Note only that MoE bases are large in *total* params
+even when active params are small — a 30B-A3B needs ~60 GB in bf16 — so §6.8's VRAM
+eligibility will correctly restrict such a run to datacenter-class hardware.
+
+#### The real problem: LoRA on the experts themselves
+
+Token routing is data-dependent, and that is what breaks uniform averaging:
+
+- Worker A's shard routes mostly to experts {3, 7, 12}; worker B's to {1, 3, 19}.
+- Worker A's adapter for expert 7 receives real gradient. Worker B's stays at
+  initialization — a zero delta.
+- A uniform mean divides expert 7's genuine learning by the worker count. **Sparsely
+  activated experts get systematically diluted**, and the more experts relative to
+  workers, the worse it gets.
+
+This isn't invalid, it's *mis-weighted* — which is why the fix is a weighting change
+rather than a redesign:
+
+```
+w_i[t] ∝ tokens routed by worker i to the expert owning tensor t
+```
+
+That requires per-tensor weights (§5.2, already provided for) and per-expert token
+counts from workers. The submit body's `metrics` is free-form and `submissions.
+metrics_json` is unstructured, so **carrying that data needs no schema change either**.
+
+#### Three softer things, none of them blockers
+
+- **Acceptance gate 2** (§5.1) requires an exact key set. Keep it strict and adopt the
+  convention that untrained experts submit explicit zero tensors rather than omitting
+  keys — zeros compress to almost nothing, and a strict gate is worth more than the
+  bytes.
+- **Momentum on untouched experts.** `m` is already per-tensor, so nothing breaks, but
+  momentum will keep pushing an expert that received no update this round. Whether to
+  decay or freeze it is a tuning question to answer with data, not a design constraint.
+- **Router training** is the genuinely hard part and should stay out of scope longest.
+  Averaging routers trained on different shard distributions can produce a router worse
+  than any input, and it breaks consistency: the expert deltas being averaged were
+  computed under *different* routing than the averaged router will produce. Freeze the
+  router; revisit only with evidence.
+
+#### One thing already working in MoE's favour
+
+Bucket sharding uses a stable hash (§3.2), so shards are effectively random rather than
+topically clustered. That means every worker sees a broadly similar routing
+distribution, which *minimizes* the dilution problem above. Topical sharding would
+specialize workers to experts and make averaging much worse — so the existing default
+is the MoE-friendly one, and worth not changing casually.
 
 ---
 
