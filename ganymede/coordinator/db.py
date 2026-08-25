@@ -82,6 +82,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     worker_id         TEXT REFERENCES workers(id),
     lease_expires_at  TEXT,
     attempts          INTEGER NOT NULL DEFAULT 1,
+    -- Last progress figure the worker reported, for acceptance gate 5. Kept on
+    -- the task rather than recovered from the audit log: the audit table grows
+    -- with every heartbeat of every worker forever, so reading progress out of
+    -- it would make each submit scan a table that never stops growing.
+    last_heartbeat_steps INTEGER,
     created_at        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_round  ON tasks(run_id, round_idx, status);

@@ -275,9 +275,7 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             "SELECT base_adapter_ref FROM rounds WHERE run_id = ? AND idx = ?",
             (task["run_id"], task["round_idx"]),
         ).fetchone()
-        from ganymede.coordinator.aggregate import load_adapter, manifest_of
-
-        expected = manifest_of(load_adapter(store.get_bytes(rnd["base_adapter_ref"])))
+        expected = closer.expected_manifest(store, rnd["base_adapter_ref"])
         accepted, reason = closer.gate_submission(conn, store, task_id, expected)
 
         result = closer.maybe_close(conn, store, task["run_id"])
@@ -410,8 +408,14 @@ def _task_payload(spec: rounds.TaskSpec, store: Store) -> dict:
     }
 
 
-def bootstrap(settings: Settings) -> FastAPI:
-    """Entrypoint used by uvicorn: build schema and storage, then the app."""
+def bootstrap() -> FastAPI:
+    """Application factory for ``uvicorn --factory ganymede.coordinator.app:bootstrap``.
+
+    Takes no arguments on purpose: uvicorn calls a factory with none, and
+    configuration is environment-driven anyway (6.5). Tests build their own app
+    with ``create_app(settings, store)`` and never come through here.
+    """
+    settings = Settings.from_env()
     conn = connect(settings.db_path)
     init_schema(conn)
     conn.close()

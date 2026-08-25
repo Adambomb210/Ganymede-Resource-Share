@@ -36,6 +36,28 @@ class CloseResult:
     next_round_opened: bool
 
 
+# A round's base adapter never changes once written, so its manifest is safe to
+# cache by key. Without this every submit re-downloads and re-parses ~13 MB just
+# to learn a key set the coordinator already knew -- eight workers a round would
+# pay for that eight times over an artifact none of them changed.
+_MANIFEST_CACHE: dict[str, dict] = {}
+
+
+def expected_manifest(store: Store, base_adapter_ref: str) -> dict:
+    """Key set and shapes a submission must match, from the round's base adapter."""
+    cached = _MANIFEST_CACHE.get(base_adapter_ref)
+    if cached is None:
+        cached = aggregate.manifest_of(
+            aggregate.load_adapter(store.get_bytes(base_adapter_ref))
+        )
+        # One entry per round; a long run would otherwise accumulate one dict
+        # per round for the lifetime of the process.
+        if len(_MANIFEST_CACHE) > 4:
+            _MANIFEST_CACHE.clear()
+        _MANIFEST_CACHE[base_adapter_ref] = cached
+    return cached
+
+
 def gate_submission(
     conn: sqlite3.Connection,
     store: Store,

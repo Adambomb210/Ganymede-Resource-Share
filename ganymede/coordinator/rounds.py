@@ -316,6 +316,32 @@ def claim_task(
         if plan is None:
             return None
 
+        # Minimum viable throughput (3.5). Below some speed a worker costs more
+        # than it contributes: it holds a lease and a full ~13 MB round trip to
+        # add noise-level weight. The comparison is against what this round's
+        # other workers were actually budgeted, so the floor adapts to whatever
+        # hardware showed up rather than encoding an absolute steps/min.
+        peers = [
+            int(r["local_steps"])
+            for r in conn.execute(
+                """SELECT local_steps FROM tasks
+                   WHERE run_id = ? AND round_idx = ? AND status != 'expired'""",
+                (run_id, rnd["idx"]),
+            ).fetchall()
+        ]
+        if peers:
+            peers.sort()
+            mid = len(peers) // 2
+            median = (peers[mid] if len(peers) % 2 else (peers[mid - 1] + peers[mid]) / 2)
+            if not budget_mod.meets_floor(
+                plan.local_steps, median, settings.throughput_floor_frac
+            ):
+                # Not an error: this worker stays eligible for other runs.
+                raise NotEligible(
+                    f"below throughput floor for this run: {plan.local_steps} steps "
+                    f"< {settings.throughput_floor_frac:.0%} of median {median:.0f}"
+                )
+
         buckets = _pick_buckets(conn, run_id, plan.n_buckets, int(run["num_buckets"]))
         task_id = uuid.uuid4().hex
         expires = now + timedelta(seconds=settings.lease_duration_sec)
@@ -389,8 +415,16 @@ def heartbeat(
             raise RoundClosed("round is no longer open")
 
         expires = now + timedelta(seconds=settings.lease_duration_sec)
+        # Progress only ever moves forward. A worker that restarts mid-task and
+        # resumes from a checkpoint may report a lower figure than its own last
+        # heartbeat; taking the max stops that from being read as the worker
+        # having un-trained steps, which gate 5 would reject.
         conn.execute(
-            "UPDATE tasks SET lease_expires_at = ? WHERE id = ?", (_iso(expires), task_id)
+            """UPDATE tasks
+               SET lease_expires_at = ?,
+                   last_heartbeat_steps = MAX(COALESCE(last_heartbeat_steps, 0), ?)
+               WHERE id = ?""",
+            (_iso(expires), steps_completed, task_id),
         )
         conn.execute(
             """INSERT INTO audit (at, worker_id, event, detail_json)
@@ -402,16 +436,11 @@ def heartbeat(
 
 
 def last_heartbeat_steps(conn: sqlite3.Connection, task_id: str) -> int | None:
-    """Steps reported by the most recent heartbeat, for acceptance gate 5."""
+    """Highest progress figure the worker reported, for acceptance gate 5."""
     row = conn.execute(
-        """SELECT detail_json FROM audit
-           WHERE event = 'heartbeat' AND detail_json LIKE ?
-           ORDER BY id DESC LIMIT 1""",
-        (f'%"task": "{task_id}"%',),
+        "SELECT last_heartbeat_steps FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
-    if row is None:
-        return None
-    return json.loads(row["detail_json"]).get("steps")
+    return None if row is None else row["last_heartbeat_steps"]
 
 
 def abandon(conn: sqlite3.Connection, task_id: str, worker_id: str) -> None:
