@@ -51,6 +51,7 @@ capabilities are probed rather than enumerated (§6.8).
 | Uniform hardware assumed | **Three-tier heterogeneity model**; `compute_profile` eligibility | §6.7 |
 | Container = the worker | **Package = the worker**; container is one delivery path | §4.1 |
 | (absent) | Capability **probing** rather than hardware enumeration | §6.8 |
+| (absent) | Per-run **data classification** as a second eligibility axis | §6.9 |
 
 ---
 
@@ -274,8 +275,14 @@ package, and every delivery path wraps the same code:
 | Linux + NVIDIA, third-party host | Container | Full §4.5 hardening |
 | Linux + NVIDIA, own hardware | Container or `pip` + systemd | Contributor's choice |
 | macOS + Apple Silicon | `pip` + launchd (**no container** — §6.7) | OS-level only |
-| Windows + NVIDIA | WSL2 container, or `pip` | Varies |
+| Windows + NVIDIA | `pip` + Scheduled Task, or Docker Desktop/WSL2 | Weakest natively |
 | Anything else | `pip` | OS-level only |
+
+Windows is supported natively, not only through WSL2 — it's where most consumer GPUs
+actually live, and requiring WSL2 is a real hurdle for a volunteer. Note that unlike
+macOS, Docker Desktop on Windows *can* reach the GPU through WSL2, so the container
+path stays available for anyone who wants it (and is required for restricted runs —
+§6.9).
 
 The pinned-digest guarantee (above) applies *within* a backend. A CUDA container fleet
 shares one bit-identical PyTorch build; native installs necessarily won't. That is
@@ -448,13 +455,15 @@ FastAPI + SQLite on one small VM. No GPU.
 ### 6.1 Schema
 
 ```
-contributors  id, name, key_hash, enabled, created_at
+contributors  id, name, key_hash, enabled, clearance, created_at  -- §6.9
 workers       id, contributor_id, compute_profile_json, image_tag,
               first_seen, last_seen                                   -- §6.7
 runs          id, status, base_model, base_precision, lora_cfg_json,
               dataset_ref, hyperparams_json, current_round, target_rounds,
-              outer_momentum_ref, requires_json, created_at
+              outer_momentum_ref, requires_json, data_classification,
+              created_at
               -- requires_json: { backend, min_vram_mb, needs: [...] }  §6.7
+              -- data_classification: open | internal | restricted     §6.9
 rounds        run_id, idx, base_adapter_ref, status, quorum_min, deadline_at,
               opened_at, closed_at, result_adapter_ref, mean_loss
 tasks         id, run_id, round_idx, buckets_json, local_steps, status,
@@ -767,6 +776,20 @@ Two deliberate limits, worth stating so nobody is surprised:
   M-series Max with 64 GB+ will participate in bf16 runs at a fraction of a discrete
   GPU's rate. That's fine — it's a contributor who can participate.
 
+#### Why this raises the value of concurrent runs
+
+With **sequential** runs — the v1 decision — a run that requires nf4 excludes every
+Mac, and a bf16 8B run excludes every 3060. Those contributors idle until the next run
+happens to suit them.
+
+Wide hardware diversity therefore makes concurrency worth more than it would be
+otherwise: two active runs with different requirements keep the whole fleet busy where
+one cannot. Sequential is still right for v1 — it avoids scheduling, priority, and
+starvation entirely — but the eligibility model above is deliberately written so that
+turning on concurrency later is a scheduling change, not a redesign.
+
+---
+
 ### 6.8 Capability probing, not hardware enumeration
 
 Supporting almost any hardware rules out the obvious implementation. The coordinator
@@ -804,19 +827,39 @@ Consequences worth naming:
   getting work, the answer is in their stored profile: not enough memory, no nf4, or
   below the floor. That is a far better support experience than silence.
 
-#### Why this raises the value of concurrent runs
+### 6.9 Per-run data classification
 
-With **sequential** runs — the v1 decision — a run that requires nf4 excludes every
-Mac, and a bf16 8B run excludes every 3060. Those contributors idle until the next run
-happens to suit them.
+Data sensitivity varies by run, and **every eligible contributor receives the dataset
+in plaintext** — now including personal laptops, not only machines you administer. So
+sensitivity becomes a second eligibility dimension alongside capability (§6.7):
 
-Wide hardware diversity therefore makes concurrency worth more than it would be
-otherwise: two active runs with different requirements keep the whole fleet busy where
-one cannot. Sequential is still right for v1 — it avoids scheduling, priority, and
-starvation entirely — but the eligibility model above is deliberately written so that
-turning on concurrency later is a scheduling change, not a redesign.
+```
+eligible(worker, run) = capability_match(worker, run)
+                      AND contributor.clearance >= run.data_classification
+```
 
----
+Three classifications, with different rules:
+
+| Class | Who may serve it | Packaging | Dataset cache |
+|---|---|---|---|
+| `open` | any registered contributor | any path | may persist |
+| `internal` | contributors who have accepted an agreement | any path | may persist |
+| `restricted` | named contributors on hosts you administer | **container only** | **wiped on task exit** |
+
+Three consequences worth building in rather than bolting on:
+
+- **`restricted` runs forbid the native install path.** Not because native is
+  insecure per se, but because the container is what makes "wipe the dataset when the
+  task ends" enforceable rather than aspirational.
+- **Cache retention is per-classification.** `open` and `internal` datasets may sit in
+  the host cache between rounds — that's a real speed win. `restricted` ones are
+  removed when the task exits, accepting the re-download cost.
+- **Clearance is recorded per contributor, not per machine.** §6.3 already stores a
+  contributor row per key; this is one more column on it.
+
+This is cheap now and awkward later: retrofitting classification means auditing which
+datasets already reached which machines, which is a question with no good answer once
+it's been asked.
 
 ## 7. Host agent
 
