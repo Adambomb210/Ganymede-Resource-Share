@@ -201,11 +201,18 @@ cannot finish, and the round closes underneath it — its effort wasted entirely
 So budget from **time remaining in the current round**:
 
 ```
-local_steps_i = throughput_i × minutes_remaining × safety_factor
+usable   = minutes_remaining − est_download − est_upload − safety_margin
+local_steps_i = throughput_i × usable
 ```
 
-with a cutoff: if less than ~5 minutes remain, return `204` with a `Retry-After`
-pointing past the round boundary rather than handing out work that can't land. This
+`est_download` and `est_upload` come from that worker's **measured** transfer rates,
+recorded on its previous rounds (§6.9). A contributor on a slow uplink automatically
+gets a smaller step budget so the transfer still fits inside the round, instead of
+becoming an unexplained straggler. Nobody has to know or declare their bandwidth.
+
+With a cutoff: if `usable` falls below a few minutes, return `204` with a
+`Retry-After` pointing past the round boundary rather than handing out work that
+can't land. This
 makes opportunistic, short-lived participation productive, which matters much more when
 machines appear at random than when they're on a schedule.
 
@@ -651,13 +658,25 @@ environments and should be the same artifact in all of them:
 the emulation. Nothing needs rewriting when it moves to the server — the compose file
 gains a reverse-proxy front end and stops binding to localhost.
 
-**Two subdomains, not one.** Something like `ganymede-api.<domain>` for the
-coordinator and `ganymede-storage.<domain>` for MinIO. Path-routing both under one
-host fights the S3 client, which expects to own its URL space.
+**Two subdomains, not one** — path-routing both services under one host fights the S3
+client, which expects to own its URL space. Concrete names are deployment config, not
+architecture; everything below refers to them as variables:
 
-**Use path-style S3 addressing** (`storage.<domain>/bucket/key`), not virtual-host
-style (`bucket.storage.<domain>/key`). Virtual-host style needs wildcard DNS and a
-wildcard certificate for what is one bucket. Path-style is one A record and one cert:
+| Variable | Meaning |
+|---|---|
+| `COORDINATOR_HOST` | Public host for the FastAPI app |
+| `STORAGE_HOST` | Public host for MinIO |
+| `S3_BUCKET`, `S3_REGION` | Bucket and region (`auto` on R2) |
+| `S3_ACCESS_KEY`, `S3_SECRET_KEY` | Store credentials |
+| `BACKUP_ENDPOINT` | Off-box backup target (§6.6) — must not resolve to the same machine |
+| `GANYMEDE_KEY` | Per-contributor bearer token, worker side (§6.3) |
+
+Nothing in the codebase should contain a hostname. The same compose file runs on
+localhost, on the LAN, and in production with only these values changing.
+
+**Use path-style S3 addressing** (`STORAGE_HOST/bucket/key`), not virtual-host style
+(`bucket.STORAGE_HOST/key`). Virtual-host style needs wildcard DNS and a wildcard
+certificate for what is one bucket. Path-style is one A record and one cert:
 
 ```python
 boto3.client("s3", endpoint_url=..., config=Config(s3={"addressing_style": "path"}))
@@ -666,9 +685,9 @@ boto3.client("s3", endpoint_url=..., config=Config(s3={"addressing_style": "path
 R2 supports path-style too, so this costs nothing in portability (§6.6).
 
 **TLS terminates at your existing reverse proxy**, which makes the presigned-URL host
-footgun in §6.6 a certainty rather than a risk — the coordinator will be signing for a
-public subdomain while talking to MinIO over the internal network. Set MinIO's
-`MINIO_SERVER_URL` to the public storage subdomain and sign with that exact value.
+footgun in §6.6 a certainty rather than a risk — the coordinator will be signing for
+`STORAGE_HOST` while talking to MinIO over the internal network. Set MinIO's
+`MINIO_SERVER_URL` to `STORAGE_HOST` and sign with that exact value.
 
 ### 6.6 Artifact storage — self-hosted now, portable later
 
@@ -717,9 +736,9 @@ R2 trigger — not an arbitrary future date.
 The point of S3-compatibility is that migration should be **configuration, not code**:
 
 ```
-GANYMEDE_S3_ENDPOINT=https://storage.ganymede.example   # → R2's endpoint
-GANYMEDE_S3_BUCKET=ganymede
-GANYMEDE_S3_REGION=us-east-1                            # → "auto" for R2
+GANYMEDE_S3_ENDPOINT=https://${STORAGE_HOST}    # → R2's endpoint
+GANYMEDE_S3_BUCKET=${S3_BUCKET}
+GANYMEDE_S3_REGION=${S3_REGION}                 # → "auto" for R2
 GANYMEDE_S3_ACCESS_KEY / _SECRET_KEY
 ```
 
@@ -741,7 +760,7 @@ swap; the compatible surface shifts over time.
 
 Presigned signatures cover the **host**. If MinIO sits behind the same reverse proxy
 that terminates TLS for the coordinator, the coordinator must sign for the *public*
-endpoint (`https://storage.ganymede.example`), not for MinIO's internal address.
+endpoint (`https://${STORAGE_HOST}`), not for MinIO's internal address.
 Get this wrong and every worker fetch fails signature validation with an error that
 does not obviously say "you signed the wrong hostname."
 
@@ -937,6 +956,15 @@ Consequences worth naming:
 - **The probe is also the diagnostic.** When a contributor asks why they're never
   getting work, the answer is in their stored profile: not enough memory, no nf4, or
   below the floor. That is a far better support experience than silence.
+
+**Transfer rates are measured too, not probed.** The worker times its own artifact
+download and upload each round and reports both. After one round the coordinator knows
+that machine's real-world bandwidth, which feeds the step budget (§3.2). This is
+strictly better than asking a contributor for a number they'd have to look up and
+would often get wrong.
+
+Together, the probe plus these observations mean **the fleet inventory is something
+the system produces, not something anyone maintains** — see §6.11.
 
 ### 6.10 Per-run data classification
 

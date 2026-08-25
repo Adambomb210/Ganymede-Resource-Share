@@ -83,7 +83,8 @@ doesn't work." You want to eliminate the first before investigating the second.
 
 ### Model: start much smaller than 8B
 
-**Bring up on a ~1.5–4B dense Qwen in bf16, then scale to 8B once M4 passes.**
+**Decided: Qwen 1.7B, dense, bf16.** Confirm the exact model ID at M0 — the family
+moves quickly. Scale to 7–8B after M4 passes, as a run-config change.
 
 This is worth more than it sounds:
 
@@ -94,7 +95,7 @@ This is worth more than it sounds:
 - **You exercise the heterogeneity paths early**, which is where the interesting bugs
   are. On an 8B nf4 run the Macs sit idle and you'd find their bugs months later.
 - **Rounds are minutes, not hours.** You can iterate the whole pipeline several times
-  a day instead of once. Use ~10-minute rounds for bring-up rather than §3.3's 30–45.
+  a day instead of once. Use ~10-minute rounds for bring-up rather than §3.4's 15–20.
 - **Adapters are ~10–15 MB**, so the storage and bandwidth plumbing gets tested
   without waiting on transfers.
 
@@ -102,36 +103,24 @@ Then scale: same code, new run, `base_model` and `base_precision` changed in the
 config. That's the whole point of config-over-code, and scaling the model is a good
 first proof that the property actually holds.
 
-### Dataset: public and permissive for bring-up
+### Dataset: Dolly 15k
 
-You want something well-understood with a known-good outcome, so that a bad result
-means your plumbing is wrong rather than your data. All of these are `open` class
-(§6.10), which also keeps clearance out of the bring-up path.
+**Decided: Databricks Dolly 15k, `open` class (§6.10).** Human-written, permissively
+licensed, and small enough that a full run takes minutes — which is what you want
+while the thing under test is the plumbing rather than the model. You want a dataset
+with a known-good outcome, so that a bad result means your pipeline is wrong rather
+than your data. Verify the current licence on the dataset card before use; these
+change.
 
-| Dataset | Size | Notes |
-|---|---|---|
-| **Databricks Dolly 15k** | 15k | Human-written, tiny, CC-BY-SA. Best for the very first end-to-end loop — a full run takes minutes |
-| **HuggingFace No Robots** | 10k | High-quality human-written SFT. Non-commercial licence — fine for bring-up, check before anything else |
-| **UltraChat 200k** | 200k | The Zephyr SFT set. Big enough for meaningful bucket sharding and multi-round convergence |
-| **Tulu 3 SFT mixture** | ~940k | Modern, strong, well-documented mixture. More than you need for bring-up |
+**Buckets: 64** (~230 samples each), per the sizing rule below.
 
-**Verify the current licence on each dataset card before use** — these change, and
-this table is a starting point rather than an authority.
-
-**Decided:**
-
-- **Bring-up (M0–M4): Qwen 1.7B (dense, bf16) + Dolly 15k.** Confirm the exact model
-  ID at M0. No `nf4` anywhere in the bring-up path, so every contributor — Macs and
-  3060s included — is eligible from the first run.
-- **Buckets: 64** for Dolly (~230 samples each), per the sizing rule below.
-- **Later:** scale to 7–8B and your own dataset, as a run-config change.
-
-One caveat on Dolly worth knowing at M4: at 15k samples a round of any real size
-covers a meaningful fraction of the set, so workers will repeat data across rounds
-sooner than they would on a larger corpus. That's fine for proving the *machinery* —
-it just means Dolly measures whether aggregation works, not how far the model can get.
-If M4's convergence result looks suspiciously flat, dataset exhaustion is the first
-thing to check, and swapping to UltraChat 200k is the test.
+A larger corpus will be wanted eventually, but that's an M4 question and not worth
+settling now. One caveat to carry forward when you get there: at 15k samples a round
+of any real size covers a meaningful fraction of the set, so workers repeat data
+across rounds sooner than they would on a larger corpus. That's fine for proving the
+*machinery* — Dolly measures whether aggregation works, not how far the model can
+get. If M4's convergence result looks suspiciously flat, **dataset exhaustion is the
+first thing to check**, and moving to a larger corpus is the test.
 
 ### Bucket count should scale with dataset size
 
@@ -266,8 +255,11 @@ Exit criteria:
 - Machine idles → worker starts within one timer interval
 - `touch /etc/ganymede/pause` → running container stops, no new ones start
 - Manifest tag bump → agent pulls and restarts on the new tag with no manual step
-- **A second person installs it from `INSTALL.md` alone, with no help from you.** That
-  test is the milestone; a working agent that only you can install isn't done
+- **The install path is validated on a fresh machine**, not just yours. With no second
+  contributor yet, a clean VM or a fresh container is a good proxy — it catches the
+  undocumented dependency and the "works because your shell already had it" bug, which
+  is most of the value. Re-run the test with a real second person when one exists;
+  until then, treat a from-scratch install on clean OS images as the bar
 - `INSTALL.md` states a minimum free-disk figure, and cache eviction demonstrably
   holds the cache under its cap across two runs with different base models
 
@@ -275,28 +267,49 @@ Exit criteria:
 
 ## M4 — Multi-node convergence — *the milestone that proves the thesis*
 
-**~3–4 days, plus wall-clock training time.**
+**Splits in two, because you currently have only your own hardware.** That's less of a
+blocker than it looks: the two things M4 proves need very different setups, and only
+one of them needs other people.
 
-Three or more real workers, sharded data, a real run to convergence, measured against
-M0's baseline.
+### M4a — Protocol under real concurrency (solo, ~2 days)
+
+Run **several worker processes against your own machine**. On one GPU they time-slice
+and run slowly; that's fine, because nothing here is measuring speed. If you have more
+than one GPU, better. Even CPU workers on a tiny model validate the protocol.
+
+Proves: concurrent claims don't double-lease, rounds close on accumulated work with
+varying worker counts, late submissions get `409`, leases expire and re-lease cleanly,
+aggregation combines several real adapters, bucket coverage advances.
+
+Exit criteria:
+- Three concurrent workers complete several rounds with no double-leasing and no
+  stuck tasks
+- Killing one mid-round costs that round's work for that worker and nothing else
+- Bucket coverage advances rather than re-training the same shards
+- Per-round loss descends across rounds
+
+**This is reachable today with one machine**, and it's where most protocol bugs live.
+
+### M4b — Convergence on genuinely parallel hardware (~1 day + training time)
+
+Proving that aggregation *helps* needs real parallelism, which time-slicing can't give
+you. You don't need contributors for this: **rent three cheap instances for an
+afternoon.** At Qwen 1.7B almost anything with a GPU qualifies, and a few hours of
+three small rentals costs about as much as lunch. That is a very cheap way to
+de-risk the thesis before asking anyone to install anything.
 
 Exit criteria:
 - Aggregated model **matches or beats** the M0 single-node baseline on the held-out set
-- Wall-clock-to-target-loss is better than single-node — otherwise the entire system
-  is an expensive way to train slower
+- Wall-clock-to-target-loss beats single-node — otherwise the system is an expensive
+  way to train slower
 - Both combine modes A/B'd (§5.2's research risk). If DiLoCo outer momentum doesn't
   beat plain weighted mean on LoRA adapters, **ship the plain mean** and record the
   negative result
-- A worker killed mid-round costs one round and nothing else
-- Per-round loss curve is visible and smooth; no divergence, no silent degradation
-- Mixed-speed workers (at least two GPU classes, ideally the widest spread you have —
-  a 3060 alongside an A100) both land near the round deadline, confirming §3.4's
-  budgets rather than truncating the slower card every round
-- No single worker exceeds the §3.4 dominance cap; removing the fastest worker
-  mid-run degrades the round rather than wrecking it
+- Mixed-speed workers both land near the round deadline, confirming §3.5's budgets
+- No single worker exceeds the §3.5 dominance cap
 
 Everything before this is plumbing. This is where you find out whether the idea works.
-Budget for it to fail the first time and need a tuning pass — that is the normal
+Budget for it to fail the first time and need a tuning pass — that's the normal
 outcome, not a signal to abandon the approach.
 
 ---
@@ -338,13 +351,18 @@ Exit criteria:
 
 ```
 M0 ─────────► M2 ─┐
- │  training       ├──► M4 ──► M5
- └──► M1 ─────► M3 ┘
+ │  training       ├──► M4a ──► M4b ──► M5
+ └──► M1 ─────► M3 ┘   solo    rented
      coordinator
 ```
 
 M1 depends on M0 only for the LoRA config shape (needed by the acceptance gates), so
-the two tracks can overlap if there's a second person. M4 needs all four.
+the two tracks can overlap if there's a second person. M4a needs all four.
+
+**Everything through M4a is reachable with one machine and no contributors.** Only M4b
+needs genuinely parallel hardware, and renting it for an afternoon is cheaper and
+faster than waiting for volunteers — and it means the first person you *do* ask to
+install something is joining a system already known to work.
 
 If you already have a fine-tuning pipeline to port, M0's trainer is a day rather than
 two, and the calibration harness is the only genuinely new build.
@@ -385,82 +403,50 @@ In rough order of when they'll start to hurt:
 
 ---
 
-## Open questions — needed before M1
+## Open questions
 
-Blocking or near-blocking. Rough order of urgency.
+Three remain. Two of the earlier ones closed themselves.
 
-1. **Base model — Qwen, latest generation. Two things to settle at M0.**
+1. **The eval set and target metric.** What number decides M4b passed? Define it
+   during M0 while the baseline is being established, not after — a baseline you can't
+   compare against isn't one. *Needed for M0's exit criteria.*
 
-   **Pick the newest dense Qwen in the 7–8B range** and confirm the exact model ID on
-   HuggingFace when you start M0 — the family moves quickly and my knowledge of what's
-   current has a cutoff. Apache 2.0 across most of the family is why this is the
-   cleanest choice for a project that ships adapters to many machines.
+2. **Your own dataset**, when bring-up is done: what it is, how large, where it lives,
+   and which classification it warrants (§6.10). Dolly carries M0–M4; this is the
+   first *real* run's input. *Not needed until after M4.*
 
-   **Dense, not MoE — this one matters.** Recent Qwen generations include MoE variants,
-   and MoE interacts badly with DiLoCo-style averaging: which experts a worker trains
-   depends on how *its* data shard routes, so different workers update different
-   experts and averaging them is not the same operation it is for a dense model.
-   Router state adds a second divergence path. Treat MoE + collaborative averaging as
-   a research project, not a v1 default.
+3. **Contributor agreement**, before the first non-`open` run. §6.10 gates `internal`
+   and `restricted` runs on clearance, which implies contributors accept something
+   before receiving non-public data. It needn't be elaborate, but it's also the
+   natural place to settle who owns the resulting adapters. Dormant while you're the
+   only contributor. *Needed before the first non-`open` run.*
 
-   **Check the chat template before generating any SFT data.** Recent Qwen models use a
-   hybrid thinking/non-thinking template. Fine-tuning against the wrong template
-   degrades behavior in ways that don't show up in training loss — you see it only in
-   generation, which would silently invalidate M0's baseline. Verify it round-trips
-   first. *Needed for M0.*
+### Closed
 
-2. **The dataset(s).** What are they, how large, where do they live? Must shard into
-   ~1000 stable buckets. Sensitivity is now handled per-run by §6.10's classification,
-   so the remaining question is narrower: **which classification does the first run
-   get, and who holds `internal` / `restricted` clearance?** *Needed for M0.*
+- ~~**Base model**~~ → Qwen 1.7B dense bf16 for bring-up, 7–8B later.
+- ~~**Bring-up dataset**~~ → Dolly 15k, 64 buckets.
+- ~~**Object store**~~ → self-hosted MinIO, R2 by config swap (§6.6).
+- ~~**Coordinator hosting**~~ → deployment config, not a design question. Everything
+  refers to `COORDINATOR_HOST` / `STORAGE_HOST` and friends (§6.5); no hostname
+  appears in the codebase. Still need real values before M1 *deploys*, but nothing is
+  blocked on choosing them.
+- ~~**Hardware inventory**~~ → **derived, not maintained** (§6.11). Capabilities are
+  probed at registration, throughput and bandwidth are measured while working, and
+  availability is observed. `GET /v1/fleet` renders the current picture. There is no
+  roster to collect or keep current.
+- ~~**Platform policy check**~~ → deferred with the rented-host phase; nothing depends
+  on it while you're on your own hardware.
 
-3. ~~**Object store.**~~ **Resolved: self-hosted MinIO on the coordinator VM**, S3
-   config in env vars so R2 is a later config swap (§6.6). Two follow-ons this raises:
-   **where do off-box backups go?** (needs to be a different machine — a free
-   object-storage tier is fine and is a painless way to start an R2 account early),
-   and **how much volume to provision?** 200 GB is generous for 10 workers × 100
-   rounds, but it depends on dataset size, which is question 2. *Needed for M1.*
+### A note on being the only contributor
 
-4. **Coordinator hosting.** A small always-on VM, a domain, and TLS. Any of Hetzner /
-   Fly / Vultr is fine; the requirements are modest and the choice isn't
-   architectural. TLS is mandatory (§6.3). *Needed for M1.*
+Nothing in the design assumes a fleet, so solo development runs into no walls:
 
-5. **Held-out eval set and target metric.** What number decides whether M4 passed?
-   Define it during M0 while the baseline is being established, not after. *Needed
-   for M0's exit criteria.*
-
-6. **Contributor hardware inventory.** Concretely, a row per machine:
-
-   | Field | Why it's needed |
-   |---|---|
-   | Label / owner | Who to ask when it misbehaves |
-   | OS | Picks the packaging path — container, launchd, or Scheduled Task (§4.1) |
-   | GPU / chip | With Apple Silicon, the chip variant matters (Air vs Max) |
-   | VRAM or unified RAM | The main eligibility gate (§6.8 Tier 2) |
-   | ~~Typical availability~~ | **Don't bother** — no reliable schedule exists. The coordinator measures participation instead (§3.2, §6.1) |
-   | Upload bandwidth | An 85 MB adapter on a 1 Mbit/s uplink is 11 minutes of a 35-minute round — that machine needs longer rounds or a smaller model |
-   | Who administers it | Decides `restricted`-run eligibility (§6.10) |
-
-   Three eligible machines is the minimum for a meaningful M4 — and note "eligible"
-   is per-run, so the count that matters is how many clear the bar for *that* run.
-   Upload bandwidth is the field people forget and the one that quietly wrecks round
-   pacing.
-
-   **Availability is deliberately absent.** Machines come and go unscheduled, so the
-   design treats fleet size as unknown at all times (§3.2) rather than planning around
-   a roster. The coordinator measures who actually showed up; you don't predict it.
-   *Needed for M3/M4.*
-
-7. **Platform policy check** (deferrable to Phase 2, but cheap to do early): does
-   running your own workload on a GPU listed for rent affect reliability or
-   availability scoring on Vast/TensorDock? This determines whether the donated-host
-   model works as designed (Review Finding M).
-
-8. **Contributor agreement.** §6.10 gates `internal` and `restricted` runs on clearance,
-   which implies contributors accept *something* before receiving non-public data. It
-   needn't be elaborate, but it needs to exist before the first non-`open` run, and
-   it's the natural place to also settle who owns the resulting adapters. Cheap now,
-   awkward once data has already moved. *Needed before the first `internal` run, not
-   for M0.*
-
-Items 1, 2, and 5 gate M0, which gates everything. They're worth settling first.
+- Rounds close on **accumulated work**, not worker count (§3.2), so a one-machine run
+  is a legitimate run rather than a degenerate case.
+- `distinct_contributors = 1` every round is **expected** right now, not a warning.
+  M5's health metric only becomes meaningful once others join — don't tune against it
+  yet.
+- §6.10's classification machinery is dormant and costs nothing. It's there so that
+  the first sensitive run doesn't require retrofitting.
+- Everything through **M4a** is reachable today. Only M4b needs parallel hardware, and
+  three cheap rentals for an afternoon beats waiting for volunteers.
