@@ -88,7 +88,25 @@ doesn't work." You want to eliminate the first before investigating the second.
 ### Model: start much smaller than 8B
 
 **Decided: Qwen 1.7B, dense, bf16.** Confirm the exact model ID at M0 — the family
-moves quickly. Scale to 7–8B after M4 passes, as a run-config change.
+moves quickly and it's worth checking what's current rather than trusting a name
+written here. Scale to 7–8B after M4 passes, as a run-config change.
+
+Two constraints that apply at **every** size, not just bring-up:
+
+**Dense, not MoE.** Recent Qwen generations include MoE variants, and MoE interacts
+badly with DiLoCo-style averaging: which experts a worker trains depends on how *its
+own* data shard routes, so different workers update different experts and averaging
+them is not the operation it is for a dense model. Router state adds a second
+divergence path on top. Treat MoE + collaborative averaging as a research project,
+not a default — and re-check this when scaling to 7–8B, where MoE options are more
+tempting.
+
+**Verify the chat template before generating any SFT data.** Recent Qwen models use a
+hybrid thinking/non-thinking template. Fine-tuning against the wrong template degrades
+behavior in ways that **do not show up in training loss** — you see it only in
+generation, which means it would silently corrupt M0's baseline and everything
+compared against it. Confirm the template round-trips before the baseline run. This is
+also what the 20-prompt greedy smoke set (below) is there to catch.
 
 This is worth more than it sounds:
 

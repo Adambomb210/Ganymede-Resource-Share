@@ -604,6 +604,7 @@ POST /v1/tasks/{id}/submit
 POST /v1/tasks/{id}/abandon      → 200   releases lease immediately
 
 GET  /v1/runs/{id}/rounds/current → { idx, status, base_adapter_url, deadline_at }
+GET  /v1/fleet                    → derived inventory (§6.11)
 GET  /healthz    GET /metrics     GET /status   (read-only HTML)
 ```
 
@@ -1004,6 +1005,33 @@ Three consequences worth building in rather than bolting on:
 This is cheap now and awkward later: retrofitting classification means auditing which
 datasets already reached which machines, which is a question with no good answer once
 it's been asked.
+
+### 6.11 The fleet inventory is derived, not maintained
+
+There is no roster to keep current. Every fact worth knowing about a contributor
+machine is either probed on registration (§6.9) or observed while it works, so the
+inventory is a **view the coordinator renders**, never a document that drifts out of
+date:
+
+| Fact | Source |
+|---|---|
+| OS, backend, device, VRAM | Probe, at registration (§6.9) |
+| Real allocation ceiling, precision support | Probe — measured, not spec-sheet |
+| Compute throughput | Probe benchmark, then refined from each round's metrics |
+| Upload / download bandwidth | Timed during the worker's own transfers (§6.9) |
+| Availability | Observed `last_seen` and `rounds_joined`. Never declared (§3.2) |
+| Contributor, clearance | The key it authenticates with (§6.3, §6.10) |
+
+`GET /v1/fleet` renders it: who is registered, what they can do, when they were last
+seen, how much they've contributed, and — for anyone not currently eligible — why.
+
+Two properties this buys:
+
+- **Hardware nobody anticipated just works.** No allowlist to update, no deploy.
+- **Nothing to keep in sync.** A contributor who upgrades a GPU re-probes and the
+  inventory is correct; nobody has to remember to edit anything.
+
+---
 
 ## 7. Host agent
 
