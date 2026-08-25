@@ -54,6 +54,9 @@ a measurement instead of a judgement call. See *Eval metric* below.
 
 ### Exit criteria
 
+- Windows environment set up per *Developing on Windows* below — long paths, `HF_HOME`,
+  developer mode — before anything else, since all three bite during the first model
+  download
 - Trainer runs, loss descends, adapter round-trips through safetensors
 - `ganymede-calibrate` produces a valid `calibration.json` for the first run config
 - The run fits the target card at the chosen `base_precision`, with headroom
@@ -257,6 +260,35 @@ count varies freely against it, which is the property that matters (§6.10).
 
 ---
 
+## Developing on Windows
+
+Primary development is Windows + NVIDIA, which is the least-trodden of the three
+supported platforms. Nothing here is a blocker, but each item costs an afternoon if
+you meet it by surprise instead of on purpose.
+
+**Good news first:** Docker Desktop's WSL2 backend *can* reach the GPU, unlike macOS.
+So the container path is testable locally and **M2 needs no rented hardware** — only
+M4b does.
+
+| Issue | What to do |
+|---|---|
+| `MAX_PATH` 260-char limit vs. HF cache paths | Enable Win32 long paths, and set `HF_HOME` to something short like `C:\hf` |
+| HF cache uses symlinks; Windows needs developer mode or admin | Enable developer mode, or accept that the cache silently doubles in size from copies |
+| `multiprocessing` uses spawn, not fork | Guard entry points with `if __name__ == "__main__"`; start with `num_workers=0` in the DataLoader |
+| No cgroups for resource limits | Job Objects, or accept no limits on native installs. Container path is unaffected |
+| `bitsandbytes` is least reliable here | Irrelevant during bring-up — bf16 at 1.7B needs no quantization. Re-check before any `nf4` run |
+| Git line endings can corrupt scripts inside containers | `.gitattributes` pinning shell scripts to LF |
+| Signals don't work like Unix | Already handled — the stop path is a sentinel file, not `SIGTERM` (§4.4) |
+
+**One risk worth naming.** Developing on Windows means the Linux container path — the
+primary deployment target for any third-party host — gets less day-to-day exercise.
+Linux-specific bugs will otherwise surface late, at exactly the moment you're asking
+someone else to install something. Mitigation: **CI builds and smoke-tests the
+container on Linux from M2 onward**, so the path you use least is still exercised on
+every commit.
+
+---
+
 ## M1 — Coordinator
 
 **~5–6 days** (was 4–5; self-hosted storage adds MinIO standup, TLS, GC, and backup).
@@ -327,7 +359,9 @@ Deliverables:
 - `ganymede/worker/probe.py` — the §6.9 self-test: allocation ceiling, precision
   support, benchmark score. Backend-dispatched (cuda / mps / rocm / cpu)
 - `docker/torch-base.Dockerfile`, `worker-core.Dockerfile`, `worker-llm.Dockerfile`
-- CI that builds and pushes all three, pinning `torch-base` **by digest**
+- CI that builds and pushes all three on **Linux**, pinning `torch-base` by digest,
+  and runs a container smoke test — the primary deployment path must not depend on
+  someone remembering to test it manually (see *Developing on Windows*)
 
 Exit criteria:
 - One real GPU claims from a real coordinator, trains, submits, loops

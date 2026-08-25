@@ -50,6 +50,7 @@ Everything else below is a gap to fill, not a mistake.
 | Data | Sensitivity **varies by run**; handled as a per-run classification gating eligibility (§6.10). |
 | v1 audience | Your group now, opening later — operator tooling, but install path and eligibility diagnostics kept honest from the start. |
 | Deployment | Coordinator containerized from day one; two subdomains; all hosts as config variables (§6.5). |
+| Dev machine | Windows + NVIDIA. Container path testable locally via WSL2, so only M4b needs rented hardware. Stop/pause controls are sentinel files rather than signals (§4.4). |
 | Eval | Held-out Dolly loss vs. the single-node baseline on two axes, tolerance from measured seed variance. |
 
 These are assumed throughout the revised architecture (`02-architecture-v2.md`).

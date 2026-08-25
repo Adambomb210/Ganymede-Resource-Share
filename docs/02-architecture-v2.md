@@ -424,19 +424,41 @@ Inner optimizer state is **not** carried across rounds — that's standard DiLoC
 inner optimizer each round, momentum lives only in the outer step on the coordinator.
 It also means nothing optimizer-shaped needs to survive preemption.
 
-### 4.4 Preemption handling
+### 4.4 Stopping cleanly
 
-On SIGTERM the worker **abandons its lease and exits**. It does not try to checkpoint
-and upload under time pressure.
+When told to stop, the worker **abandons its lease and exits**. It does not try to
+checkpoint and upload under time pressure.
 
 Rationale (Finding D): Docker's default stop grace is 10 s, and platform preemption can
 be harder still. A save-and-upload race is likely to lose and, worse, may half-upload.
 Abandoning releases the shard for immediate re-lease by another worker — strictly
 better for the swarm than a partial artifact of uncertain quality.
 
-`docker run --stop-timeout 120` gives room for a best-effort partial submit *when the
-signal arrives early enough*, which is an optimization, not a requirement. The
-correctness path is abandon-and-exit.
+#### The stop signal is a file, not a signal
+
+Signals don't port. `SIGTERM` is delivered reliably to a Linux container and to a
+native macOS process, but native Windows has no real equivalent — console control
+handlers and service control codes are different mechanisms with different semantics,
+and building the correctness path on them means three implementations of the one
+thing that must not be flaky.
+
+So the primary stop mechanism is a **sentinel file the worker polls**. It is already
+polling — heartbeats run every 60 s — so this costs one `os.path.exists` per cycle
+and behaves identically on all three platforms:
+
+| Platform | Stop sentinel |
+|---|---|
+| Linux / macOS | `$GANYMEDE_STATE/stop` (default `/var/lib/ganymede/`) |
+| Windows | `%PROGRAMDATA%\Ganymede\stop` |
+
+Signal handlers stay as an **optimization** where they work: catching `SIGTERM` lets a
+container abandon its lease within milliseconds instead of within a poll interval.
+That's worth having, and it is not what correctness rests on. `docker run
+--stop-timeout 120` still gives room for a best-effort partial submit when the signal
+arrives early enough.
+
+The same reasoning covers the contributor's pause control (§7.1) — one sentinel-file
+mechanism, two files, three platforms.
 
 ### 4.5 Isolation (baseline, unchanged in spirit from v1 §3.4)
 
@@ -1141,14 +1163,17 @@ class IdleBackend(Protocol):
 ```
 
 - **`local`** (v1, own hardware): no non-Ganymede process in
-  `nvidia-smi --query-compute-apps`, AND no `/etc/ganymede/pause` file, AND (optional)
-  inside a configured time window.
+  `nvidia-smi --query-compute-apps`, AND no `pause` sentinel present, AND (optional)
+  inside a configured time window. User-idle detection differs per platform —
+  `GetLastInputInfo` on Windows, `ioreg` on macOS — but the predicate is the same.
 - **`vast`**, **`tensordock`** (later): query the platform API for active rentals on
   this GPU.
 
-`/etc/ganymede/pause` is the contributor's kill switch. It must work with no network,
-no coordinator, and no explanation required — `touch` the file and Ganymede stops
-taking the GPU. Document it prominently; it's what makes the ask reasonable.
+The **pause sentinel** is the contributor's kill switch — `$GANYMEDE_STATE/pause`, or
+`%PROGRAMDATA%\Ganymede\pause` on Windows. It must work with no network, no
+coordinator, and no explanation required: create the file and Ganymede stops taking
+the GPU. Document it prominently; it's what makes the ask reasonable. Same mechanism
+as the stop sentinel (§4.4), deliberately.
 
 **Verify before the rented-host phase:** whether running your own workload on a listed
 GPU affects platform reliability scoring (Review Finding M).
