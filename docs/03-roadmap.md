@@ -88,28 +88,69 @@ to train.** Using your real target data for M0–M4 conflates two failure modes 
 look identical from the outside: "the infrastructure is broken" and "this fine-tune
 doesn't work." You want to eliminate the first before investigating the second.
 
-### Model: start much smaller than 9B
+### Model: start much smaller than the scale target
 
-**Decided: `Qwen/Qwen3.5-2B-Base`, dense, bf16.** Verified against the HuggingFace API
-(Aug 2026): dense — no expert keys in `config.json` — Apache 2.0, and widely used.
-Scale to `Qwen3.5-9B` after M4 passes, as a run-config change.
+**Decided: `Qwen/Qwen3-1.7B-Base`, dense, text-only, bf16.** Scale to
+`Qwen3-8B-Base` after M4 passes, as a run-config change.
 
-Notes from checking the family rather than trusting a remembered name:
+**This reverses an earlier pick of `Qwen3.5-2B-Base`, and the reason matters.** That
+choice was made by checking the HuggingFace *listing* — generation, parameter count,
+licence, download counts — which is enough to tell you a model is current and is not
+an obvious MoE. It is not enough to tell you what the architecture actually is. Loading
+`config.json` says otherwise on two counts:
 
-- **Qwen3.5** (Feb 2026) is the current generation for *small dense* models: 0.8B, 2B,
-  4B, 9B. Later generations (3.6, 3.8) so far ship only large models — 27B dense and
-  MoE variants — so 3.5 is the right line here, not the newest number.
-- **`model_type` is `qwen3_5`**, so an older `transformers` simply won't load it. Pin a
-  version that knows this architecture and record the pin; this is the most likely
-  first-hour failure at M0.
+- **The whole Qwen3.5 dense line is multimodal**, `-Base` included. Every size — 0.8B,
+  2B, 4B, 9B — reports `architectures: ["Qwen3_5ForConditionalGeneration"]` with a
+  24-layer vision tower in `vision_config`. `AutoModelForCausalLM` is the wrong class
+  for it; the text stack has to be addressed explicitly. The vision tower is weight,
+  memory, and LoRA-target surface that a text fine-tune has no use for.
+- **Attention is hybrid, 3:1.** `layer_types` alternates `linear_attention` and
+  `full_attention` — 18/6 at 2B, 24/8 at 4B and 9B. Only the `full_attention` layers
+  carry `self_attn.{q,k,v,o}_proj`. The `linear_attention` layers carry a different
+  module set entirely: `linear_attn.{in_proj_qkv, in_proj_a, in_proj_b, in_proj_z,
+  out_proj}` plus a `conv1d`.
+
+The second point is a live trap rather than a curiosity. **The standard LoRA recipe —
+`target_modules=["q_proj","k_proj","v_proj","o_proj"]` — attaches to 6 of 24 layers on
+Qwen3.5-2B and reports no error.** Training runs. Loss descends. The adapter is a
+quarter of the model it looks like. That failure would surface at M4 as "the
+distributed run underperforms the baseline," and the investigation would go straight to
+DiLoCo's outer step — §5.2's known research risk, and an entirely innocent one here.
+Bring-up exists to eliminate exactly this class of confusion, so the bring-up model
+should not be the one introducing it.
+
+`Qwen3-1.7B-Base` has neither problem: `Qwen3ForCausalLM`, no vision tower, and all 28
+layers `full_attention`. One module-name set, uniform coverage, `AutoModelForCausalLM`
+loads it directly.
+
+Verified here rather than assumed:
+
+- **The adapter manifest is 224 tensors, 6.42 M parameters, 12.85 MB in bf16** at
+  `r=16` over `{q,k,v,o}_proj` — 28 layers × 4 modules × 2 (A and B). Generated from
+  `config.json` on a meta device, with no weight download, which is also how the
+  coordinator can hold an expected-key manifest without ever holding a base model
+  (see *Blocking check for M1* below).
+- **`transformers` must know the architecture.** `qwen3` is long-settled, so this is
+  no longer the first-hour hazard it was for `qwen3_5` — but pin the version and record
+  the pin regardless.
 - **`-Base`, not the instruct variant, and that's deliberate**: a base model has no
   chat template, so you define the format yourself and the hybrid thinking/non-thinking
   template hazard below doesn't apply during bring-up. One less way for the baseline to
   be silently wrong. The hazard returns when you move to an instruct model — which is
   why the check stays documented.
-- **`Qwen3.5-0.8B-Base`** is worth knowing about as a second option: small enough to
-  train on CPU, which makes it useful for protocol testing (M4a) on machines with no
-  usable GPU at all.
+- **`Qwen3-0.6B-Base`** is the second option worth knowing about: small enough to train
+  on CPU, which makes it useful for protocol testing (M4a) on machines with no usable
+  GPU at all.
+
+**Qwen3.5 is not ruled out — it is deferred until the platform is proven.** It is the
+newer line and the better model, and both of its complications are tractable once
+there's a working baseline to compare against. Adopting it needs three things, none of
+which belong in bring-up: scoping the LoRA to the text stack so the vision tower is
+untouched; a target-module set that covers **both** attention types (or a deliberate
+decision to use `mlp.{gate,up,down}_proj`, which is present and identically shaped in
+every layer of both types and so sidesteps the hybrid problem entirely); and a
+re-measured baseline, because the adapter is a different shape. Revisit at the scale
+step, not before.
 
 Two constraints that apply at **every** size, not just bring-up:
 
@@ -122,7 +163,7 @@ This is deferred, **not foreclosed** — §5.4 records exactly what MoE would ne
 the one design accommodation for it (per-tensor aggregation weights) is already in
 §5.2. Worth knowing now: **an MoE base with attention-only LoRA works on the current
 design unchanged**, since frozen experts and a frozen router reduce it to the dense
-case. Re-check when scaling to 9B, where MoE options get more tempting.
+case. Re-check at the scale step, where MoE options get more tempting.
 
 **Verify the chat template before generating any SFT data** — this applies the moment
 you use an *instruct* model, and is sidestepped during bring-up only because the pick
@@ -135,7 +176,7 @@ also what the 20-prompt greedy smoke set (below) is there to catch.
 
 This is worth more than it sounds:
 
-- **No `nf4` needed.** A 2B model in bf16 is ~4 GB of weights — it fits a 12 GB
+- **No `nf4` needed.** A 1.7B model in bf16 is ~3.4 GB of weights — it fits a 12 GB
   3060 and a 16 GB Mac comfortably. That removes the entire nf4/MPS exclusion problem
   (§6.8 Tier 3) during bring-up, so **every contributor is eligible for the bring-up
   run**, including the Macs.
@@ -143,7 +184,7 @@ This is worth more than it sounds:
   are. On an 8B nf4 run the Macs sit idle and you'd find their bugs months later.
 - **Rounds are minutes, not hours.** You can iterate the whole pipeline several times
   a day instead of once. Use ~10-minute rounds for bring-up rather than §3.4's 15–20.
-- **Adapters are ~15–20 MB**, so the storage and bandwidth plumbing gets tested
+- **Adapters are ~13 MB** (measured, not estimated), so the storage and bandwidth plumbing gets tested
   without waiting on transfers.
 
 Then scale: same code, new run, `base_model` and `base_precision` changed in the run
@@ -186,7 +227,7 @@ mode to catch, since a distributed run that is quietly slightly worse than singl
 looks identical to a healthy one on a training curve.
 
 **What not to use, and why:** MMLU, GSM8K, IFEval and friends are high-variance at
-this scale, expensive, and insensitive to the deltas that matter. A 2B model
+this scale, expensive, and insensitive to the deltas that matter. A 1.7B model
 fine-tuned on 15k general instruction samples will barely move them, so you'd be
 reading noise. They're the right tool for a real run's quality much later; they are
 the wrong tool for validating infrastructure.
@@ -219,7 +260,7 @@ the spread. That spread *is* your tolerance:
   is working
 - Consistently **above** the band → aggregation is lossy; investigate before scaling
 
-At 2B on Dolly this costs perhaps an hour of compute and it converts M4's exit
+At 1.7B on Dolly this costs perhaps an hour of compute and it converts M4's exit
 criterion from a judgement call into a measurement. `baseline.json` should carry all
 seeds plus the mean and spread, not a single number.
 
@@ -248,7 +289,7 @@ happily reports as fine.
 
 #### Where eval runs
 
-**v1: on the coordinator, after aggregation.** At 2B, a forward-only pass over ~500
+**v1: on the coordinator, after aggregation.** At 1.7B, a forward-only pass over ~500
 held-out samples on CPU is a few minutes — acceptable inside a 15–20 minute round, and
 it keeps eval out of the worker protocol entirely.
 
@@ -295,7 +336,7 @@ M4b does.
 | HF cache uses symlinks; Windows needs developer mode or admin | Enable developer mode, or accept that the cache silently doubles in size from copies |
 | `multiprocessing` uses spawn, not fork | Guard entry points with `if __name__ == "__main__"`; start with `num_workers=0` in the DataLoader |
 | No cgroups for resource limits | Job Objects, or accept no limits on native installs. Container path is unaffected |
-| `bitsandbytes` is least reliable here | Irrelevant during bring-up — bf16 at 2B needs no quantization. Re-check before any `nf4` run |
+| `bitsandbytes` is least reliable here | Irrelevant during bring-up — bf16 at 1.7B needs no quantization. Re-check before any `nf4` run |
 | Git line endings can corrupt scripts inside containers | `.gitattributes` pinning shell scripts to LF |
 | Signals don't work like Unix | Already handled — the stop path is a sentinel file, not `SIGTERM` (§4.4) |
 
@@ -305,6 +346,71 @@ Linux-specific bugs will otherwise surface late, at exactly the moment you're as
 someone else to install something. Mitigation: **CI builds and smoke-tests the
 container on Linux from M2 onward**, so the path you use least is still exercised on
 every commit.
+
+---
+
+## Blocking check for M1
+
+Run against a real Linux box (Aug 2026) rather than reasoned about. **Nothing blocks
+building or testing M1.** What follows is what was actually verified, what still needs
+a value, and what is genuinely deferred to deploy time.
+
+### Verified working
+
+| Check | Result |
+|---|---|
+| `fastapi`, `uvicorn`, `boto3`, `httpx`, `pytest` from PyPI | Install clean |
+| `torch` (CPU), `transformers`, `peft`, `safetensors` | Install clean; enough to build adapters and exercise the gates without a GPU |
+| MinIO container | Pulls and runs |
+| Presigned `PUT` then `GET`, path-style, **signed against a non-localhost hostname** | **200 / 200, bytes round-trip** |
+| LoRA key manifest from `config.json`, meta device, no weights | 224 tensors, 12.85 MB bf16 |
+
+The presigned-URL result is the one worth calling out. §6.6's footgun is that MinIO
+signs against whatever `MINIO_SERVER_URL` says, so a coordinator that signs
+`localhost` mints URLs no worker can use. Reproducing that *class* of bug needs a
+hostname that isn't `localhost` — not a real domain. Point one at the loopback in
+`/etc/hosts`, set `MINIO_SERVER_URL` to it, sign with it, and fetch as a separate
+client. That test belongs in M1's suite, and it works with no DNS and no certificate.
+
+### Two environment notes for CI
+
+- **Start `dockerd` explicitly.** `docker --version` reports the client and says
+  nothing about the daemon; on a fresh container there is no socket until something
+  starts one. Worth an explicit check in CI rather than a confusing first failure.
+- **Docker Hub rate-limits unauthenticated pulls** — `429 Too Many Requests` from a
+  shared cloud IP, which is what CI runs on. `quay.io/minio/minio` pulled without
+  complaint. Prefer non-Hub registries, or authenticate, and pin by digest either way.
+
+### Three values M1 must choose (none blocking)
+
+1. **Where gate 2's expected key set comes from.** §5.1 says a submission's keys and
+   shapes must match "the round's expected LoRA config" without saying who holds that.
+   **The round's `base_adapter_ref` is the manifest** — the coordinator hands out
+   `A_base` every round, so the expected key set is simply `A_base`'s. Self-referential,
+   no dependency on M0, and it makes gate 2 a set comparison against a file the
+   coordinator already has. The only new requirement is that **something must produce
+   round 0's seed adapter**: a `peft` init, no training, verified above at 224 tensors.
+   Do it as an admin script (`scripts/newrun.py`) and M1's dependency on M0 disappears
+   entirely.
+2. **The cold-start throughput constant.** §3.5's third tier is a "conservative
+   default" for the first worker of an unseen GPU class on an uncalibrated run, with no
+   number attached. It self-corrects after one round, so pick something deliberately
+   low, name it as a constant, and let the measurement fix it.
+3. **`lr_outer`'s default.** §5.2 sets `β = 0.9` but leaves `lr_outer` unset except by
+   implication — the conservative arm of the A/B is `lr_outer = 1, β = 0`, the plain
+   weighted mean. Both modes ship (M1 deliverables), so this is choosing which one a
+   fresh run gets by default. Default to the conservative arm until M4 says otherwise.
+
+### Deferred to deploy, not to build
+
+- **Real hostnames and a TLS certificate.** §6.5 keeps every hostname in an environment
+  variable, so the code is unaffected; the fake-worker suite runs over plain HTTP on
+  loopback. Needed the day M1 leaves the dev box.
+- **An off-box backup destination.** M1's exit criteria require backup to land off-box,
+  which by definition can't be tested against a destination that doesn't exist yet.
+  Build `scripts/backup.py` against a second local MinIO — the code path is identical
+  and only the endpoint changes — and re-run the check against the real destination at
+  deploy.
 
 ---
 
@@ -462,7 +568,7 @@ Exit criteria:
 
 Proving that aggregation *helps* needs real parallelism, which time-slicing can't give
 you. You don't need contributors for this: **rent three cheap instances for an
-afternoon.** At Qwen3.5-2B almost anything with a GPU qualifies, and a few hours of
+afternoon.** At Qwen3-1.7B almost anything with a GPU qualifies, and a few hours of
 three small rentals costs about as much as lunch. That is a very cheap way to
 de-risk the thesis before asking anyone to install anything.
 
@@ -595,7 +701,11 @@ Two remain, and neither blocks M0.
 
 ### Closed
 
-- ~~**Base model**~~ → `Qwen/Qwen3.5-2B-Base`, dense bf16, for bring-up; 9B later. Verified against the HuggingFace API rather than recalled.
+- ~~**Base model**~~ → `Qwen/Qwen3-1.7B-Base`, dense, text-only, bf16, for bring-up;
+  `Qwen3-8B-Base` later. Settled by reading `config.json`, not the model listing: the
+  newer Qwen3.5 dense line is multimodal with hybrid attention at every size, which
+  makes the standard LoRA target set silently cover a quarter of the layers. Deferred
+  to the scale step with its requirements written down.
 - ~~**Bring-up dataset**~~ → Dolly 15k, 64 buckets.
 - ~~**Object store**~~ → self-hosted MinIO, R2 by config swap (§6.6).
 - ~~**Coordinator hosting**~~ → deployment config, not a design question. Everything

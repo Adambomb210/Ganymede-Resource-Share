@@ -223,7 +223,7 @@ the trade: shorter rounds mean more chances to contribute and less work lost whe
 machine disappears mid-round.
 
 Start nearer **15–20 minutes**. The cost of shorter rounds is aggregation overhead and
-more artifact round-trips — and at bring-up scale a 2B LoRA adapter is only ~15–20 MB,
+more artifact round-trips — and at bring-up scale a 1.7B LoRA adapter is only ~13 MB,
 so that cost is negligible. Revisit when scaling to 8B, where adapters are ~85 MB and
 round-trip overhead starts to matter.
 
@@ -500,7 +500,12 @@ that this takes seconds.
 Every submission passes all of these or is rejected with a recorded reason:
 
 1. Loads as **safetensors** — never `torch.load` (Finding G)
-2. Key set and tensor shapes exactly match the round's expected LoRA config
+2. Key set and tensor shapes exactly match the round's expected LoRA config. **The
+   round's `base_adapter_ref` is that manifest** — the coordinator hands out `A_base`
+   at the start of every round, so "expected" means "the keys and shapes of `A_base`".
+   No separate manifest, and no need for the coordinator to hold a base model. Round 0's
+   seed adapter is a `peft` init with no training, produced by `scripts/newrun.py`; it
+   can be built from `config.json` on a meta device without downloading weights
 3. dtype matches; no NaN, no Inf
 4. Per-tensor Frobenius norm within `k×` the cohort median for this round
    (`k = 5` initially; tune from observed spread)

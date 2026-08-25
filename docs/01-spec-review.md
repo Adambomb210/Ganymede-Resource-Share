@@ -40,13 +40,13 @@ Everything else below is a gap to fill, not a mistake.
 |---|---|
 | v1 scope | `llm_finetune` only. `rl_rollout` deferred to Phase 2. |
 | Sync layer | Central aggregation now, behind a `SyncBackend` seam so Hivemind can be swapped in without touching the worker protocol. |
-| First job | LoRA on a dense Qwen. **Bring-up on `Qwen3.5-2B-Base` + Dolly 15k**; scale to 9B after M4. |
+| First job | LoRA on a dense Qwen. **Bring-up on `Qwen3-1.7B-Base` + Dolly 15k**; scale to `Qwen3-8B-Base` after M4. |
 | Host model | All three (own hardware, donated rented hosts, paid instances) — **starting with own hardware**, so idle detection ships as a pluggable backend with `local` first. |
 | Storage | **Self-hosted, S3-compatible (MinIO)** on the coordinator VM, with R2 or S3 reachable by config change later. |
 | Run concurrency | **Sequential** for v1 — one active run at a time. Eligibility model written so concurrency is a later scheduling change, not a redesign. |
 | Fleet | Wide heterogeneity expected: Apple Silicon, 12 GB consumer cards, A100s. Three tiers — Architecture v2 §6.8. **No reliable schedule**, so rounds close on accumulated work (§3.2) and the inventory is derived (§6.11). |
 | Compatibility | **A project goal** (§0). The worker is a package; the container is one delivery path. Linux, macOS, and Windows all supported natively. |
-| Base model | `Qwen/Qwen3.5-2B-Base` — dense, Apache 2.0, verified Aug 2026. MoE deferred, not foreclosed (§5.4). |
+| Base model | `Qwen/Qwen3-1.7B-Base` — dense, text-only, uniform full attention. Qwen3.5 deferred to the scale step: multimodal with hybrid attention at every dense size, so the standard LoRA target set silently covers a quarter of the layers. MoE deferred, not foreclosed (§5.4). |
 | Data | Sensitivity **varies by run**; handled as a per-run classification gating eligibility (§6.10). |
 | v1 audience | Your group now, opening later — operator tooling, but install path and eligibility diagnostics kept honest from the start. |
 | Deployment | Coordinator containerized from day one; two subdomains; all hosts as config variables (§6.5). |
