@@ -44,16 +44,25 @@ possibly the model choice. Find out with one script, not with a deployed swarm.
 
 ## M1 — Coordinator
 
-**~4–5 days.**
+**~5–6 days** (was 4–5; self-hosted storage adds MinIO standup, TLS, GC, and backup).
 
 FastAPI + SQLite: schema (§6.1), API (§6.2), auth (§6.3), round state machine (§3.1),
-lease manager, aggregator with acceptance gates (§5), presigned URL minting, SQLite
-backup-to-object-store on every round close.
+lease manager, aggregator with acceptance gates (§5), and self-hosted MinIO with
+presigned URL minting (§6.5).
+
+Storage is self-hosted on the coordinator VM, on a **separate volume from the OS
+disk**, with S3 config kept in environment variables so the later R2 swap is a config
+change rather than a code change.
 
 Deliverables:
 - `ganymede/coordinator/` — app, models, rounds, leases, aggregate, auth
 - `ganymede/coordinator/aggregate.py` with **both** combine modes (plain weighted mean
   and DiLoCo outer momentum), selectable per run — M4 needs to A/B them
+- `ganymede/coordinator/store.py` — thin S3 wrapper, `boto3` with `endpoint_url` from
+  env. Restricted to the portable API subset in §6.5
+- `deploy/` — MinIO service unit, reverse proxy + TLS config, separate volume mount
+- `scripts/backup.py` — off-box SQLite dump + latest-adapter copy, on round close
+- `scripts/gc.py` — drop worker submissions older than 3 closed rounds
 - `scripts/newrun.py`, `scripts/issue-key.py` — admin CLI
 - Test suite with a **fake worker**: concurrent claims, lease expiry, late submission,
   gate rejection, quorum-vs-deadline close, zero-submission reopen
@@ -66,6 +75,11 @@ Exit criteria:
 - A NaN adapter, a wrong-shape adapter, and a pickle file are each rejected with the
   right reason
 - Killing the coordinator mid-round loses nothing already submitted
+- **A presigned URL minted by the coordinator is fetchable by an external client**
+  over the public hostname. This is the §6.5 signing footgun; catch it here, with one
+  integration test, rather than in M2 against a real GPU
+- Backup lands **off-box** and GC actually deletes. An untested backup script is
+  indistinguishable from no backup script
 
 Do this before any Docker work. Testing the state machine against fake workers is
 vastly faster than testing it against real GPUs.
@@ -153,9 +167,11 @@ rate spiking), a runbook, and verified restore-from-backup.
 Exit criteria:
 - You can answer "is it training, and who is contributing?" in one glance
 - You get alerted about a stalled run without having to look
-- **Coordinator restore from backup has been performed at least once**, not merely
-  configured. §6.4 names this as the system's single point of failure; an untested
-  backup isn't one
+- **A full restore has been performed at least once**, not merely configured: rebuild
+  the coordinator from the off-box SQLite dump plus the latest round adapter, and
+  resume the run. §6.4 names the shared VM as the system's single point of failure,
+  and self-hosted storage is what makes this drill non-optional
+- Artifact volume has headroom, and GC is demonstrably keeping it that way
 
 ---
 
@@ -211,11 +227,12 @@ Blocking or near-blocking. Rough order of urgency.
    sees it in plaintext**. If any of it is sensitive, that changes the trust model
    materially and pulls Phase 2 items forward. *Needed for M0.*
 
-3. **Object store.** Recommend **Cloudflare R2** — S3-compatible, and zero egress fees,
-   which matters directly because every worker pulls a base adapter every round.
-   Plain S3 works but you'll pay per-round egress that scales with contributor count.
-   MinIO on the coordinator VM is viable for early testing and makes the VM a
-   bandwidth bottleneck later. *Needed for M1.*
+3. ~~**Object store.**~~ **Resolved: self-hosted MinIO on the coordinator VM**, S3
+   config in env vars so R2 is a later config swap (§6.5). Two follow-ons this raises:
+   **where do off-box backups go?** (needs to be a different machine — a free
+   object-storage tier is fine and is a painless way to start an R2 account early),
+   and **how much volume to provision?** 200 GB is generous for 10 workers × 100
+   rounds, but it depends on dataset size, which is question 2. *Needed for M1.*
 
 4. **Coordinator hosting.** A small always-on VM, a domain, and TLS. Any of Hetzner /
    Fly / Vultr is fine; the requirements are modest and the choice isn't

@@ -42,6 +42,7 @@ Everything else below is a gap to fill, not a mistake.
 | Sync layer | Central aggregation now, behind a `SyncBackend` seam so Hivemind can be swapped in without touching the worker protocol. |
 | First job | LoRA on a 7–8B base model. |
 | Host model | All three (own hardware, donated rented hosts, paid instances) — **starting with own hardware**, so idle detection ships as a pluggable backend with `local` first. |
+| Storage | **Self-hosted, S3-compatible (MinIO)** on the coordinator VM, with R2 or S3 reachable by config change later. |
 
 These are assumed throughout the revised architecture (`02-architecture-v2.md`).
 
@@ -127,10 +128,17 @@ There are two coherent resolutions, and the spec needs to pick one:
   entries, keeps the coordinator small, and lets you use presigned URLs so the
   coordinator never touches artifact bytes.
 
-**Recommendation: the second.** Allowlist = coordinator, object store, HuggingFace
-(`huggingface.co` + `cdn-lfs*.hf.co`). Artifacts move worker↔object-store directly via
-presigned PUT/GET; the coordinator only ever handles *references*. This keeps the
-coordinator on a small VM and makes the bandwidth math work (Finding H).
+**Recommendation: the second.** Allowlist = coordinator, artifact store, HuggingFace
+(`huggingface.co` + `cdn-lfs*.hf.co`). Artifacts move worker↔store directly via
+presigned PUT/GET; the coordinator application only ever handles *references*, which
+makes the bandwidth math work (Finding H).
+
+**Per the storage decision**, the store is self-hosted MinIO on the coordinator VM in
+v1, so two of those three destinations are the same machine. Keep them as separate
+config entries anyway — otherwise moving storage to R2 later means editing every
+contributor's firewall rules instead of one manifest field. Architecture v2 §6.5
+covers the sizing, the retention policy, and the backup consequence, which is the one
+thing co-location genuinely breaks.
 
 ### D. §9 over-claims durability
 
@@ -203,14 +211,20 @@ A LoRA adapter for an 8B model at rank 16 is roughly **15–85 MB in bf16** depe
 which modules you target (~14 MB for q/v only, ~84 MB for all linear layers). Pushing
 that through FastAPI request handling and into SQLite works right up until it doesn't.
 
-**Fix:** worker asks for a presigned PUT, uploads to the object store directly, then
-submits the *reference* plus metrics. Coordinator handles kilobytes. This is the same
+**Fix:** worker asks for a presigned PUT, uploads to the store directly, then submits
+the *reference* plus metrics. The coordinator handles kilobytes. This is the same
 change Finding C recommends, from the other direction.
 
 **Bandwidth sanity check, which is the real justification for the central design:**
 per worker per round, ~85 MB down + ~85 MB up. Ten workers on 30-minute rounds is
-~3.4 GB/hour — trivially served by a small VM fronting object storage, and free on a
-provider with no egress fees. Peer-to-peer averaging buys nothing at this scale.
+~3.4 GB/hour, about 7.6 Mbit/s average — comfortably served by one small VM.
+Peer-to-peer averaging buys nothing at this scale.
+
+This is also what makes self-hosted storage a sensible default rather than a
+compromise: the access pattern is egress-dominated, which is precisely where metered
+object storage prices worst. A VM with a bundled traffic allowance and R2's
+zero-egress model are both fine; S3-class egress pricing is the option to avoid.
+Architecture v2 §6.5 has the numbers and names the worker count at which to revisit.
 
 ### I. Missing: dataset sharding
 

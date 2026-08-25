@@ -25,6 +25,8 @@ and disappear when it isn't.
   `SyncBackend` seam so peer-to-peer can be swapped in later
 - **Hosts:** own hardware first; donated and rented platform hosts behind the same
   `IdleBackend` interface
+- **Storage:** self-hosted, S3-compatible (MinIO), with Cloudflare R2 or S3 reachable
+  by a config change rather than a rewrite
 - **Trust:** trusted circle, with safetensors-only artifacts and sanity gates on every
   submission
 

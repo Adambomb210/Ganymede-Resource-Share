@@ -16,7 +16,8 @@ summarized rather than restated.
 |---|---|---|
 | Job queue | **Run → round → task** | Review Finding A |
 | `worker-core` as shared base | **`torch-base` as shared base**, core above it | Finding B |
-| Egress: coordinator + bootstrap | Egress: coordinator + object store + HuggingFace | Finding C |
+| Egress: coordinator + bootstrap | Egress: coordinator + artifact store + HuggingFace | Finding C |
+| (unspecified `s3://`) | **Self-hosted MinIO**, S3-API-compatible, R2-swappable by config | Decision |
 | Weights in POST body | Presigned PUT; coordinator sees only refs | Finding H |
 | Hivemind DHT | Central aggregator behind `SyncBackend` | Decision |
 | Axolotl / torchtune | Owned ~250-line `peft` trainer | Finding K |
@@ -43,13 +44,17 @@ summarized rather than restated.
   │                      │   · acceptance gates         │
   │                      │   · presigned URL minting    │
   │                      └───────────────┬──────────────┘
-  │                                      │ refs only, never bytes
+  │                                      │ mints presigned URLs;
+  │                                      │ app never proxies bytes
   │                                      ▼
   │                      ┌──────────────────────────────┐
-  │                      │  Object store (S3-compatible)│
+  │                      │  MinIO  (self-hosted, §6.5)  │
   │                      │   · round base adapters      │
   │                      │   · worker submissions       │
   │                      │   · sharded dataset buckets  │
+  │                      │                              │
+  │                      │  same VM in v1 — so this VM  │
+  │                      │  DOES serve artifact bytes   │
   │                      └───────────────┬──────────────┘
   │                                      │ presigned GET/PUT
   ├──────────────┬───────────────────────┤
@@ -62,9 +67,14 @@ summarized rather than restated.
                                                     └──────────────┘
 ```
 
-The coordinator is the only always-on component and remains GPU-free. It never
-handles artifact bytes — only references, metrics, and control flow — which is what
-keeps it on a small VM.
+The coordinator is the only always-on component and remains GPU-free. The FastAPI
+application never proxies artifact bytes — it mints presigned URLs and handles only
+references, metrics, and control flow.
+
+In v1 the artifact store is **self-hosted MinIO on the same VM**, so that VM does
+serve the bytes at the network level even though the application doesn't touch them.
+That is a deliberate, and cheap, trade — see §6.5 for the sizing that justifies it and
+the one consequence that genuinely bites (backups).
 
 ---
 
@@ -231,8 +241,12 @@ correctness path is abandon-and-exit.
   `/cache/hf` (persistent volume), `/tmp` (tmpfs), `/run/ganymede` (tmpfs)
   — these are required; `transformers`, Triton, and `torch.compile` all write caches
 - cgroup limits: `--memory`, `--cpus`, `--pids-limit`
-- **Egress allowlist**: coordinator host, object-store host, `huggingface.co` +
+- **Egress allowlist**: coordinator host, artifact-store host, `huggingface.co` +
   `cdn-lfs*.hf.co`. Three destinations, all named, all HTTPS. (Finding C)
+  In v1 the first two are the same machine on different subdomains, so the effective
+  allowlist is two hosts — but keep them as separate config entries, or moving storage
+  to R2 later becomes an edit to every contributor's firewall rules instead of one
+  manifest field.
 
 Stronger sandboxing (gVisor/Kata) stays deferred to Phase 2 — but note it's the host
 that's being protected here, and every v1 host is either yours or a person you vouch
@@ -384,11 +398,128 @@ gone from every request body.
 | Worker submits garbage | Rejected by §5.1 gates, recorded, round proceeds with remaining submissions |
 | Round misses quorum | Closes on deadline with ≥1 submission. Zero submissions → round reopens with a fresh deadline |
 | Coordinator down | No claims, no submissions, no aggregation. In-flight workers finish, fail to submit, retry with backoff. **Nothing is lost that was already submitted** |
-| Object store down | Same as coordinator down, from the worker's side |
-| Coordinator disk lost | Everything is lost that isn't in object storage. **Therefore: back up the SQLite file to object storage after every round close.** It is small, and this is the single point of failure in the system |
+| Artifact store down | Same as coordinator down, from the worker's side. In v1 they share a VM, so in practice these fail together |
+| Coordinator VM lost | **The failure that matters.** In v1 the database and every checkpoint are on one machine, so this loses both unless backups are genuinely off-box. See §6.5 — separate volume, off-box SQLite dump each round close, off-box copy of the latest round adapter |
+| Artifact volume lost, VM survives | Recoverable from the off-box dump + latest adapter: resume the run rather than restart it. Loses older checkpoint history |
 
-That last row is the one genuinely fragile spot in the design. The backup is a
-five-line job and should exist from M1, not be added later.
+### 6.5 Artifact storage — self-hosted now, portable later
+
+**Decision: self-hosted MinIO on the coordinator VM for v1, with a documented path to
+Cloudflare R2 or plain S3.**
+
+#### Why this is a good default, not a concession
+
+The instinct is to read self-hosting as the cheap option you tolerate until you can
+afford managed storage. For *this* access pattern it's the other way round. Every
+worker pulls a base adapter at the start of every round and pushes one at the end, so
+cost scales with egress, which is exactly where object storage is priced worst:
+
+| | 10 workers | 50 workers |
+|---|---|---|
+| Egress volume | ~2.5 TB/mo | ~12.4 TB/mo |
+| Self-hosted (VM with 20 TB included) | included | included |
+| Cloudflare R2 (no egress fee) | $0 egress | $0 egress |
+| S3-class storage at ~$0.09/GB egress | ~$225/mo | ~$1,100/mo |
+
+*List-price illustrations, not quotes. Assumes ~85 MB per adapter — the conservative
+all-linear-modules figure; the q/k/v/o config in §8 is closer to 27 MB — and 30-minute
+rounds.*
+
+So the real ordering is: self-hosted and R2 are both fine, S3-class egress pricing is
+the one to avoid. Self-hosting first is the right call, and R2 stays the escape hatch
+if you'd rather not operate storage than not pay for it.
+
+#### Can one small VM actually serve this?
+
+Yes, comfortably, at v1 scale. At 10 workers on 30-minute rounds: ~3.4 GB/hour
+sustained, about **7.6 Mbit/s average**. The load is bursty rather than steady — when
+a round opens, every worker wants the base adapter at once, a ~850 MB thundering herd.
+On a 1 Gbit/s link that's ~7 seconds; on 100 Mbit/s, ~70 seconds.
+
+Both are acceptable, but **jitter the claim response** so workers don't all start
+their fetch on the same tick. §4.2's backoff already jitters the `204` path; apply the
+same to round-open.
+
+This scales linearly, so it's worth naming where it stops being free: past roughly
+**50 workers**, or if the VM's monthly egress allowance is tight, revisit. That's the
+R2 trigger — not an arbitrary future date.
+
+#### The portability contract
+
+The point of S3-compatibility is that migration should be **configuration, not code**:
+
+```
+GANYMEDE_S3_ENDPOINT=https://storage.ganymede.example   # → R2's endpoint
+GANYMEDE_S3_BUCKET=ganymede
+GANYMEDE_S3_REGION=us-east-1                            # → "auto" for R2
+GANYMEDE_S3_ACCESS_KEY / _SECRET_KEY
+```
+
+`boto3` against MinIO and `boto3` against R2 are the same client with a different
+`endpoint_url`. To keep it that way, **stay inside the S3 subset every implementation
+supports**: PUT / GET / HEAD / DELETE object, `list-objects-v2`, presigned URLs,
+multipart upload.
+
+Avoid depending on: object versioning, lifecycle rules, object lock, storage classes,
+and server-side-copy-heavy patterns. Implementations diverge there, and each one you
+use is a migration blocker you won't notice until you try to move. Where you'd reach
+for a lifecycle rule, write the GC job instead (below) — it's a cron entry, and it
+works identically everywhere.
+
+Verify against the target provider's current S3-compatibility documentation before any
+swap; the compatible surface shifts over time.
+
+#### The presigned-URL host footgun
+
+Presigned signatures cover the **host**. If MinIO sits behind the same reverse proxy
+that terminates TLS for the coordinator, the coordinator must sign for the *public*
+endpoint (`https://storage.ganymede.example`), not for MinIO's internal address.
+Get this wrong and every worker fetch fails signature validation with an error that
+does not obviously say "you signed the wrong hostname."
+
+Set MinIO's `MINIO_SERVER_URL` to the public endpoint and sign with the same value.
+Worth an explicit integration test in M1 — it's a five-minute fix and a two-hour
+debugging session.
+
+#### Retention and garbage collection
+
+Self-hosting means the disk is finite and nobody else is managing it. Two classes of
+object with different lifetimes:
+
+- **Round result adapters** — keep all. This is the checkpoint history, and it's what
+  makes §6.4's "nothing submitted is lost" true. ~85 MB × rounds.
+- **Individual worker submissions** — delete once the round has closed and aggregated
+  successfully, keeping ~3 rounds of grace for debugging a bad aggregate.
+
+Steady state at 10 workers over 100 rounds: ~8.5 GB of results + ~3.4 GB of in-flight
+submissions + the dataset. **A 200 GB volume is generous.** Note the 16 GB base model
+is deliberately *not* stored here — workers pull it from HuggingFace into a
+host-persistent cache (§4.1). Keep it that way; putting it in the artifact store would
+multiply egress by an order of magnitude for no benefit.
+
+The GC job runs on round close, alongside the backup.
+
+#### Backups — the one thing this decision genuinely breaks
+
+§6.4 previously said: back up SQLite to object storage after every round close. **With
+storage co-located on the coordinator VM, that backup is worthless for the failure it
+was written to survive.** Losing the disk loses the database and every checkpoint
+together.
+
+So the rule for v1 is stricter than it was:
+
+1. **The artifact store lives on a separate volume from the OS disk.** Cheap, and it
+   turns "VM died" into a recoverable event.
+2. **SQLite dumps go off-box, every round close.** The file is kilobytes-to-megabytes;
+   any external target covers it indefinitely, and a free object-storage tier is a
+   perfectly good destination. This is also the natural place to start an R2 account
+   long before you migrate primary storage to it.
+3. **The latest round result adapter replicates off-box too.** ~85 MB per round. If
+   everything else burns down, the database plus the newest adapter is enough to
+   resume the run rather than restart it.
+
+Off-box means a different machine, not a different directory. That distinction is the
+entire value of the item.
 
 ---
 
