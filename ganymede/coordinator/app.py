@@ -2,7 +2,7 @@
 
 Weights never travel through this API's request bodies. The coordinator mints
 presigned URLs and workers talk to object storage directly, which keeps a
-~13 MB artifact off the Python process entirely (Finding on v1's design) and
+~25 MB artifact off the Python process entirely (Finding on v1's design) and
 means a slow uploader occupies a socket on MinIO rather than a worker thread
 here.
 """
@@ -221,7 +221,7 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                 return JSONResponse(_task_payload(spec, store))
 
         # 204 is a legitimate answer, not an error: nothing eligible, or too
-        # little of the round left to be worth a 13 MB round trip.
+        # little of the round left to be worth a 25 MB round trip.
         return Response(status_code=204, headers={"Retry-After": "60"})
 
     @app.post(f"/{API_VERSION}/tasks/{{task_id}}/heartbeat")

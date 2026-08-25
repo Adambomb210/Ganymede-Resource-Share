@@ -317,7 +317,7 @@ def claim_task(
             return None
 
         # Minimum viable throughput (3.5). Below some speed a worker costs more
-        # than it contributes: it holds a lease and a full ~13 MB round trip to
+        # than it contributes: it holds a lease and a full ~25 MB round trip to
         # add noise-level weight. The comparison is against what this round's
         # other workers were actually budgeted, so the floor adapts to whatever
         # hardware showed up rather than encoding an absolute steps/min.

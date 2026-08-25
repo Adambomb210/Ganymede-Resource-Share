@@ -1,0 +1,72 @@
+# Coordinator + MinIO (docs/02-architecture-v2.md 6.5).
+#
+# This one file is meant to run unchanged across all three deployment stages:
+#   - Development: `docker compose up` here, everything on localhost
+#   - Bring-up:    the same file on a real server, reachable on the LAN
+#   - Production:  the same images, behind a reverse proxy that terminates TLS
+#                  and fronts two subdomains (6.5 -- one for the coordinator,
+#                  one for storage; path-routing both under one host fights
+#                  the S3 client, which expects to own its URL space)
+#
+# Everything that differs between those stages is an environment variable --
+# see ganymede.env.example -- never a hostname baked in here.
+
+services:
+  minio:
+    # quay.io, not Docker Hub: Hub rate-limits unauthenticated pulls with 429
+    # from cloud IPs, which is exactly where a coordinator VM's outbound pulls
+    # come from. Pin by digest (image: quay.io/minio/minio@sha256:...) in
+    # production so a republished `latest` can't change what's running under you
+    # without a deliberate version bump.
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
+      # This MUST be byte-identical to STORAGE_HOST below (StorageConfig.
+      # endpoint_url, store.py's Rule 1). MinIO signs presigned URLs against
+      # whatever it was told to serve here; the coordinator signs against
+      # STORAGE_HOST independently, and if the two values differ even by a
+      # trailing slash or http-vs-https, every presigned URL a worker tries to
+      # use 403s with a signature mismatch that gives no hint why
+      # (docs/02-architecture-v2.md 6.6, "the presigned-URL host footgun").
+      MINIO_SERVER_URL: ${STORAGE_HOST}
+    volumes:
+      # A named volume, deliberately NOT a bind mount into the coordinator
+      # container's own filesystem or an anonymous volume that dies with the
+      # container: this is the artifact store, and 6.6 requires it to live on
+      # a separate volume from the OS disk so losing the OS disk doesn't also
+      # lose every checkpoint. On a real server, back this named volume with
+      # its own disk/partition, not a directory on the root filesystem.
+      - minio_data:/data
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console -- put this behind auth or drop it in production
+    env_file:
+      - ganymede.env
+
+  coordinator:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    depends_on:
+      - minio
+    ports:
+      - "8000:8000"
+    env_file:
+      - ganymede.env
+    volumes:
+      # SQLite lives here (GANYMEDE_DB). Also not the OS disk in production --
+      # give it a persistent mount for the same reason as minio_data above.
+      - coordinator_db:/var/lib/ganymede
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request as u,sys; sys.exit(0 if u.urlopen('http://localhost:8000/healthz',timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+volumes:
+  minio_data:
+  coordinator_db:

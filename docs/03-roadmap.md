@@ -125,11 +125,18 @@ loads it directly.
 
 Verified here rather than assumed:
 
-- **The adapter manifest is 224 tensors, 6.42 M parameters, 12.85 MB in bf16** at
-  `r=16` over `{q,k,v,o}_proj` — 28 layers × 4 modules × 2 (A and B). Generated from
+- **The adapter manifest is 224 tensors, 6.42 M parameters** at `r=16` over
+  `{q,k,v,o}_proj` — 28 layers × 4 modules × 2 (A and B). Generated from
   `config.json` on a meta device, with no weight download, which is also how the
   coordinator can hold an expected-key manifest without ever holding a base model
   (see *Blocking check for M1* below).
+- **The stored artifact is ~25 MB, not the ~13 MB the parameter count implies.**
+  Adapters are kept in **fp32 even when the base model is bf16 or nf4**, and that is
+  deliberate. `base_precision` describes the frozen base; the adapter is the only
+  thing being refined, and it is refined *iteratively* — each round's output is the
+  next round's input. Storing it in bf16 would round-trip the accumulated result
+  through three decimal digits once per round, for twenty-odd rounds. Budget the
+  bandwidth at 25 MB per worker per round in each direction.
 - **`transformers` must know the architecture.** `qwen3` is long-settled, so this is
   no longer the first-hour hazard it was for `qwen3_5` — but pin the version and record
   the pin regardless.
@@ -184,7 +191,7 @@ This is worth more than it sounds:
   are. On an 8B nf4 run the Macs sit idle and you'd find their bugs months later.
 - **Rounds are minutes, not hours.** You can iterate the whole pipeline several times
   a day instead of once. Use ~10-minute rounds for bring-up rather than §3.4's 15–20.
-- **Adapters are ~13 MB** (measured, not estimated), so the storage and bandwidth plumbing gets tested
+- **Adapters are ~25 MB** (measured, not estimated), so the storage and bandwidth plumbing gets tested
   without waiting on transfers.
 
 Then scale: same code, new run, `base_model` and `base_precision` changed in the run
@@ -363,7 +370,7 @@ a value, and what is genuinely deferred to deploy time.
 | `torch` (CPU), `transformers`, `peft`, `safetensors` | Install clean; enough to build adapters and exercise the gates without a GPU |
 | MinIO container | Pulls and runs |
 | Presigned `PUT` then `GET`, path-style, **signed against a non-localhost hostname** | **200 / 200, bytes round-trip** |
-| LoRA key manifest from `config.json`, meta device, no weights | 224 tensors, 12.85 MB bf16 |
+| LoRA key manifest from `config.json`, meta device, no weights | 224 tensors, 25 MB fp32 |
 
 The presigned-URL result is the one worth calling out. §6.6's footgun is that MinIO
 signs against whatever `MINIO_SERVER_URL` says, so a coordinator that signs

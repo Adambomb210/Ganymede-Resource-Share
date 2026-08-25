@@ -37,7 +37,7 @@ class CloseResult:
 
 
 # A round's base adapter never changes once written, so its manifest is safe to
-# cache by key. Without this every submit re-downloads and re-parses ~13 MB just
+# cache by key. Without this every submit re-downloads and re-parses ~25 MB just
 # to learn a key set the coordinator already knew -- eight workers a round would
 # pay for that eight times over an artifact none of them changed.
 _MANIFEST_CACHE: dict[str, dict] = {}

@@ -223,7 +223,7 @@ the trade: shorter rounds mean more chances to contribute and less work lost whe
 machine disappears mid-round.
 
 Start nearer **15–20 minutes**. The cost of shorter rounds is aggregation overhead and
-more artifact round-trips — and at bring-up scale a 1.7B LoRA adapter is only ~13 MB,
+more artifact round-trips — and at bring-up scale a 1.7B LoRA adapter is only ~25 MB,
 so that cost is negligible. Revisit when scaling to 8B, where adapters are ~85 MB and
 round-trip overhead starts to matter.
 

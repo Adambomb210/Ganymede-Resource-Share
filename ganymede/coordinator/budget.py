@@ -116,7 +116,7 @@ def meets_floor(candidate_steps: int, median_steps: float, floor_frac: float) ->
     """Minimum viable throughput gate (3.5).
 
     Below some speed a worker costs more than it contributes: it consumes a
-    lease slot and a full ~13 MB round trip to add noise-level weight. A worker
+    lease slot and a full ~25 MB round trip to add noise-level weight. A worker
     that cannot reach ``floor_frac`` of the cohort's median budget is not
     offered work for this run (it stays eligible for others).
 

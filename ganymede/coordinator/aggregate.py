@@ -2,7 +2,7 @@
 (docs/02-architecture-v2.md section 5).
 
 Everything here is pure CPU tensor math over small LoRA adapters (dict[str,
-Tensor], ~224 tensors / ~13 MB). Nothing in this module talks to the DB or to
+Tensor], ~224 tensors / ~25 MB). Nothing in this module talks to the DB or to
 object storage -- callers pass bytes/tensors in and get GateResult/tensors
 back, and are responsible for persisting the outcome (submissions.accepted,
 submissions.reject_reason, rounds.result_adapter_ref, runs.outer_momentum_ref).
