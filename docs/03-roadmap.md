@@ -47,14 +47,18 @@ three things directly:
 - **Capability filtering** (§6.2) — which GPUs are eligible for this run at all
 - **The M4 comparison** — the single-node number the distributed run must beat
 
-**3. The baseline.** One held-out eval set and a recorded single-node result per run.
+**3. The baseline — multi-seed.** A held-out eval split carved out before bucketing,
+and single-node results across **2–3 seeds**, so `baseline.json` carries a mean and a
+spread rather than one number. The spread is what makes M4's "matches the baseline"
+a measurement instead of a judgement call. See *Eval metric* below.
 
 ### Exit criteria
 
 - Trainer runs, loss descends, adapter round-trips through safetensors
 - `ganymede-calibrate` produces a valid `calibration.json` for the first run config
 - The run fits the target card at the chosen `base_precision`, with headroom
-- A single-node `baseline.json` exists for that run
+- `baseline.json` exists with **multiple seeds**, giving a mean and a variance band
+- The ~20-prompt greedy generation smoke set exists and its round-0 output is recorded
 
 ### Why the baseline can't be dropped
 
@@ -121,6 +125,96 @@ across rounds sooner than they would on a larger corpus. That's fine for proving
 *machinery* — Dolly measures whether aggregation works, not how far the model can
 get. If M4's convergence result looks suspiciously flat, **dataset exhaustion is the
 first thing to check**, and moving to a larger corpus is the test.
+
+### Eval metric
+
+The M4 question is **"did distributed training preserve the training signal?"**, not
+"is the model good." Those need different instruments, and reaching for a benchmark
+suite here measures the wrong thing.
+
+#### Primary: held-out loss on a fixed Dolly split
+
+Hold out **500–1000 samples before bucketing** — the split must be carved out first,
+or eval samples leak into training buckets and the number becomes meaningless.
+
+Held-out loss is right here because it's cheap enough to run every round,
+deterministic, and *sensitive to small degradation* — which is exactly the failure
+mode to catch, since a distributed run that is quietly slightly worse than single-node
+looks identical to a healthy one on a training curve.
+
+**What not to use, and why:** MMLU, GSM8K, IFEval and friends are high-variance at
+this scale, expensive, and insensitive to the deltas that matter. A 1.7B model
+fine-tuned on 15k general instruction samples will barely move them, so you'd be
+reading noise. They're the right tool for a real run's quality much later; they are
+the wrong tool for validating infrastructure.
+
+#### The comparison is two curves, answering two different questions
+
+This is the part that's easy to get wrong. Plot held-out loss against two different
+x-axes:
+
+| Axis | Question | What failure looks like |
+|---|---|---|
+| **Cumulative steps** summed across all workers | Does aggregation preserve the training signal? | Distributed curve sits **above** single-node at equal total compute → averaging is lossy |
+| **Wall-clock** | Is this worth doing at all? | Distributed reaches a given loss no faster → overhead ate the parallelism |
+
+**Both matter, and a system can pass one while failing the other.** Aggregation can be
+perfectly sound while round-trip overhead eats the entire speedup; or it can be faster
+in wall-clock while producing a measurably worse model, which is a bad trade you would
+not notice with only one curve. The first axis is the correctness test; the second is
+the value test.
+
+#### Define "matches" by measuring your noise floor first
+
+"Matches or beats the baseline" needs a tolerance, and you can't pick one honestly
+without knowing run-to-run variance.
+
+**Run the single-node baseline 2–3 times with different seeds during M0** and record
+the spread. That spread *is* your tolerance:
+
+- Distributed lands **inside** the seed-variance band at equal total steps → aggregation
+  is working
+- Consistently **above** the band → aggregation is lossy; investigate before scaling
+
+At 1.7B on Dolly this costs perhaps an hour of compute and it converts M4's exit
+criterion from a judgement call into a measurement. `baseline.json` should carry all
+seeds plus the mean and spread, not a single number.
+
+#### Diagnostics worth logging from the start
+
+Cheap to compute at aggregation time, and each one localizes a different failure:
+
+- **Per-round loss delta** — `loss(round N+1 base) − loss(round N base)`. Negative most
+  rounds. A positive round is a signal: a bad contribution, or `lr_outer` too high.
+- **Inter-worker adapter divergence** — pairwise distance between submitted adapters
+  before averaging. This directly measures the thing DiLoCo trades away: more local
+  steps means more drift means a less meaningful average. **If drift grows across
+  rounds, `local_steps` is too high.** Probably the single most actionable number in
+  the system.
+- **Gate rejection rate per contributor** (§5.1) — already recorded; watch it.
+
+#### One qualitative check loss won't give you
+
+Held-out loss can look healthy while generation quality degrades — chat-template
+corruption is the specific risk already flagged for Qwen, and it barely moves loss.
+
+Keep **~20 fixed prompts, generated greedily (temperature 0) at each checkpoint**, and
+diff the outputs against the previous round. Not a metric; a smoke test. It catches
+template breakage and mode collapse, which are exactly the failures that a loss number
+happily reports as fine.
+
+#### Where eval runs
+
+**v1: on the coordinator, after aggregation.** At 1.7B, a forward-only pass over ~500
+held-out samples on CPU is a few minutes — acceptable inside a 15–20 minute round, and
+it keeps eval out of the worker protocol entirely.
+
+This stops being comfortable at 8B. The natural extension is to make eval **a task
+type** dispatched like any other, which reuses the whole claim/submit mechanism — and
+has a pleasant side effect worth noting: a machine below the *training* throughput
+floor (§3.5) may be perfectly capable of running evals. That gives the Macs and
+low-end cards a real job on runs they can't otherwise join. Worth doing when the
+coordinator-side path starts to hurt, not before.
 
 ### Bucket count should scale with dataset size
 
@@ -299,9 +393,12 @@ three small rentals costs about as much as lunch. That is a very cheap way to
 de-risk the thesis before asking anyone to install anything.
 
 Exit criteria:
-- Aggregated model **matches or beats** the M0 single-node baseline on the held-out set
-- Wall-clock-to-target-loss beats single-node — otherwise the system is an expensive
-  way to train slower
+- Held-out loss vs. **cumulative steps** lands inside the M0 seed-variance band —
+  aggregation preserves the training signal
+- Held-out loss vs. **wall-clock** beats single-node — otherwise the system is an
+  expensive way to train slower
+- Greedy generations on the fixed prompt set show no template corruption or collapse
+- Inter-worker adapter divergence is stable across rounds, not growing
 - Both combine modes A/B'd (§5.2's research risk). If DiLoCo outer momentum doesn't
   beat plain weighted mean on LoRA adapters, **ship the plain mean** and record the
   negative result
@@ -405,17 +502,13 @@ In rough order of when they'll start to hurt:
 
 ## Open questions
 
-Three remain. Two of the earlier ones closed themselves.
+Two remain, and neither blocks M0.
 
-1. **The eval set and target metric.** What number decides M4b passed? Define it
-   during M0 while the baseline is being established, not after — a baseline you can't
-   compare against isn't one. *Needed for M0's exit criteria.*
-
-2. **Your own dataset**, when bring-up is done: what it is, how large, where it lives,
+1. **Your own dataset**, when bring-up is done: what it is, how large, where it lives,
    and which classification it warrants (§6.10). Dolly carries M0–M4; this is the
    first *real* run's input. *Not needed until after M4.*
 
-3. **Contributor agreement**, before the first non-`open` run. §6.10 gates `internal`
+2. **Contributor agreement**, before the first non-`open` run. §6.10 gates `internal`
    and `restricted` runs on clearance, which implies contributors accept something
    before receiving non-public data. It needn't be elaborate, but it's also the
    natural place to settle who owns the resulting adapters. Dormant while you're the
@@ -436,6 +529,9 @@ Three remain. Two of the earlier ones closed themselves.
   roster to collect or keep current.
 - ~~**Platform policy check**~~ → deferred with the rented-host phase; nothing depends
   on it while you're on your own hardware.
+- ~~**Eval metric**~~ → held-out loss on a fixed Dolly split, compared against the
+  single-node baseline on two axes (total steps for correctness, wall-clock for
+  value), with tolerance set by measured seed variance. See *Eval metric* above.
 
 ### A note on being the only contributor
 

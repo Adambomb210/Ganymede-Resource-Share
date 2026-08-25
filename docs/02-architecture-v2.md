@@ -502,6 +502,10 @@ Two things worth stating plainly:
 
 - **Outer momentum `m` is durable coordinator state**, persisted alongside the run
   (Finding L7). Losing it isn't fatal but does cost convergence progress.
+- **Record inter-worker divergence at this point** — pairwise distance across the
+  `A_i` before they're averaged. It measures precisely what DiLoCo trades away: more
+  local steps means more drift means a less meaningful mean. Growing drift across
+  rounds says `local_steps` is too high, which is otherwise very hard to see.
 - **Averaging LoRA adapters is better-behaved than averaging full weights**, because
   every adapter is a delta against the *same frozen base*. This is exactly why
   `base_precision` must be pinned (Finding J) — heterogeneous quantization silently
@@ -549,7 +553,8 @@ runs          id, status, base_model, base_precision, lora_cfg_json,
               -- data_classification: open | internal | restricted     §6.9
 rounds        run_id, idx, base_adapter_ref, status, target_steps,
               min_round_sec, max_round_sec, opened_at, closed_at,
-              result_adapter_ref, mean_loss, distinct_contributors   -- §3.2
+              result_adapter_ref, distinct_contributors,             -- §3.2
+              eval_loss, adapter_divergence                          -- §5.2
 tasks         id, run_id, round_idx, buckets_json, local_steps, status,
               worker_id, lease_expires_at, attempts, created_at
 submissions   task_id, artifact_ref, steps_completed, tokens_seen,
