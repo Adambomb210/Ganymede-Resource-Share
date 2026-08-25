@@ -1,7 +1,7 @@
 # Ganymede — Architecture v2
 
 **Status:** Draft v2, incorporating `01-spec-review.md`
-**Scope:** `llm_finetune` only (LoRA on a 7–8B base). `rl_rollout` deferred to Phase 2.
+**Scope:** `llm_finetune` only (LoRA on a dense Qwen base). `rl_rollout` deferred to Phase 2.
 **Sync:** Central aggregation, behind a `SyncBackend` seam for a later Hivemind swap.
 **Trust:** Trusted circle, with two items pulled forward from v1 §10 (safetensors, sanity gates).
 
@@ -223,7 +223,7 @@ the trade: shorter rounds mean more chances to contribute and less work lost whe
 machine disappears mid-round.
 
 Start nearer **15–20 minutes**. The cost of shorter rounds is aggregation overhead and
-more artifact round-trips — and at bring-up scale a 1.7B LoRA adapter is only ~10–15 MB,
+more artifact round-trips — and at bring-up scale a 2B LoRA adapter is only ~15–20 MB,
 so that cost is negligible. Revisit when scaling to 8B, where adapters are ~85 MB and
 round-trip overhead starts to matter.
 

@@ -88,11 +88,28 @@ to train.** Using your real target data for M0–M4 conflates two failure modes 
 look identical from the outside: "the infrastructure is broken" and "this fine-tune
 doesn't work." You want to eliminate the first before investigating the second.
 
-### Model: start much smaller than 8B
+### Model: start much smaller than 9B
 
-**Decided: Qwen 1.7B, dense, bf16.** Confirm the exact model ID at M0 — the family
-moves quickly and it's worth checking what's current rather than trusting a name
-written here. Scale to 7–8B after M4 passes, as a run-config change.
+**Decided: `Qwen/Qwen3.5-2B-Base`, dense, bf16.** Verified against the HuggingFace API
+(Aug 2026): dense — no expert keys in `config.json` — Apache 2.0, and widely used.
+Scale to `Qwen3.5-9B` after M4 passes, as a run-config change.
+
+Notes from checking the family rather than trusting a remembered name:
+
+- **Qwen3.5** (Feb 2026) is the current generation for *small dense* models: 0.8B, 2B,
+  4B, 9B. Later generations (3.6, 3.8) so far ship only large models — 27B dense and
+  MoE variants — so 3.5 is the right line here, not the newest number.
+- **`model_type` is `qwen3_5`**, so an older `transformers` simply won't load it. Pin a
+  version that knows this architecture and record the pin; this is the most likely
+  first-hour failure at M0.
+- **`-Base`, not the instruct variant, and that's deliberate**: a base model has no
+  chat template, so you define the format yourself and the hybrid thinking/non-thinking
+  template hazard below doesn't apply during bring-up. One less way for the baseline to
+  be silently wrong. The hazard returns when you move to an instruct model — which is
+  why the check stays documented.
+- **`Qwen3.5-0.8B-Base`** is worth knowing about as a second option: small enough to
+  train on CPU, which makes it useful for protocol testing (M4a) on machines with no
+  usable GPU at all.
 
 Two constraints that apply at **every** size, not just bring-up:
 
@@ -105,10 +122,12 @@ This is deferred, **not foreclosed** — §5.4 records exactly what MoE would ne
 the one design accommodation for it (per-tensor aggregation weights) is already in
 §5.2. Worth knowing now: **an MoE base with attention-only LoRA works on the current
 design unchanged**, since frozen experts and a frozen router reduce it to the dense
-case. Re-check when scaling to 7–8B, where MoE options get more tempting.
+case. Re-check when scaling to 9B, where MoE options get more tempting.
 
-**Verify the chat template before generating any SFT data.** Recent Qwen models use a
-hybrid thinking/non-thinking template. Fine-tuning against the wrong template degrades
+**Verify the chat template before generating any SFT data** — this applies the moment
+you use an *instruct* model, and is sidestepped during bring-up only because the pick
+above is a base model. Recent Qwen instruct models use a hybrid thinking/non-thinking
+template. Fine-tuning against the wrong template degrades
 behavior in ways that **do not show up in training loss** — you see it only in
 generation, which means it would silently corrupt M0's baseline and everything
 compared against it. Confirm the template round-trips before the baseline run. This is
@@ -116,7 +135,7 @@ also what the 20-prompt greedy smoke set (below) is there to catch.
 
 This is worth more than it sounds:
 
-- **No `nf4` needed.** A 1.7B model in bf16 is ~3.4 GB of weights — it fits a 12 GB
+- **No `nf4` needed.** A 2B model in bf16 is ~4 GB of weights — it fits a 12 GB
   3060 and a 16 GB Mac comfortably. That removes the entire nf4/MPS exclusion problem
   (§6.8 Tier 3) during bring-up, so **every contributor is eligible for the bring-up
   run**, including the Macs.
@@ -124,7 +143,7 @@ This is worth more than it sounds:
   are. On an 8B nf4 run the Macs sit idle and you'd find their bugs months later.
 - **Rounds are minutes, not hours.** You can iterate the whole pipeline several times
   a day instead of once. Use ~10-minute rounds for bring-up rather than §3.4's 15–20.
-- **Adapters are ~10–15 MB**, so the storage and bandwidth plumbing gets tested
+- **Adapters are ~15–20 MB**, so the storage and bandwidth plumbing gets tested
   without waiting on transfers.
 
 Then scale: same code, new run, `base_model` and `base_precision` changed in the run
@@ -167,7 +186,7 @@ mode to catch, since a distributed run that is quietly slightly worse than singl
 looks identical to a healthy one on a training curve.
 
 **What not to use, and why:** MMLU, GSM8K, IFEval and friends are high-variance at
-this scale, expensive, and insensitive to the deltas that matter. A 1.7B model
+this scale, expensive, and insensitive to the deltas that matter. A 2B model
 fine-tuned on 15k general instruction samples will barely move them, so you'd be
 reading noise. They're the right tool for a real run's quality much later; they are
 the wrong tool for validating infrastructure.
@@ -200,7 +219,7 @@ the spread. That spread *is* your tolerance:
   is working
 - Consistently **above** the band → aggregation is lossy; investigate before scaling
 
-At 1.7B on Dolly this costs perhaps an hour of compute and it converts M4's exit
+At 2B on Dolly this costs perhaps an hour of compute and it converts M4's exit
 criterion from a judgement call into a measurement. `baseline.json` should carry all
 seeds plus the mean and spread, not a single number.
 
@@ -229,7 +248,7 @@ happily reports as fine.
 
 #### Where eval runs
 
-**v1: on the coordinator, after aggregation.** At 1.7B, a forward-only pass over ~500
+**v1: on the coordinator, after aggregation.** At 2B, a forward-only pass over ~500
 held-out samples on CPU is a few minutes — acceptable inside a 15–20 minute round, and
 it keeps eval out of the worker protocol entirely.
 
@@ -276,7 +295,7 @@ M4b does.
 | HF cache uses symlinks; Windows needs developer mode or admin | Enable developer mode, or accept that the cache silently doubles in size from copies |
 | `multiprocessing` uses spawn, not fork | Guard entry points with `if __name__ == "__main__"`; start with `num_workers=0` in the DataLoader |
 | No cgroups for resource limits | Job Objects, or accept no limits on native installs. Container path is unaffected |
-| `bitsandbytes` is least reliable here | Irrelevant during bring-up — bf16 at 1.7B needs no quantization. Re-check before any `nf4` run |
+| `bitsandbytes` is least reliable here | Irrelevant during bring-up — bf16 at 2B needs no quantization. Re-check before any `nf4` run |
 | Git line endings can corrupt scripts inside containers | `.gitattributes` pinning shell scripts to LF |
 | Signals don't work like Unix | Already handled — the stop path is a sentinel file, not `SIGTERM` (§4.4) |
 
@@ -443,7 +462,7 @@ Exit criteria:
 
 Proving that aggregation *helps* needs real parallelism, which time-slicing can't give
 you. You don't need contributors for this: **rent three cheap instances for an
-afternoon.** At Qwen 1.7B almost anything with a GPU qualifies, and a few hours of
+afternoon.** At Qwen3.5-2B almost anything with a GPU qualifies, and a few hours of
 three small rentals costs about as much as lunch. That is a very cheap way to
 de-risk the thesis before asking anyone to install anything.
 
@@ -576,7 +595,7 @@ Two remain, and neither blocks M0.
 
 ### Closed
 
-- ~~**Base model**~~ → Qwen 1.7B dense bf16 for bring-up, 7–8B later.
+- ~~**Base model**~~ → `Qwen/Qwen3.5-2B-Base`, dense bf16, for bring-up; 9B later. Verified against the HuggingFace API rather than recalled.
 - ~~**Bring-up dataset**~~ → Dolly 15k, 64 buckets.
 - ~~**Object store**~~ → self-hosted MinIO, R2 by config swap (§6.6).
 - ~~**Coordinator hosting**~~ → deployment config, not a design question. Everything

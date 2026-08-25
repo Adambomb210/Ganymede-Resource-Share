@@ -40,13 +40,13 @@ Everything else below is a gap to fill, not a mistake.
 |---|---|
 | v1 scope | `llm_finetune` only. `rl_rollout` deferred to Phase 2. |
 | Sync layer | Central aggregation now, behind a `SyncBackend` seam so Hivemind can be swapped in without touching the worker protocol. |
-| First job | LoRA on a dense Qwen. **Bring-up on 1.7B + Dolly 15k**; scale to 7–8B after M4. |
+| First job | LoRA on a dense Qwen. **Bring-up on `Qwen3.5-2B-Base` + Dolly 15k**; scale to 9B after M4. |
 | Host model | All three (own hardware, donated rented hosts, paid instances) — **starting with own hardware**, so idle detection ships as a pluggable backend with `local` first. |
 | Storage | **Self-hosted, S3-compatible (MinIO)** on the coordinator VM, with R2 or S3 reachable by config change later. |
 | Run concurrency | **Sequential** for v1 — one active run at a time. Eligibility model written so concurrency is a later scheduling change, not a redesign. |
 | Fleet | Wide heterogeneity expected: Apple Silicon, 12 GB consumer cards, A100s. Three tiers — Architecture v2 §6.8. **No reliable schedule**, so rounds close on accumulated work (§3.2) and the inventory is derived (§6.11). |
 | Compatibility | **A project goal** (§0). The worker is a package; the container is one delivery path. Linux, macOS, and Windows all supported natively. |
-| Base model | Latest **dense** Qwen — not MoE, and verify the chat template. Rationale in `03-roadmap.md` → *Model*. MoE is deferred, not foreclosed (Architecture v2 §5.4). |
+| Base model | `Qwen/Qwen3.5-2B-Base` — dense, Apache 2.0, verified Aug 2026. MoE deferred, not foreclosed (§5.4). |
 | Data | Sensitivity **varies by run**; handled as a per-run classification gating eligibility (§6.10). |
 | v1 audience | Your group now, opening later — operator tooling, but install path and eligibility diagnostics kept honest from the start. |
 | Deployment | Coordinator containerized from day one; two subdomains; all hosts as config variables (§6.5). |
@@ -273,7 +273,7 @@ state. Axolotl owns the training loop and is configured by YAML; bending it to y
 control at a step boundary means fighting the framework. torchtune's recipes are
 meant to be forked, which is better, but then you're maintaining a fork.
 
-For LoRA on a 7–8B model, `transformers` + `peft` + a hand-written loop is about
+For LoRA on a small dense model, `transformers` + `peft` + a hand-written loop is about
 **250 lines** and gives exact control over the sync boundary, the SIGTERM path, and
 the safetensors I/O. It also drops a large dependency tree, which serves the footprint
 goal directly.
