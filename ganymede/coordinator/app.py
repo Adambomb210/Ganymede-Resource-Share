@@ -396,6 +396,8 @@ def _task_payload(spec: rounds.TaskSpec, store: Store) -> dict:
         "run_id": spec.run_id,
         "round_idx": spec.round_idx,
         "buckets": spec.buckets,
+        "num_buckets": spec.num_buckets,
+        "seed": rounds.task_seed(spec.run_id, spec.round_idx, spec.id),
         "local_steps": spec.local_steps,
         "lease_expires_at": spec.lease_expires_at.isoformat(),
         "base_model": spec.base_model,

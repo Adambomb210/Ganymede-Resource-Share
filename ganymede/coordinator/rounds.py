@@ -11,6 +11,7 @@ not a degenerate case.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -53,6 +54,11 @@ class TaskSpec:
     run_id: str
     round_idx: int
     buckets: list[int]
+    # Total bucket count for the run. The worker receives bucket *indices* and
+    # has to turn them into rows itself -- the coordinator never sees the data --
+    # which it cannot do without knowing how many buckets the dataset was cut
+    # into. Sending the indices alone is not a shard assignment.
+    num_buckets: int
     local_steps: int
     lease_expires_at: datetime
     base_adapter_ref: str
@@ -373,12 +379,29 @@ def claim_task(
         return _task_spec(task_row, run, rnd)
 
 
+def task_seed(run_id: str, round_idx: int, task_id: str) -> int:
+    """Deterministic per-task seed for shuffling within the assigned buckets.
+
+    Derived rather than stored, and derived from the task id rather than the
+    round: two workers in the same round must not walk their shards in a
+    correlated order, and a task retried after a lease expiry should reproduce
+    the ordering the first attempt used. blake2b rather than hash() because
+    Python salts str hashing per process, which would make this irreproducible
+    across a coordinator restart.
+    """
+    digest = hashlib.blake2b(
+        f"{run_id}/{round_idx}/{task_id}".encode(), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "big") % (2**31)
+
+
 def _task_spec(task: sqlite3.Row, run: sqlite3.Row, rnd: sqlite3.Row) -> TaskSpec:
     return TaskSpec(
         id=task["id"],
         run_id=task["run_id"],
         round_idx=task["round_idx"],
         buckets=json.loads(task["buckets_json"]),
+        num_buckets=int(run["num_buckets"]),
         local_steps=task["local_steps"],
         lease_expires_at=_parse(task["lease_expires_at"]),
         base_adapter_ref=rnd["base_adapter_ref"],

@@ -819,6 +819,35 @@ def test_cross_contributor_task_access_is_404_not_403(client, store, conn, make_
 # genuine defect this suite turned up while probing adjacent behaviour.
 # Left as failing (not fixed) per instructions -- the coordinator is someone
 # else's ownership boundary.
+def test_task_payload_carries_everything_the_trainer_needs(client, store, make_contributor, seeded_run, register_worker):
+    """The M0 trainer's run_task contract must be satisfiable from one claim.
+
+    Bucket indices without num_buckets are not a shard assignment: the worker
+    maps indices to rows itself, because the coordinator never sees the data.
+    """
+    _, key = make_contributor()
+    run_id = seeded_run(num_buckets=64)
+    wid = register_worker(key)
+    task = client.post("/v1/tasks/claim", headers={"Authorization": f"Bearer {key}"},
+                       json={"worker_id": wid}).json()
+    for field in ("task_id", "run_id", "round_idx", "buckets", "num_buckets", "seed",
+                  "local_steps", "base_model", "base_precision", "lora_cfg",
+                  "hyperparams", "dataset_ref", "base_adapter_url"):
+        assert field in task, f"task payload is missing {field}"
+    assert task["num_buckets"] == 64
+    assert all(0 <= b < task["num_buckets"] for b in task["buckets"])
+
+
+def test_task_seed_is_stable_across_processes_and_distinct_per_task():
+    """A retried task must reproduce its data ordering; two concurrent tasks
+    must not walk their shards in a correlated one. Python salts str hashing
+    per process, so this cannot be built on hash()."""
+    a = rounds.task_seed("run1", 0, "task-aaa")
+    assert a == rounds.task_seed("run1", 0, "task-aaa")
+    assert a != rounds.task_seed("run1", 0, "task-bbb")
+    assert a != rounds.task_seed("run1", 1, "task-aaa")
+
+
 # ==========================================================================
 
 
