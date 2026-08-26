@@ -474,6 +474,59 @@ vastly faster than testing it against real GPUs.
 
 ---
 
+## M1 status — built
+
+**Done.** 136 tests, nothing skipped, including the real-MinIO storage tests.
+
+| Exit criterion | State |
+|---|---|
+| N workers concurrently claim, train, submit; rounds advance | met |
+| No double-leasing under concurrent claim (`BEGIN IMMEDIATE` tested directly) | met |
+| NaN, wrong-shape and pickle adapters each rejected with the right reason | met — plus Inf, missing key, extra key, wrong dtype |
+| Killing the coordinator mid-round loses nothing submitted | met |
+| Round closes with 1, 2 and 8 workers, one unchanged config | met |
+| Zero workers reopens quietly, no alert | met |
+| Worker with ~3 minutes left gets `204` | met |
+| 3× throughput → budgets and bucket counts both scale; weight follows steps | met |
+| `nf4` requirement and the throughput floor gate eligibility | met |
+| Presigned URL fetchable by an external client over the public hostname | met — verified live, `urllib` only, no boto3 |
+| GC deletes; backup lands off-box | GC met. Backup is tested against a second store and refuses a destination equal to its source; pointing it at a **real** off-box destination is deploy work |
+
+Also verified live rather than only in tests: the `uvicorn` factory boots against
+real MinIO, `issue_key` and `newrun` produce a real run from `Qwen3-1.7B-Base` in
+about six seconds with **no weight download**, and a worker speaking only `urllib`
+runs a full round through presigned URLs. Measured throughput then replaces the
+cold-start default in the next round's budget — 108 steps to 1172, with bucket
+counts scaling alongside so the faster worker gets more *data*, not more epochs.
+
+### Three bugs the integration suite found
+
+Worth recording, because each was invisible to the module-level tests and two were
+in code that looked obviously correct:
+
+1. **The round-close race.** `close_round` checked "is this round open" with a plain
+   `SELECT` outside any transaction. Two submissions landing together both passed
+   the check, both ran the whole aggregate-and-advance path, and the loser died on
+   a `rounds` UNIQUE violation — a 500 to a worker that did nothing wrong. Closing
+   is now claimed with a conditional `UPDATE`; the loser gets a clean no-op. The
+   claim path had this right from the start, which is exactly why the omission
+   survived review.
+2. **Two inert tunables.** `GANYMEDE_NORM_REJECT_K` and `GANYMEDE_DOMINANCE_CAP`
+   were read from the environment, stored on `Settings`, and documented — and never
+   passed to the gates, which hardcoded the same values. The deployment knob did
+   nothing. A tunable nobody reads is worse than no tunable, because the operator
+   believes it works.
+3. **A cache keyed too loosely.** The expected-key manifest was cached by adapter
+   ref alone, so the same key path against different storage returned a manifest
+   for bytes it had never read.
+
+### Still deploy-time, not build-time
+
+Unchanged from the pre-M1 check: real hostnames and a TLS certificate, and a real
+off-box backup destination. Neither blocks M2.
+
+---
+
 ## M2 — Worker package + container
 
 **~4–5 days** (was 3–4; the native path and the probe are new scope).
