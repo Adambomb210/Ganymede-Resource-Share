@@ -670,7 +670,7 @@ docker/
 | One real GPU claims from a real coordinator, trains, submits, loops | **met on CPU.** A containerized `worker-llm` ran 207 steps against a live uvicorn coordinator and real MinIO under `--read-only --cap-drop=ALL --security-opt=no-new-privileges`, non-root, and the coordinator closed the round and opened the next. Repeatable as `tests/test_worker_live.py`. **The GPU itself is yours** |
 | The same package runs natively on Linux/CUDA, macOS/MPS, Windows/CUDA | **needs three machines.** The backend registry (§4.5) makes each one an entry rather than a port, and the probe reports honestly on any of them — but "it registers correctly on a Mac" is a claim only a Mac can settle |
 | The probe reports a machine ineligible without failing registration | met — nothing in the probe raises; a machine where every measurement failed still produces a valid profile and is simply never eligible |
-| Read-only rootfs works with the declared writable mounts | met, and asserted in CI on every push |
+| Read-only rootfs works with the declared writable mounts | met — verified by hand on this box, and asserted in CI. The CI half of that was aspirational until M4a: the workflow's container job had never actually executed, and its first run failed on the image chain (see "M4a status") |
 | `docker stop` mid-training → lease released → another worker picks the shard up | partially: abandon-on-stop is covered by tests, and the sentinel path works. The two-worker handoff needs a second machine to be worth calling proven |
 | Egress allowlist enforced; worker functions with three destinations reachable | **not done.** Needs a firewall to enforce, which this container does not have |
 | HF cache volume: base model pulled once, reused on every container start | met — observed directly. Setup was 110 s on a cold cache and 19 s on a warm one, same image, same model |
@@ -944,6 +944,40 @@ because it reads as evidence. Each response is now a deterministic function of
 one token in its instruction, so the assertion has something real to detect, and
 the threshold sits well outside what noise on forty examples produces. That one
 change is the difference between the two curves above.
+
+### And the CI job that had never run
+
+The push that closed M4a triggered **run #1** of the workflow — the first time
+GitHub Actions had ever executed it. The fast suite passed. The container job
+failed in one second, on its second `docker build`:
+
+```
+ERROR: failed to solve: ganymede/torch-base:cpu:
+  pull access denied, repository does not exist or may require authorization
+```
+
+The images are a chain: `worker-core`'s `FROM` is the `torch-base` built by the
+step above it. `docker/setup-buildx-action`'s default `docker-container` driver
+runs the build inside its own container with its own image store, so it resolved
+that `FROM` against Docker Hub and asked for an image that only exists locally.
+`load: true` does not help — it puts the base in the *host* daemon's store,
+which is not where the builder looks.
+
+Two things worth taking from it, neither of them about Docker:
+
+**A CI job that has never run is not a check, it is a plan.** The M2 exit
+criteria table said read-only rootfs was "asserted in CI on every push". The
+underlying claim was true — the images were built and run by hand, under
+`--read-only --cap-drop=ALL`, and a containerized worker completed 207 steps —
+but the sentence described a mechanism that had never once executed. That entry
+now says which half was verified how.
+
+**The failure mode that worries me more is the one that did not happen.** Had
+some unrelated `ganymede/torch-base:cpu` existed on Docker Hub, the pull would
+have *succeeded*, and every check in the job would have passed against an image
+nobody in this repository built. The job now builds with the host daemon — which
+is also what `docker/README.md` tells a contributor to run — and asserts that
+`worker-core`'s base layer is the `torch-base` from the step above it.
 
 ### Two things worth knowing before M4b
 

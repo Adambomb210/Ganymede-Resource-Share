@@ -47,30 +47,60 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-buildx-action@v3
-
+      # Plain `docker build`, not buildx. The images are a chain --
+      # worker-core's FROM is the torch-base built in the step above -- and
+      # buildx's default `docker-container` driver runs in its own container
+      # with its own image store, so it resolves that FROM against Docker Hub
+      # and fails with "pull access denied" on an image that exists locally.
+      # `load: true` does not help: it puts the base in the *host* daemon's
+      # store, which is not where the builder looks.
+      #
+      # The host daemon's builder resolves local tags naturally, which is also
+      # what a contributor following docker/README.md runs. The cost is the
+      # GitHub Actions layer cache; the CPU base builds in about 75 s without
+      # it, and a cache that makes the build not test the real thing is worth
+      # less than the minute.
       - name: Build torch-base (CPU stand-in)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/torch-base-cpu.Dockerfile
-          tags: ganymede/torch-base:cpu
-          load: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        run: |
+          docker build -f docker/torch-base-cpu.Dockerfile -t ganymede/torch-base:cpu .
 
       - name: Build worker-core
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/worker-core.Dockerfile
-          build-args: |
-            TORCH_BASE=ganymede/torch-base:cpu
-            GANYMEDE_VERSION=ci
-          tags: ganymede/worker-core:ci
-          load: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        run: |
+          docker build -f docker/worker-core.Dockerfile \
+            --build-arg TORCH_BASE=ganymede/torch-base:cpu \
+            --build-arg GANYMEDE_VERSION=ci \
+            -t ganymede/worker-core:ci .
+
+      - name: worker-core was built on the torch-base from the step above
+        # The failure this guards against is silent in the worst way. If that
+        # FROM ever resolves to some *other* ganymede/torch-base -- a real one
+        # on Docker Hub, say -- the pull succeeds and every check below passes
+        # against an image nobody in this repository built.
+        #
+        # The test is layer prefix, not layer equality and not the first layer
+        # alone: B is built on A exactly when A's layers are a prefix of B's.
+        # Comparing only the first layer is not enough, and the reason is easy
+        # to miss -- torch-base is itself FROM python:3.11-slim, so an unrelated
+        # image on the same Debian base shares that first layer and would pass.
+        run: |
+          python - <<'EOF'
+          import json, subprocess, sys
+
+          def layers(ref):
+              out = subprocess.run(
+                  ["docker", "image", "inspect", ref, "--format", "{{json .RootFS.Layers}}"],
+                  capture_output=True, text=True, check=True)
+              return json.loads(out.stdout)
+
+          base = layers("ganymede/torch-base:cpu")
+          child = layers("ganymede/worker-core:ci")
+          if child[:len(base)] != base:
+              print("worker-core was not built on the torch-base from the previous step")
+              print(f"  torch-base:  {len(base)} layers")
+              print(f"  worker-core: {len(child)} layers")
+              sys.exit(1)
+          print(f"chain ok: {len(base)} base layers, {len(child)} total")
+          EOF
 
       - name: Probe runs inside the container
         # The entrypoint's own self-report. If the image cannot describe its own
