@@ -106,6 +106,9 @@ def settings(tmp_path) -> Settings:
         min_usable_sec=300,
         est_download_sec=60,
         est_upload_sec=30,
+        # Zero in the suite so the existing budget expectations stay readable;
+        # test_budget.py covers the reservation itself directly.
+        est_setup_sec=0,
         safety_margin_sec=60,
         norm_reject_k=5.0,
         dominance_cap=2.0,

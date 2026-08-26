@@ -39,6 +39,7 @@ ganymede-newrun = "scripts.newrun:main"
 ganymede-issue-key = "scripts.issue_key:main"
 ganymede-calibrate = "ganymede.trainer.calibrate:main"
 ganymede-baseline = "ganymede.trainer.baseline:main"
+ganymede-worker = "ganymede.worker.loop:main"
 
 [tool.setuptools.packages.find]
 include = ["ganymede*"]

@@ -386,6 +386,12 @@ def main(
         }
 
         store = store or Store(settings.storage)
+        # Idempotent, and it removes an ordering dependency between two admin
+        # steps: this script is the first thing that ever writes to the bucket,
+        # and requiring the coordinator to have been started at least once first
+        # is the kind of unwritten prerequisite that turns a first deployment
+        # into a boto stack trace about NoSuchBucket.
+        store.ensure_bucket()
 
         # Ordering matters and is the load-bearing part of this script: the
         # base adapter has to be durable in object storage *before* anything in

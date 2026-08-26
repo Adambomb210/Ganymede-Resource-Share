@@ -33,6 +33,7 @@ def usable_seconds(
     est_download_sec: int,
     est_upload_sec: int,
     safety_margin_sec: int,
+    est_setup_sec: int = 0,
 ) -> int:
     """Seconds of actual training time available to a worker claiming right now.
 
@@ -42,8 +43,19 @@ def usable_seconds(
     minutes of work to budget from, not a full round's worth; sizing against the
     full round would hand it work it cannot finish before the round closes
     underneath it, wasting the effort entirely.
+
+    ``est_setup_sec`` covers loading the base model and attaching the adapter,
+    and it belongs here for the same reason download and upload do: it is a
+    fixed cost per task, not a rate, so folding it into throughput would make
+    the error depend on round length. It is not a rounding error. A live M2
+    round measured 110 s of setup against 46 s of training on a 0.6B model with
+    a warm cache -- the setup was 2.4x the work. An 8B model on a cold cache is
+    minutes. Budget without reserving it and every worker is handed more steps
+    than it can reach, stops at its deadline part-way through, and delivers
+    short every round with nothing reporting a problem.
     """
-    usable = remaining_sec - est_download_sec - est_upload_sec - safety_margin_sec
+    usable = (remaining_sec - est_download_sec - est_upload_sec
+              - safety_margin_sec - est_setup_sec)
     return max(0, usable)
 
 
@@ -142,6 +154,7 @@ def plan_budget(
     safety_margin_sec: int,
     min_usable_sec: int,
     target_passes: float = 1.0,
+    est_setup_sec: int = 0,
 ) -> Budget | None:
     """Compose the pieces above into the budget offered to a claiming worker.
 
@@ -149,7 +162,8 @@ def plan_budget(
     coordinator's claim endpoint) turns that into ``204 No Content`` plus a
     ``Retry-After`` pointing past the round boundary (3.2).
     """
-    usable = usable_seconds(remaining_sec, est_download_sec, est_upload_sec, safety_margin_sec)
+    usable = usable_seconds(remaining_sec, est_download_sec, est_upload_sec,
+                            safety_margin_sec, est_setup_sec)
 
     # Deliberate refusal, not a failure: handing a worker three minutes of a
     # fifteen-minute task wastes its bandwidth on a download/upload round trip

@@ -52,6 +52,12 @@ COLD_START_STEPS_PER_MIN = 3.0
 DEFAULT_NORM_REJECT_K = 5.0
 DEFAULT_DOMINANCE_CAP = 2.0
 
+# Base-model load plus adapter attach, in seconds. Sized from a measured M2
+# round: 110 s for a 0.6B model with a warm HuggingFace cache. Larger models and
+# cold caches are worse, so raise it per deployment -- a worker's submitted
+# `setup_sec` metric is the number to raise it from.
+DEFAULT_EST_SETUP_SEC = 120
+
 DEFAULT_COMBINE_MODE = "mean"
 DEFAULT_LR_OUTER = 1.0
 DEFAULT_OUTER_MOMENTUM = 0.9  # only consulted when combine mode is "diloco"
@@ -97,6 +103,10 @@ class Settings:
     # Fixed overheads subtracted from remaining round time before sizing a budget.
     est_download_sec: int
     est_upload_sec: int
+    # Loading the base model and attaching the adapter. A fixed per-task cost
+    # like download and upload, not a rate -- see budget.usable_seconds for the
+    # measurement that put it there.
+    est_setup_sec: int
     safety_margin_sec: int
     # Gate 4: reject a tensor whose Frobenius norm exceeds k x the cohort median.
     norm_reject_k: float
@@ -119,6 +129,7 @@ class Settings:
             min_usable_sec=_env_int("GANYMEDE_MIN_USABLE_SEC", 300),
             est_download_sec=_env_int("GANYMEDE_EST_DOWNLOAD_SEC", 60),
             est_upload_sec=_env_int("GANYMEDE_EST_UPLOAD_SEC", 30),
+            est_setup_sec=_env_int("GANYMEDE_EST_SETUP_SEC", DEFAULT_EST_SETUP_SEC),
             safety_margin_sec=_env_int("GANYMEDE_SAFETY_MARGIN_SEC", 60),
             norm_reject_k=_env_float("GANYMEDE_NORM_REJECT_K", DEFAULT_NORM_REJECT_K),
             dominance_cap=_env_float("GANYMEDE_DOMINANCE_CAP", DEFAULT_DOMINANCE_CAP),

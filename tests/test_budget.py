@@ -408,3 +408,70 @@ def test_clearance_permits_unknown_strings_fail_closed():
 
 def test_clearance_order_matches_spec():
     assert CLEARANCE_ORDER == ("open", "internal", "restricted")
+
+
+# --------------------------------------------------------------------------
+# Setup time is a fixed cost, not a rate
+# --------------------------------------------------------------------------
+
+
+def test_setup_time_is_reserved_like_download_and_upload():
+    """Loading the base model is a per-task cost, so it comes off usable time.
+
+    Folding it into throughput instead would make the error depend on round
+    length -- small on long rounds, large on short ones, and never visible as an
+    error anywhere.
+    """
+    without = usable_seconds(1800, 60, 30, 60)
+    with_setup = usable_seconds(1800, 60, 30, 60, est_setup_sec=120)
+    assert without - with_setup == 120
+
+
+def test_unreserved_setup_overcommits_the_worker():
+    """The concrete failure, with the numbers a live M2 round actually produced.
+
+    Setup was 110 s against 46 s of training on a 0.6B model with a warm cache.
+    Budget without reserving it and the worker is handed steps it cannot reach:
+    it stops at its deadline part-way through and delivers short every round,
+    with nothing anywhere reporting a problem.
+    """
+    throughput = 47.9  # steps/min, as measured
+    remaining, setup = 600, 110
+
+    naive = step_budget(throughput, usable_seconds(remaining, 5, 5, 10))
+    honest = step_budget(
+        throughput, usable_seconds(remaining, 5, 5, 10, est_setup_sec=setup)
+    )
+
+    assert naive > honest
+    # The worker's real training window is what is left after setup, so the
+    # naive budget is unreachable by roughly the setup time's worth of steps.
+    reachable = step_budget(throughput, remaining - 5 - 5 - 10 - setup)
+    assert honest == reachable
+    assert naive - honest == pytest.approx(throughput * setup / 60, abs=1)
+
+
+def test_plan_budget_threads_setup_through():
+    plan = plan_budget(
+        remaining_sec=1800, measured=10.0, calibrated=None, cold_start=3.0,
+        samples_per_step=8, samples_per_bucket=222, total_buckets=64,
+        est_download_sec=60, est_upload_sec=30, safety_margin_sec=60,
+        min_usable_sec=300, est_setup_sec=300,
+    )
+    assert plan is not None
+    assert plan.usable_sec == 1800 - 60 - 30 - 60 - 300
+
+
+def test_setup_can_exhaust_a_short_round_entirely():
+    """A worker joining with four minutes left cannot load an 8B model and train.
+
+    Refusing with a 204 is the right answer: the alternative is a lease held for
+    a round's remainder that produces nothing.
+    """
+    plan = plan_budget(
+        remaining_sec=240, measured=10.0, calibrated=None, cold_start=3.0,
+        samples_per_step=8, samples_per_bucket=222, total_buckets=64,
+        est_download_sec=60, est_upload_sec=30, safety_margin_sec=60,
+        min_usable_sec=60, est_setup_sec=300,
+    )
+    assert plan is None

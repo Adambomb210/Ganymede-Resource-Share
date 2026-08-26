@@ -343,6 +343,7 @@ def claim_task(
             total_buckets=int(run["num_buckets"]),
             est_download_sec=settings.est_download_sec,
             est_upload_sec=settings.est_upload_sec,
+            est_setup_sec=settings.est_setup_sec,
             safety_margin_sec=settings.safety_margin_sec,
             min_usable_sec=settings.min_usable_sec,
             target_passes=float(hp.get("target_passes", 1.0)),
