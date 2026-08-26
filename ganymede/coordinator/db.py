@@ -50,6 +50,11 @@ CREATE TABLE IF NOT EXISTS runs (
     outer_beta          REAL NOT NULL DEFAULT 0.0,
     outer_momentum_ref  TEXT,
     requires_json       TEXT NOT NULL DEFAULT '{}',
+    -- Image tag a worker must be running to claim this run (8, 4.2 step 5).
+    -- NULL means no requirement, which is the native-install case; a non-NULL
+    -- value is also how 6.10's "restricted runs use the container path" is
+    -- actually enforced, since a native worker has no image tag to match.
+    required_image      TEXT,
     data_classification TEXT NOT NULL DEFAULT 'open',
     num_buckets         INTEGER NOT NULL DEFAULT 64,
     created_at          TEXT NOT NULL
@@ -87,6 +92,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- with every heartbeat of every worker forever, so reading progress out of
     -- it would make each submit scan a table that never stops growing.
     last_heartbeat_steps INTEGER,
+    -- Wall-clock ceiling handed to the worker as a safety net (8). Stored at
+    -- claim rather than recomputed, so a worker resuming a held lease is told
+    -- the same budget it was originally given; lease_expires_at is the harder
+    -- bound and the worker honours whichever comes first.
+    max_runtime_sec   INTEGER,
     created_at        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_round  ON tasks(run_id, round_idx, status);
@@ -155,8 +165,41 @@ def connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+# Columns added after a table's first release. ``CREATE TABLE IF NOT EXISTS``
+# is a no-op against an existing table, so a new column in SCHEMA above reaches
+# a fresh database and silently misses every existing one -- and the failure
+# lands later, as a KeyError deep in the claim path, on the one deployment that
+# has data worth keeping.
+#
+# Additive only, deliberately. Renames, drops and type changes need a real
+# migration with a version number and a plan; adding a nullable column does
+# not, and pretending otherwise here would mean writing a migration framework
+# before there is a second thing to migrate.
+_ADDED_COLUMNS: dict[str, dict[str, str]] = {
+    "runs": {"required_image": "TEXT"},
+    "tasks": {"max_runtime_sec": "INTEGER", "last_heartbeat_steps": "INTEGER"},
+}
+
+
+def _apply_additive_migrations(conn: sqlite3.Connection) -> list[str]:
+    """Add any declared column the database does not already have."""
+    applied = []
+    for table, columns in _ADDED_COLUMNS.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not existing:
+            continue  # table itself is new; CREATE TABLE already has the column
+        for name, decl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                applied.append(f"{table}.{name}")
+    if applied:
+        conn.commit()
+    return applied
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _apply_additive_migrations(conn)
 
 
 @contextmanager

@@ -71,10 +71,10 @@ PROBE_TIMEOUT_SEC = 3600.0
 def describe_device(device: torch.device) -> dict[str, Any]:
     """What the coordinator keys throughput on, plus enough to debug a surprise.
 
-    ``name`` comes from ``model.device_name``, the single implementation shared
-    with the trainer's submitted metrics and with what a worker reports as
-    ``device_name`` in its ``compute_profile`` (6.9). That string is the join key
-    between this file and ``rounds.claim_task``.
+    ``name`` comes from ``ganymede.device.device_name`` -- the one implementation
+    shared with the trainer's submitted metrics and with what the worker's probe
+    reports as ``device_name`` (6.9). That string is the join key between this
+    file and ``rounds.claim_task``.
     """
     info: dict[str, Any] = {
         "type": device.type,

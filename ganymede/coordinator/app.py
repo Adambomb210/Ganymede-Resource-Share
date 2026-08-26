@@ -218,7 +218,7 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                 reasons.append(f"{run_id}: {exc}")
                 continue
             if spec is not None:
-                return JSONResponse(_task_payload(spec, store))
+                return JSONResponse(_task_payload(spec, store, settings))
 
         # 204 is a legitimate answer, not an error: nothing eligible, or too
         # little of the round left to be worth a 25 MB round trip.
@@ -389,7 +389,7 @@ def _selectable_runs(conn: sqlite3.Connection, pinned: str | None,
     return [r["id"] for r in sorted(rows, key=lambda r: r["base_model"] not in cached)]
 
 
-def _task_payload(spec: rounds.TaskSpec, store: Store) -> dict:
+def _task_payload(spec: rounds.TaskSpec, store: Store, settings: Settings) -> dict:
     url, expires = store.presign_get(spec.base_adapter_ref)
     return {
         "task_id": spec.id,
@@ -399,7 +399,13 @@ def _task_payload(spec: rounds.TaskSpec, store: Store) -> dict:
         "num_buckets": spec.num_buckets,
         "seed": rounds.task_seed(spec.run_id, spec.round_idx, spec.id),
         "local_steps": spec.local_steps,
+        "max_runtime_sec": spec.max_runtime_sec,
         "lease_expires_at": spec.lease_expires_at.isoformat(),
+        "heartbeat_interval_sec": settings.heartbeat_interval_sec,
+        # None when the run has no image requirement (the native-install case).
+        # A worker running a different tag abandons here rather than after
+        # downloading a base model (4.2 step 5).
+        "required_image": spec.required_image,
         "base_model": spec.base_model,
         "base_precision": spec.base_precision,
         "lora_cfg": spec.lora_cfg,

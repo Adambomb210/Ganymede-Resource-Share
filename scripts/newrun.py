@@ -136,6 +136,7 @@ _CONFIG_KEYS = {
     "min_round_sec": "min_round_sec",
     "max_round_sec": "max_round_sec",
     "data_classification": "classification",
+    "required_image": "required_image",
 }
 
 _REQUIRED = (
@@ -238,6 +239,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="seed for the permutation that defines eval split and buckets")
     p.add_argument("--prompt-format", default=None,
                    help="named format in ganymede.trainer.data.FORMATS")
+    p.add_argument(
+        "--required-image", default=None,
+        help="image tag a worker must be running to claim this run (4.2 step 5). "
+             "Omit for no requirement -- which is what allows native installs. "
+             "Setting it is also how a restricted run (6.10) is held to the "
+             "container path, since a native worker has no image tag to match",
+    )
     p.add_argument("--requires", default="{}", help="JSON object, budget.is_eligible shape")
     p.add_argument("--hyperparams", default="{}", help="JSON object merged into hyperparams_json")
     p.add_argument("--dry-run", action="store_true",
@@ -398,12 +406,12 @@ def main(
                      (id, status, base_model, base_precision, lora_cfg_json, dataset_ref,
                       hyperparams_json, current_round, target_rounds, combine_mode,
                       lr_outer, outer_beta, requires_json, data_classification,
-                      num_buckets, created_at)
-                   VALUES (?, 'active', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                      num_buckets, required_image, created_at)
+                   VALUES (?, 'active', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (args.run_id, args.base_model, args.base_precision, json.dumps(lora_cfg),
                  args.dataset_ref, json.dumps(hyperparams), args.target_rounds,
                  args.combine_mode, args.lr_outer, outer_beta, json.dumps(requires),
-                 args.data_classification, args.num_buckets, now),
+                 args.data_classification, args.num_buckets, args.required_image, now),
             )
             for b in range(args.num_buckets):
                 conn.execute(

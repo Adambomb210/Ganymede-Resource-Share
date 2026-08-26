@@ -163,6 +163,7 @@ def seeded_run(conn, store):
         requires: dict | None = None,
         classification: str = "open",
         hyperparams: dict | None = None,
+        required_image: str | None = None,
     ) -> str:
         hp = {"micro_batch": 8, "grad_accum": 1, "samples_per_bucket": 234,
               "target_passes": 1.0, "cold_start_steps_per_min": 30.0}
@@ -172,12 +173,13 @@ def seeded_run(conn, store):
                  (id, status, base_model, base_precision, lora_cfg_json, dataset_ref,
                   hyperparams_json, current_round, target_rounds, combine_mode,
                   lr_outer, outer_beta, requires_json, data_classification,
-                  num_buckets, created_at)
+                  num_buckets, required_image, created_at)
                VALUES (?, 'active', 'Qwen/Qwen3-1.7B-Base', 'bf16', ?, 'dolly15k',
-                       ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (run_id, json.dumps({"r": 16, "alpha": 32}), json.dumps(hp), target_rounds,
              combine_mode, lr_outer, outer_beta, json.dumps(requires or {}),
-             classification, num_buckets, rounds._iso(rounds.utcnow())),
+             classification, num_buckets, required_image,
+             rounds._iso(rounds.utcnow())),
         )
         for b in range(num_buckets):
             conn.execute(

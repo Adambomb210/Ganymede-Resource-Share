@@ -831,7 +831,8 @@ def test_task_payload_carries_everything_the_trainer_needs(client, store, make_c
     task = client.post("/v1/tasks/claim", headers={"Authorization": f"Bearer {key}"},
                        json={"worker_id": wid}).json()
     for field in ("task_id", "run_id", "round_idx", "buckets", "num_buckets", "seed",
-                  "local_steps", "base_model", "base_precision", "lora_cfg",
+                  "local_steps", "max_runtime_sec", "heartbeat_interval_sec",
+                  "required_image", "base_model", "base_precision", "lora_cfg",
                   "hyperparams", "dataset_ref", "base_adapter_url"):
         assert field in task, f"task payload is missing {field}"
     assert task["num_buckets"] == 64
@@ -958,3 +959,71 @@ def test_expected_manifest_cache_ignores_store_identity():
     manifest_b = closer.expected_manifest(store_b, key)
     # Desired: reflects store_b's actual bytes, not store_a's stale cache entry.
     assert set(manifest_b) == set(adapter_b)
+
+
+def test_max_runtime_sec_is_the_budgeted_time_not_a_constant(
+    client, make_contributor, seeded_run, register_worker, conn
+):
+    """A safety net unrelated to the round is not a safety net.
+
+    ``budget.plan_budget`` already computes exactly the right number -- the
+    round's remaining time less the download, upload and margin it reserved --
+    and before this it was simply not sent, leaving the worker to fall back on a
+    flat hour that has nothing to do with when the round closes.
+    """
+    _, key = make_contributor()
+    run_id = seeded_run(max_round_sec=1800)
+    wid = register_worker(key)
+    task = client.post("/v1/tasks/claim", headers={"Authorization": f"Bearer {key}"},
+                       json={"worker_id": wid}).json()
+
+    assert 0 < task["max_runtime_sec"] < 1800  # bounded by the round, minus reserves
+    stored = conn.execute(
+        "SELECT max_runtime_sec FROM tasks WHERE id = ?", (task["task_id"],)
+    ).fetchone()["max_runtime_sec"]
+    assert stored == task["max_runtime_sec"]
+
+
+def test_required_image_is_none_unless_the_run_sets_one(
+    client, make_contributor, seeded_run, register_worker
+):
+    """Null means "no requirement", which is what permits native installs (4.1).
+
+    Defaulting it to some image instead would silently exclude every macOS and
+    Windows contributor, who have no container to report a tag from.
+    """
+    _, key = make_contributor()
+    run_id = seeded_run()
+    wid = register_worker(key)
+    task = client.post("/v1/tasks/claim", headers={"Authorization": f"Bearer {key}"},
+                       json={"worker_id": wid}).json()
+    assert task["required_image"] is None
+
+
+def test_a_run_can_demand_an_image_tag(
+    client, make_contributor, seeded_run, register_worker
+):
+    _, key = make_contributor()
+    run_id = seeded_run(required_image="ganymede/worker-llm:v3")
+    wid = register_worker(key)
+    task = client.post("/v1/tasks/claim", headers={"Authorization": f"Bearer {key}"},
+                       json={"worker_id": wid}).json()
+    assert task["required_image"] == "ganymede/worker-llm:v3"
+
+
+def test_a_resumed_lease_reports_the_same_budget_it_was_given(
+    client, make_contributor, seeded_run, register_worker
+):
+    """One lease per worker: a re-claim after a network blip resumes rather than
+    forking the work. The budget it resumes with has to be the one it started
+    with, or a worker that reconnects gets a different deadline mid-task."""
+    _, key = make_contributor()
+    run_id = seeded_run()
+    wid = register_worker(key)
+    headers = {"Authorization": f"Bearer {key}"}
+
+    first = client.post("/v1/tasks/claim", headers=headers, json={"worker_id": wid}).json()
+    again = client.post("/v1/tasks/claim", headers=headers, json={"worker_id": wid}).json()
+
+    assert again["task_id"] == first["task_id"]
+    assert again["max_runtime_sec"] == first["max_runtime_sec"]

@@ -22,6 +22,10 @@ from ganymede.coordinator import budget as budget_mod
 from ganymede.coordinator.config import COLD_START_STEPS_PER_MIN
 from ganymede.coordinator.db import immediate
 
+# Fallback wall-clock ceiling for task rows written before max_runtime_sec
+# existed. One hour matches the default lease, so the two bounds agree.
+DEFAULT_MAX_RUNTIME_SEC = 3600
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -60,6 +64,11 @@ class TaskSpec:
     # into. Sending the indices alone is not a shard assignment.
     num_buckets: int
     local_steps: int
+    # Wall-clock safety net (8). The worker stops at whichever comes first, this
+    # or lease_expires_at -- they answer different questions: this one is "how
+    # long was this work budgeted", the lease is "when does the coordinator stop
+    # believing you".
+    max_runtime_sec: int
     lease_expires_at: datetime
     base_adapter_ref: str
     base_model: str
@@ -67,6 +76,10 @@ class TaskSpec:
     lora_cfg: dict
     hyperparams: dict
     dataset_ref: str
+    # Image tag the worker must be running, or None for no requirement (4.2
+    # step 5). A worker that cannot honour it abandons before downloading
+    # anything rather than submitting an artifact from the wrong stack.
+    required_image: str | None
 
 
 # --------------------------------------------------------------------------
@@ -370,10 +383,10 @@ def claim_task(
         conn.execute(
             """INSERT INTO tasks
                  (id, run_id, round_idx, buckets_json, local_steps, status,
-                  worker_id, lease_expires_at, attempts, created_at)
-               VALUES (?, ?, ?, ?, ?, 'leased', ?, ?, 1, ?)""",
+                  worker_id, lease_expires_at, attempts, max_runtime_sec, created_at)
+               VALUES (?, ?, ?, ?, ?, 'leased', ?, ?, 1, ?, ?)""",
             (task_id, run_id, rnd["idx"], json.dumps(buckets), plan.local_steps,
-             worker_id, _iso(expires), _iso(now)),
+             worker_id, _iso(expires), plan.usable_sec, _iso(now)),
         )
         # Mark the shard as spoken for now, not at submit. If this worker
         # vanishes the lease expires and the buckets come back round on
@@ -418,6 +431,9 @@ def _task_spec(task: sqlite3.Row, run: sqlite3.Row, rnd: sqlite3.Row) -> TaskSpe
         buckets=json.loads(task["buckets_json"]),
         num_buckets=int(run["num_buckets"]),
         local_steps=task["local_steps"],
+        # Defaulted for rows written before the column existed; the lease still
+        # bounds them, so the fallback is a belt rather than the braces.
+        max_runtime_sec=int(task["max_runtime_sec"] or DEFAULT_MAX_RUNTIME_SEC),
         lease_expires_at=_parse(task["lease_expires_at"]),
         base_adapter_ref=rnd["base_adapter_ref"],
         base_model=run["base_model"],
@@ -425,6 +441,7 @@ def _task_spec(task: sqlite3.Row, run: sqlite3.Row, rnd: sqlite3.Row) -> TaskSpe
         lora_cfg=json.loads(run["lora_cfg_json"]),
         hyperparams=json.loads(run["hyperparams_json"]),
         dataset_ref=run["dataset_ref"],
+        required_image=run["required_image"],
     )
 
 
