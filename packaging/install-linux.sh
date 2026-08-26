@@ -102,7 +102,16 @@ note "ok"
 
 # ------------------------------------------------------------------ install --
 echo "Installing the ganymede package."
-python3 -m pip install --quiet --upgrade . || die "pip install failed"
+# --no-deps on the docker path, deliberately. `ganymede/host` imports nothing
+# outside the standard library (that is why it can be installed by copying),
+# and the package's declared dependencies include torch -- roughly 2 GB that
+# this machine already has inside the worker image and will never load on the
+# host. A native install does need them, and asks for them.
+if [ "$RUNTIME" = docker ]; then
+    python3 -m pip install --quiet --upgrade --no-deps . || die "pip install failed"
+else
+    python3 -m pip install --quiet --upgrade ".[trainer]" || die "pip install failed"
+fi
 
 # The unit's ExecStart has to name a path that exists. pip puts console scripts
 # in /usr/local/bin on a system Python and /usr/bin on a distro-packaged one,

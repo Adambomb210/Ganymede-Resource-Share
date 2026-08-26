@@ -70,6 +70,13 @@ DEFAULT_MEMORY = "16g"
 DEFAULT_CPUS = "4"
 DEFAULT_PIDS_LIMIT = 256
 
+# The floor INSTALL.md quotes, in GB: ~12 GB of worker image plus one base
+# model plus room to work. Named here so the document and the `--check` warning
+# cannot drift apart -- a stated minimum nothing enforces is a number people
+# stop believing.
+MIN_FREE_DISK_GB = 35.0
+MIN_FREE_DISK_GB_NATIVE = 25.0
+
 # How long the machine must have been untouched before it counts as idle.
 # Fifteen minutes is longer than a coffee and shorter than a lunch: it will not
 # grab the GPU while someone is reading, and it will not sit out an afternoon.

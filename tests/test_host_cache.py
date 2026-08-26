@@ -275,3 +275,60 @@ def test_cli_protect_flag_is_honoured(tmp_path, capsys):
     ])
     out = json.loads(capsys.readouterr().out)
     assert "org/oldest" not in out["removed"]
+
+
+# --------------------------------------------------------------------------
+# The M3 exit criterion, as a scenario rather than a unit
+# --------------------------------------------------------------------------
+
+
+def test_the_cap_holds_across_two_runs_with_different_base_models(tmp_path):
+    """"Cache eviction demonstrably holds the cache under its cap across two
+    runs with different base models" -- roadmap M3.
+
+    Written as a sequence rather than a single call because that is where the
+    interesting failure lives. Each step individually satisfies the cap; what
+    this checks is that the cap still holds after the *second* run pulls a model
+    the first one never used, which is the situation 6.7 describes: ten runs
+    across five base models, and a disk that fills quietly.
+    """
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    cap = 25_000  # room for two models, not three
+
+    # Run 1 downloads two models and stays under the cap on its own.
+    _make_repo(hub, "models--org--modelA", total_bytes=10_000, last_used=100.0)
+    _make_repo(hub, "models--org--modelB", total_bytes=10_000, last_used=200.0)
+    first = cache.evict_to_cap(hub, cap_bytes=cap, protect=frozenset({"org/modelB"}))
+    assert first.removed == []
+    assert first.size_after == 20_000 <= cap
+
+    # Run 2 needs a model neither previous run used. Without eviction the cache
+    # would now be 30_000 -- over the cap, and growing with every new run.
+    _make_repo(hub, "models--org--modelC", total_bytes=10_000, last_used=300.0)
+    second = cache.evict_to_cap(hub, cap_bytes=cap, protect=frozenset({"org/modelC"}))
+
+    assert second.size_after <= cap
+    # modelA was the least recently used and was not needed by run 2.
+    assert [r.model_id for r in second.removed] == ["org/modelA"]
+    assert not (hub / "models--org--modelA").exists()
+    assert (hub / "models--org--modelC").exists()
+
+    # And the model the active run needs survived, which is the whole point of
+    # `protect`: evicting it would mean re-downloading it before any work.
+    assert (hub / "models--org--modelB").exists()
+
+
+def test_the_model_an_active_run_needs_is_never_evicted_even_to_meet_the_cap(tmp_path):
+    """Where protect and the cap genuinely conflict, protect wins and the cache
+    stays over its cap. The alternative -- evicting a model the machine is about
+    to be handed work for -- means a ~16 GB download before anything useful
+    happens, potentially longer than the round itself."""
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    _make_repo(hub, "models--org--needed", total_bytes=10_000, last_used=100.0)
+
+    result = cache.evict_to_cap(hub, cap_bytes=1_000, protect=frozenset({"org/needed"}))
+    assert result.removed == []
+    assert result.size_after == 10_000  # over cap, deliberately
+    assert (hub / "models--org--needed").exists()

@@ -44,7 +44,12 @@ from ganymede.host import cache as cache_mod
 from ganymede.host import idle as idle_mod
 from ganymede.host import manifest as manifest_mod
 from ganymede.host import runtime as runtime_mod
-from ganymede.host.config import HostConfig, default_config_path
+from ganymede.host.config import (
+    MIN_FREE_DISK_GB,
+    MIN_FREE_DISK_GB_NATIVE,
+    HostConfig,
+    default_config_path,
+)
 
 log = logging.getLogger("ganymede.host")
 
@@ -325,11 +330,14 @@ def _check(config: HostConfig) -> int:
     print(f"state dir   : {config.resolved_state_dir()}")
     print(f"cache dir   : {config.resolved_cache_dir()}")
     print(f"cache cap   : {config.cache_cap_gb:g} GB")
-    free = cache_mod.free_disk_bytes(config.resolved_cache_dir())
-    print(f"free disk   : {free / 1024**3:.1f} GB")
+    free_gb = cache_mod.free_disk_bytes(config.resolved_cache_dir()) / 1024**3
+    floor = MIN_FREE_DISK_GB_NATIVE if config.runtime == "native" else MIN_FREE_DISK_GB
+    short = " -- below the " + f"{floor:g} GB minimum" if free_gb < floor else ""
+    print(f"free disk   : {free_gb:.1f} GB{short}")
 
     gaps = config.missing()
     if gaps:
+        _flush()
         print(f"\nnot configured: {', '.join(gaps)} unset", file=sys.stderr)
         return 2
 
@@ -339,13 +347,28 @@ def _check(config: HostConfig) -> int:
     try:
         manifest = manifest_mod.fetch(config)
     except manifest_mod.ManifestError as exc:
+        # Flush first. stdout is block-buffered when it is a pipe -- which it is
+        # whenever an install script captures this -- and stderr is not, so
+        # without this the failure prints *above* the report explaining it.
+        _flush()
         print(f"\ncoordinator unreachable: {exc}", file=sys.stderr)
         return 1
 
     decision = manifest_mod.resolve(manifest, config)
     print(f"active runs : {len(manifest.runs)}")
     print(f"image       : {decision.image or '(none)'} -- {decision.reason}")
+    if free_gb < floor:
+        _flush()
+        print(f"\nwarning: {free_gb:.1f} GB free is below the {floor:g} GB INSTALL.md asks for."
+              f" Lower cache_cap_gb, or free some space.", file=sys.stderr)
     return 0
+
+
+def _flush() -> None:
+    try:
+        sys.stdout.flush()
+    except (ValueError, OSError):
+        pass
 
 
 if __name__ == "__main__":
