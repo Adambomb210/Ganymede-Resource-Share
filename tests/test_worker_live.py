@@ -135,16 +135,26 @@ def live_stack(minio_container, tmp_path, tiny_model_dir, tiny_lora_cfg, tiny_ro
         os.environ.clear()
         os.environ.update(saved)
 
+    # A log file rather than subprocess.PIPE. An unread pipe holds about 64 KB
+    # and uvicorn logs a line per request; once it fills, the coordinator blocks
+    # on its next write and stops serving, which looks from the outside like a
+    # hung worker. This test is short enough not to reach that, but the fixture
+    # it is a template for is not (test_worker_concurrency), so it does not
+    # model the hazard.
+    server_log = tmp_path / "coordinator.log"
+    server_handle = server_log.open("w")
     server = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "ganymede.coordinator.app:bootstrap",
          "--factory", "--host", "127.0.0.1", "--port", str(port)],
         cwd=str(REPO_ROOT), env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        stdout=server_handle, stderr=subprocess.STDOUT, text=True,
     )
     try:
         if not _wait_for(f"http://127.0.0.1:{port}/healthz"):
             server.terminate()
-            pytest.skip(f"coordinator did not start: {server.communicate(timeout=5)[0][-2000:]}")
+            server.wait(timeout=5)
+            server_handle.close()
+            pytest.skip(f"coordinator did not start: {server_log.read_text()[-2000:]}")
         yield {"url": f"http://127.0.0.1:{port}", "key": key,
                "db": db_path, "rows": tiny_rows}
     finally:
@@ -153,6 +163,8 @@ def live_stack(minio_container, tmp_path, tiny_model_dir, tiny_lora_cfg, tiny_ro
             server.wait(timeout=10)
         except subprocess.TimeoutExpired:
             server.kill()
+            server.wait(timeout=10)
+        server_handle.close()
 
 
 def _worker(live_stack, tmp_path, **config):
@@ -182,18 +194,16 @@ def _rounds(db_path: str) -> list[dict]:
         conn.close()
 
 
-def test_a_real_worker_completes_a_real_round(live_stack, tmp_path, monkeypatch):
+def test_a_real_worker_completes_a_real_round(live_stack, tmp_path):
     """Register, claim, download, train, upload, submit -- over real HTTP.
 
     The presigned URL round trip is the part that cannot be faked: it is signed
     against a hostname, fetched by a client with no coordinator credentials, and
     is the one place M1's storage footgun (6.6) would bite.
+
+    The dataset is resolved for real too, from the ``file://`` ref in the run
+    config -- the worker never receives rows, only a ref and bucket indices.
     """
-    from ganymede.trainer import data as data_mod
-
-    rows = live_stack["rows"]
-    monkeypatch.setattr(data_mod, "resolve_dataset", lambda ref: rows)
-
     worker = _worker(live_stack, tmp_path)
     assert worker.run() == 0
     assert worker.rounds_done == 1
@@ -210,7 +220,7 @@ def test_a_real_worker_completes_a_real_round(live_stack, tmp_path, monkeypatch)
 
 
 def test_the_measured_throughput_lands_under_the_key_the_next_claim_reads(
-    live_stack, tmp_path, monkeypatch
+    live_stack, tmp_path
 ):
     """The feedback loop, end to end.
 
@@ -222,11 +232,7 @@ def test_the_measured_throughput_lands_under_the_key_the_next_claim_reads(
     import sqlite3
 
     from ganymede.device import device_name
-    from ganymede.trainer import data as data_mod
     import torch
-
-    rows = live_stack["rows"]
-    monkeypatch.setattr(data_mod, "resolve_dataset", lambda ref: rows)
 
     assert _worker(live_stack, tmp_path).run() == 0
 
@@ -243,7 +249,7 @@ def test_the_measured_throughput_lands_under_the_key_the_next_claim_reads(
 
 
 def test_a_worker_on_the_wrong_image_gets_no_work_and_takes_no_lease(
-    live_stack, tmp_path, monkeypatch
+    live_stack, tmp_path
 ):
     """Observed live: without this filter on the coordinator side, an ineligible
     worker is handed a lease it must immediately abandon -- once per poll

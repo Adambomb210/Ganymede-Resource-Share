@@ -28,7 +28,7 @@ and disappear when it isn't.
 | `ganymede/worker/` | The worker package a contributor installs: probe, client, loop |
 | `docker/` | The three-layer worker image stack (§4.1) |
 | `configs/` | Run configs — one file feeds calibrate, baseline and `newrun` alike |
-| `scripts/` | Admin CLI — create a run, issue a key, GC, backup |
+| `scripts/` | Admin CLI — create a run, issue a key, evaluate rounds, GC, backup |
 | `deploy/` | Container image, compose file, env template |
 | `tests/` | Unit tests per module, plus a fake-worker integration suite |
 
@@ -44,6 +44,7 @@ and disappear when it isn't.
 | `store.py` | S3-compatible object storage, restricted to the portable subset |
 | `rounds.py` | Round lifecycle, leases, the work-based close rule |
 | `closer.py` | Gating, aggregation, publishing the next round's base adapter |
+| `invariants.py` | What "broken" means, checked over the database. Non-zero exit, so it works as a cron check |
 | `app.py` | The HTTP surface |
 
 ### Trainer modules
@@ -70,6 +71,23 @@ and disappear when it isn't.
 ganymede-worker --probe-only    # what to ask a contributor for when they get no work
 ```
 
+### Operating a live run
+
+```sh
+python3 -m ganymede.coordinator.invariants --db … --run-id …   # is anything wedged?
+python3 -m scripts.evalround --run-id … --watch                # fill in held-out loss
+```
+
+The first exits non-zero on a violation, so it belongs in cron. It reports the two
+failures that are otherwise **silent** — a round wedged mid-close and a lease nobody
+will reclaim — and deliberately says nothing about an idle fleet, which is normal
+operation rather than an incident.
+
+The second is separate from the coordinator on purpose: a forward pass over the
+held-out split is minutes of CPU, and running it inside the close would hold one
+arbitrary contributor's HTTP response open for all of it. It needs the trainer extra,
+so it runs wherever that already lives.
+
 The trainer's stack (`transformers`, `peft`, `datasets`) is an optional extra, not a
 base dependency: the coordinator never loads a base model — `newrun.py` derives the
 adapter manifest from `config.json` on a meta device — and the coordinator box is the
@@ -95,6 +113,12 @@ with a real tokenizer, built in the fixture. Same architecture as the bring-up m
 so target modules, parameter naming and shapes are all the production ones — at a size
 where a full run costs milliseconds. The claims that need a real model live in
 `tests/test_trainer_cpu.py` behind `-m slow`.
+
+`tests/test_worker_concurrency.py` is the M4a suite: three real worker *processes*
+against a real coordinator and real MinIO, driving a multi-round run to completion,
+plus a `SIGKILL` mid-round to check the blast radius. Also `-m slow`. Run it on its
+own — the MinIO fixture uses a fixed container name and port, so a second pytest
+process tears the container down underneath it.
 
 ## v1 scope
 

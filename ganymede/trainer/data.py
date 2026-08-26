@@ -47,8 +47,10 @@ nobody can explain.
 
 from __future__ import annotations
 
+import json
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
 # Rows per bucket we aim for when suggesting a bucket count (docs/03-roadmap.md,
@@ -351,6 +353,18 @@ def resolve_dataset(dataset_ref: str) -> list[dict[str, Any]]:
         compare across time** -- an unpinned hub dataset can gain or lose rows,
         which silently repartitions every bucket in the run.
 
+    ``file://<path>``
+        A local file of rows: either a JSON array of objects, or JSONL with one
+        object per line. Dispatched on the first non-whitespace byte rather than
+        the extension, because ``.json`` gets used for both.
+
+        This is the on-disk escape hatch, and it is what makes a run
+        reproducible without a hub round trip: the file is a fixed artifact on
+        a fixed path, so every worker derives the same partition from it. The
+        path must resolve identically on every machine in the fleet -- which in
+        practice means a shared mount, a baked-in container path, or a
+        single-machine run.
+
     ``s3://<bucket>/<prefix>``
         Reserved for self-hosted datasets (the shape 8's example uses). Not
         implemented yet; it needs a decided on-disk layout, and inventing one
@@ -369,10 +383,26 @@ def resolve_dataset(dataset_ref: str) -> list[dict[str, Any]]:
         ds = load_dataset(spec, split=split, revision=revision)
         return [dict(row) for row in ds]
 
+    if dataset_ref.startswith("file://"):
+        path = Path(dataset_ref[len("file://") :])
+        if not path.exists():
+            raise FileNotFoundError(f"dataset file {str(path)!r} does not exist")
+        text = path.read_text()
+        stripped = text.lstrip()
+        if stripped.startswith("["):
+            rows = json.loads(text)
+        else:
+            rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+        if not all(isinstance(row, dict) for row in rows):
+            raise ValueError(f"dataset file {str(path)!r} must contain objects, not scalars")
+        return rows
+
     if dataset_ref.startswith("s3://"):
         raise NotImplementedError(
             "s3:// datasets are not implemented; the on-disk layout is undecided "
             "(see resolve_dataset's docstring)"
         )
 
-    raise ValueError(f"unrecognized dataset_ref {dataset_ref!r}: expected hf:// or s3://")
+    raise ValueError(
+        f"unrecognized dataset_ref {dataset_ref!r}: expected hf://, file:// or s3://"
+    )

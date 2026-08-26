@@ -13,6 +13,7 @@ it cannot run until the round is done.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import weakref
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ from ganymede.coordinator import aggregate, rounds
 from ganymede.coordinator.config import DEFAULT_DOMINANCE_CAP, DEFAULT_NORM_REJECT_K
 from ganymede.coordinator.db import immediate
 from ganymede.coordinator.store import Store, base_adapter_key, momentum_key
+
+log = logging.getLogger("ganymede.coordinator.closer")
 
 
 @dataclass(frozen=True)
@@ -162,6 +165,43 @@ def close_round(
     if not claimed:
         return None
 
+    try:
+        return _close_claimed_round(conn, store, run_id, round_idx, reason, now,
+                                    norm_k, cap)
+    except Exception:
+        # Give the round back. Everything between claiming 'closing' and the
+        # status update below is storage I/O and tensor arithmetic, any of which
+        # can fail -- and 'closing' is claimed by exactly one caller and
+        # released only by that caller finishing. Leaving it set would wedge the
+        # round permanently: no worker could claim it, no submission could
+        # reopen it, and nothing would report an error. Every worker would
+        # simply get 204 forever.
+        #
+        # Reopening is safe to retry. The result adapter is written under a key
+        # derived from (run, round), so a second attempt overwrites the same
+        # object rather than accumulating; the submissions it aggregates are
+        # unchanged; and the close rule that fired once will fire again on the
+        # next submit or claim.
+        conn.execute(
+            """UPDATE rounds SET status = 'open'
+               WHERE run_id = ? AND idx = ? AND status = 'closing'""",
+            (run_id, round_idx),
+        )
+        log.exception("closing round %s#%s failed; reopened for retry", run_id, round_idx)
+        raise
+
+
+def _close_claimed_round(
+    conn: sqlite3.Connection,
+    store: Store,
+    run_id: str,
+    round_idx: int,
+    reason: str,
+    now: datetime,
+    norm_k: float,
+    cap: float,
+) -> CloseResult | None:
+    """The body of ``close_round``, after the close has been claimed."""
     run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
     rnd = conn.execute(
         "SELECT * FROM rounds WHERE run_id = ? AND idx = ?", (run_id, round_idx)

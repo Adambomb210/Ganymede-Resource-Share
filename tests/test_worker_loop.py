@@ -26,6 +26,7 @@ class StubClient:
         self.submit_response = submit_response or {"accepted": True}
         self.calls: list[tuple] = []
         self.heartbeat_raises: Exception | None = None
+        self.upload_raises: Exception | None = None
 
     def register(self, profile, image_tag=None):
         self.calls.append(("register", image_tag))
@@ -53,6 +54,8 @@ class StubClient:
 
     def upload(self, url, data, content_type="application/octet-stream"):
         self.calls.append(("upload", len(data)))
+        if self.upload_raises is not None:
+            raise self.upload_raises
 
     def submit(self, task_id, key, steps, tokens_seen=0, metrics=None):
         self.calls.append(("submit", task_id, steps, metrics))
@@ -393,10 +396,50 @@ def test_a_claim_failure_is_survivable(tmp_path):
     assert calls["n"] >= 2
 
 
+def _task_in_round(idx: int, task_id: str | None = None) -> dict:
+    return {**TASK, "round_idx": idx, "task_id": task_id or f"t{idx}"}
+
+
 def test_max_rounds_stops_a_long_running_worker(tmp_path, stub_trainer):
-    client = StubClient(tasks=[TASK, TASK, TASK])
+    client = StubClient(tasks=[_task_in_round(0), _task_in_round(1), _task_in_round(2)])
     worker = make_worker(tmp_path, client=client, max_rounds=2)
     monkey_idle(worker)
+
+    assert worker.run() == 0
+    assert worker.rounds_done == 2
+    assert worker.tasks_done == 2
+
+
+def test_several_tasks_inside_one_round_count_as_one_round(tmp_path, stub_trainer):
+    """A worker that finishes its step budget while the round is still open
+    claims again -- routinely several times over. ``--max-rounds 2`` has to
+    mean two rounds, not two claims.
+
+    It meant two claims until M4a, where three workers each took twenty tiny
+    cold-start tasks inside round 0, hit ``--max-rounds 20``, and exited before
+    the round they were all working had closed. The run never advanced and
+    nothing reported a problem.
+    """
+    same_round = [_task_in_round(0, f"t0-{i}") for i in range(4)]
+    client = StubClient(tasks=[*same_round, _task_in_round(1)])
+    worker = make_worker(tmp_path, client=client, max_rounds=2)
+    monkey_idle(worker)
+
+    assert worker.run() == 0
+    assert worker.rounds_done == 2      # round 0 and round 1
+    assert worker.tasks_done == 5       # but five claims to get there
+
+
+def test_a_round_whose_work_was_dropped_still_counts_as_worked(tmp_path, monkeypatch):
+    """Otherwise ``--max-rounds`` quietly means "until N rounds happen to go
+    your way" -- and a worker on an unlucky stretch never stops."""
+    from ganymede.worker import loop as loop_mod
+
+    client = StubClient(tasks=[_task_in_round(0), _task_in_round(1)])
+    worker = make_worker(tmp_path, client=client, max_rounds=2)
+    monkey_idle(worker)
+    # Every round drops its work, as a round closing underneath the worker does.
+    monkeypatch.setattr(loop_mod.Worker, "run_round", lambda self, task: None)
 
     assert worker.run() == 0
     assert worker.rounds_done == 2
@@ -428,3 +471,39 @@ def test_a_missing_key_fails_at_startup_with_a_name(monkeypatch, tmp_path):
     monkeypatch.delenv("GANYMEDE_KEY", raising=False)
     with pytest.raises(SystemExit, match="GANYMEDE_KEY"):
         Worker.create(WorkerConfig(coordinator_url="http://c", key=""))
+
+
+def test_a_storage_outage_costs_the_round_not_the_worker(tmp_path, stub_trainer):
+    """§6.4: an unreachable object store is something a worker rides out.
+
+    Observed in M4a: MinIO went away mid-round and all three workers exited on
+    the spot, on an unhandled exception out of the upload. On an unscheduled
+    volunteer fleet that is the worst available failure -- the machines that
+    were contributing stop permanently, and nobody is watching to notice.
+    """
+    from ganymede.worker.client import CoordinatorError
+
+    client = StubClient(tasks=[_task_in_round(0), _task_in_round(1)])
+    client.upload_raises = CoordinatorError(0, "http://storage/put", "connection refused")
+    worker = make_worker(tmp_path, client=client, max_rounds=2)
+    monkey_idle(worker)
+
+    # Survives both failed rounds and exits on its own terms, not on a traceback.
+    assert worker.run() == 0
+    assert worker.rounds_done == 2
+    # And gave each shard back rather than sitting on a lease it could not use.
+    assert [c for c in client.calls if c[0] == "abandon"] != []
+
+
+def test_an_unexpected_error_still_stops_the_worker(tmp_path, stub_trainer):
+    """The other half of the split. A storage outage is infrastructure and
+    passes; a bug in the worker is not something it can retry its way out of,
+    and a machine failing every round forever while holding leases is worse
+    than one the host agent restarts."""
+    client = StubClient(tasks=[_task_in_round(0)])
+    client.upload_raises = ValueError("something is genuinely wrong")
+    worker = make_worker(tmp_path, client=client, max_rounds=2)
+    monkey_idle(worker)
+
+    with pytest.raises(ValueError, match="genuinely wrong"):
+        worker.run()

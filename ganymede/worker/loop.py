@@ -173,8 +173,20 @@ class Worker:
     profile: dict[str, Any]
     worker_id: str = ""
     heartbeat_interval: int = 60
-    rounds_done: int = 0
+    tasks_done: int = 0
+    # Coordinator rounds this worker has worked, as (run_id, round_idx). A set
+    # rather than a counter because a worker routinely takes several tasks
+    # inside one round -- it finishes its step budget, the round is still open,
+    # and it claims again -- and `--max-rounds 5` has to mean five rounds. It
+    # meant five *tasks* until M4a, where three workers all stopped inside
+    # round 0 having taken twenty tiny tasks each and the run never advanced.
+    rounds_worked: set[tuple[str, int]] = field(default_factory=set)
     cached_base_models: set[str] = field(default_factory=set)
+
+    @property
+    def rounds_done(self) -> int:
+        """How many distinct rounds this worker has worked."""
+        return len(self.rounds_worked)
 
     # ---------------- setup ----------------
 
@@ -295,6 +307,26 @@ class Worker:
             # wrong, the coordinator said which gate, and the loop moves on.
             log.error("task %s rejected: %s", task_id, exc.reason)
             return None
+        except CoordinatorError as exc:
+            # Infrastructure, not this worker: the coordinator or the object
+            # store is unreachable, and the client already exhausted its
+            # retries. 6.4 says a worker rides this out and retries with
+            # backoff -- it must not be fatal.
+            #
+            # It was, until M4a. The object store went away mid-round and all
+            # three workers exited on the spot, on an unhandled exception out
+            # of the upload. On a volunteer fleet that is the worst available
+            # behaviour: the machines that were contributing stop, quietly and
+            # permanently, and nobody is watching to notice. A storage blip
+            # should cost the round in progress, not the worker.
+            log.error("task %s: %s -- abandoning and backing off", task_id, exc)
+            self._abandon(task_id)
+            # Pause before claiming again. Without this the loop would take a
+            # fresh lease immediately, train a whole round, and fail at the same
+            # upload -- burning a contributor's machine for as long as the
+            # outage lasts.
+            self._idle(IDLE_SLEEP_SEC)
+            return None
         except Exception:
             log.exception("task %s failed; abandoning the lease", task_id)
             self._abandon(task_id)
@@ -395,12 +427,18 @@ class Worker:
                 continue
 
             self.run_round(task)
-            self.rounds_done += 1
+            self.tasks_done += 1
+            # Recorded whatever the outcome. A round whose work was dropped
+            # because it closed underneath us was still a round this worker
+            # took part in, and counting only successes would have `--max-rounds`
+            # quietly mean "until N rounds happen to go your way".
+            self.rounds_worked.add((task["run_id"], int(task["round_idx"])))
 
             if self.config.once:
                 return 0
             if self.config.max_rounds and self.rounds_done >= self.config.max_rounds:
-                log.info("reached max_rounds=%s", self.config.max_rounds)
+                log.info("reached max_rounds=%s after %d task(s)",
+                         self.config.max_rounds, self.tasks_done)
                 return 0
 
 
@@ -422,7 +460,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--cache-dir", default=None, help="host-persistent HF cache")
     p.add_argument("--backend", default=None, help="pin the compute backend (cuda, rocm, xpu, mps, cpu)")
     p.add_argument("--once", action="store_true", help="one claim then exit; for smoke tests")
-    p.add_argument("--max-rounds", type=int, default=None)
+    p.add_argument("--max-rounds", type=int, default=None,
+                   help="stop after taking part in this many coordinator rounds; "
+                        "a worker may take several tasks within one")
     p.add_argument("--skip-bench", action="store_true", help="skip the benchmark during probing")
     p.add_argument("--insecure", action="store_true",
                    help="skip TLS verification -- for a self-signed coordinator only")

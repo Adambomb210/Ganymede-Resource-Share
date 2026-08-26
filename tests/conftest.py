@@ -113,6 +113,7 @@ def settings(tmp_path) -> Settings:
         norm_reject_k=5.0,
         dominance_cap=2.0,
         throughput_floor_frac=0.10,
+        poll_interval_sec=60,
         gc_keep_rounds=3,
     )
 
@@ -222,6 +223,14 @@ def register_worker(client):
 # --------------------------------------------------------------------------
 
 
+# The adapter shape ``tiny_model_dir`` is built for. A module-level constant
+# rather than only a fixture value, so a module-scoped fixture -- which cannot
+# depend on a function-scoped one -- can use the same numbers instead of
+# copying them somewhere they would silently drift.
+TINY_LORA_CFG = {"rank": 4, "alpha": 8, "dropout": 0.0,
+                 "target_modules": ["q_proj", "v_proj"]}
+
+
 @pytest.fixture(scope="session")
 def tiny_model_dir(tmp_path_factory):
     """A genuine Qwen3 checkpoint of ~107k parameters, with a real tokenizer.
@@ -265,7 +274,7 @@ def tiny_model_dir(tmp_path_factory):
 
 @pytest.fixture
 def tiny_lora_cfg():
-    return {"rank": 4, "alpha": 8, "dropout": 0.0, "target_modules": ["q_proj", "v_proj"]}
+    return dict(TINY_LORA_CFG)
 
 
 @pytest.fixture

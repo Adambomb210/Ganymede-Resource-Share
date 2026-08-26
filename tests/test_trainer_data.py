@@ -10,6 +10,7 @@ wrong sharding. These tests are that cross-check.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 
@@ -296,3 +297,47 @@ def test_unknown_dataset_scheme_is_rejected_by_name():
 def test_s3_datasets_say_they_are_unimplemented_rather_than_failing_obscurely():
     with pytest.raises(NotImplementedError, match="undecided"):
         D.resolve_dataset("s3://ganymede/data/whatever")
+
+
+def test_a_local_json_array_resolves_to_rows(tmp_path):
+    path = tmp_path / "rows.json"
+    path.write_text(json.dumps([{"instruction": "a", "response": "b"}]))
+
+    assert D.resolve_dataset(f"file://{path}") == [{"instruction": "a", "response": "b"}]
+
+
+def test_jsonl_resolves_to_the_same_rows_as_the_equivalent_array(tmp_path):
+    """Dispatched on the first byte, not the extension: ``.json`` gets used for
+    both, and a JSONL file named ``.json`` is the common way to hit this."""
+    rows = [{"instruction": "a", "response": "b"}, {"instruction": "c", "response": "d"}]
+    array = tmp_path / "array.json"
+    array.write_text(json.dumps(rows))
+    lines = tmp_path / "lines.json"          # deliberately not .jsonl
+    lines.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    assert D.resolve_dataset(f"file://{array}") == D.resolve_dataset(f"file://{lines}")
+
+
+def test_blank_lines_in_jsonl_are_skipped_rather_than_becoming_rows(tmp_path):
+    """A trailing newline is the normal state of a text file, and an empty row
+    would shift every bucket boundary in the run by one."""
+    path = tmp_path / "rows.jsonl"
+    path.write_text('{"instruction": "a"}\n\n{"instruction": "b"}\n\n')
+
+    assert D.resolve_dataset(f"file://{path}") == [{"instruction": "a"}, {"instruction": "b"}]
+
+
+def test_a_missing_dataset_file_names_the_path(tmp_path):
+    """The failure mode this guards is a container that mounted the dataset at a
+    different path than the coordinator's run config names -- which otherwise
+    surfaces much later as a confusing partition error."""
+    with pytest.raises(FileNotFoundError, match="missing.json"):
+        D.resolve_dataset(f"file://{tmp_path / 'missing.json'}")
+
+
+def test_a_file_of_scalars_is_rejected_rather_than_partitioned(tmp_path):
+    path = tmp_path / "rows.json"
+    path.write_text(json.dumps(["a", "b"]))
+
+    with pytest.raises(ValueError, match="objects"):
+        D.resolve_dataset(f"file://{path}")

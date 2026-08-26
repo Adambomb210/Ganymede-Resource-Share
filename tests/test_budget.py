@@ -14,6 +14,7 @@ from ganymede.coordinator.budget import (
     plan_budget,
     resolve_throughput,
     step_budget,
+    steps_for_buckets,
     usable_seconds,
 )
 
@@ -475,3 +476,105 @@ def test_setup_can_exhaust_a_short_round_entirely():
         min_usable_sec=60, est_setup_sec=300,
     )
     assert plan is None
+
+
+# --------------------------------------------------------------------------
+# The budget never asks for more passes than the data supports
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def plan_kwargs() -> dict:
+    """A plan_budget call with everything but the axis under test pinned.
+
+    Overheads at zero and a long round, so ``usable_sec`` is a round number and
+    each test below varies exactly one thing.
+    """
+    return {
+        "remaining_sec": 600,
+        "measured": None,
+        "calibrated": None,
+        "cold_start": 30.0,
+        "samples_per_step": 8,
+        "samples_per_bucket": 234,
+        "total_buckets": 64,
+        "est_download_sec": 0,
+        "est_upload_sec": 0,
+        "safety_margin_sec": 0,
+        "min_usable_sec": 60,
+    }
+
+
+
+def test_a_budget_bigger_than_the_whole_dataset_is_cut_to_the_data(plan_kwargs):
+    """Observed under M4a on a small run: a measured throughput produced 14,268
+    steps over 352 training samples -- about 81 passes on a run configured for
+    one. bucket_count caps the shard at the run's total and cannot see that the
+    budget beside it still asks for more."""
+    plan = plan_budget(**{
+        **plan_kwargs,
+        "measured": 6000.0,          # a very fast worker on a very small run
+        "samples_per_step": 2,
+        "samples_per_bucket": 11,
+        "total_buckets": 32,
+        "target_passes": 1.0,
+    })
+
+    assert plan is not None
+    assert plan.n_buckets == 32                       # everything there is
+    assert plan.local_steps == 32 * 11 // 2           # one pass over it, not eighty
+    assert plan.data_limited is True
+
+
+def test_a_budget_the_data_can_support_is_left_alone(plan_kwargs):
+    """The clamp must be a no-op in the ordinary case, or every budget in every
+    healthy run gets quietly rounded down."""
+    plan = plan_budget(**{
+        **plan_kwargs,
+        "measured": 30.0,
+        "samples_per_step": 8,
+        "samples_per_bucket": 234,
+        "total_buckets": 64,
+    })
+
+    assert plan is not None
+    assert plan.n_buckets < 64
+    assert plan.data_limited is False
+    assert plan.local_steps == step_budget(30.0, plan.usable_sec)
+
+
+def test_target_passes_above_one_raises_the_ceiling_it_clamps_to(plan_kwargs):
+    """A run that deliberately asks for three passes should get three, not one:
+    the clamp enforces the configured number, it does not impose its own."""
+    common = {
+        **plan_kwargs, "measured": 6000.0, "samples_per_step": 2,
+        "samples_per_bucket": 11, "total_buckets": 32,
+    }
+    one = plan_budget(**{**common, "target_passes": 1.0})
+    three = plan_budget(**{**common, "target_passes": 3.0})
+
+    assert three.local_steps == 3 * one.local_steps
+
+
+def test_a_dataset_too_small_for_a_single_step_is_a_204_not_a_zero_step_lease(
+    plan_kwargs
+):
+    """Leasing a shard for zero work marks it spoken for and produces nothing."""
+    plan = plan_budget(**{
+        **plan_kwargs,
+        "measured": 600.0,
+        "samples_per_step": 64,
+        "samples_per_bucket": 1,
+        "total_buckets": 8,
+    })
+
+    assert plan is None
+
+
+def test_steps_for_buckets_inverts_bucket_count(plan_kwargs):
+    """The round trip has to be lossless in the direction that matters: convert
+    a budget to buckets and back, and you must not get less than you started
+    with, or the clamp would bite in the healthy case."""
+    for steps in (1, 7, 33, 250, 1000):
+        n = bucket_count(steps, samples_per_step=4, samples_per_bucket=97, total_buckets=1024)
+        assert steps_for_buckets(n, 97, 4) >= steps

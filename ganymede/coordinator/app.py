@@ -209,6 +209,17 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         candidates = _selectable_runs(conn, body.run_id, body.cached_base_models)
         reasons: list[str] = []
         for run_id in candidates:
+            # Evaluate the close here too, not only after a submit. A round can
+            # become closeable through the passage of time alone -- its backstop
+            # arrives with work already in hand -- and on the submit path alone
+            # nothing would ever notice: every worker has already submitted, and
+            # none can claim, because there is too little of the round left to
+            # be worth a budget. The round stays open, the run stops advancing,
+            # and no request anywhere returns an error. Closing on the poll
+            # makes any worker that is still awake enough to move the run on,
+            # and hands this one the freshly opened round instead of another
+            # empty 204.
+            closer.maybe_close(conn, store, run_id, settings=settings)
             try:
                 spec = rounds.claim_task(
                     conn, run_id, body.worker_id, contributor.clearance,
@@ -222,7 +233,10 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
 
         # 204 is a legitimate answer, not an error: nothing eligible, or too
         # little of the round left to be worth a 25 MB round trip.
-        return Response(status_code=204, headers={"Retry-After": "60"})
+        return Response(
+            status_code=204,
+            headers={"Retry-After": str(settings.poll_interval_sec)},
+        )
 
     @app.post(f"/{API_VERSION}/tasks/{{task_id}}/heartbeat")
     def heartbeat(task_id: str, body: HeartbeatRequest, conn: ConnDep,

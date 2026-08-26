@@ -115,6 +115,13 @@ class Settings:
     # A worker that cannot reach this fraction of the median budget is not offered
     # work for this run (it stays eligible for others).
     throughput_floor_frac: float
+    # What a 204 tells the worker to wait before claiming again. It bounds how
+    # long a machine sits out after a round closes, so it wants to be small
+    # against the round length -- a fleet on five-minute rounds polling every
+    # sixty seconds wastes a fifth of every round on the poll cadence alone.
+    # Sent as Retry-After; the worker jitters around it so the fleet does not
+    # re-converge into a synchronized poll.
+    poll_interval_sec: int
     gc_keep_rounds: int
 
     @classmethod
@@ -134,5 +141,6 @@ class Settings:
             norm_reject_k=_env_float("GANYMEDE_NORM_REJECT_K", DEFAULT_NORM_REJECT_K),
             dominance_cap=_env_float("GANYMEDE_DOMINANCE_CAP", DEFAULT_DOMINANCE_CAP),
             throughput_floor_frac=_env_float("GANYMEDE_THROUGHPUT_FLOOR", 0.10),
+            poll_interval_sec=_env_int("GANYMEDE_POLL_SEC", 60),
             gc_keep_rounds=_env_int("GANYMEDE_GC_KEEP_ROUNDS", 3),
         )

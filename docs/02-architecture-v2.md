@@ -180,6 +180,35 @@ Nothing is lost and nothing degrades — an idle fleet means the run pauses, whi
 the correct behavior, not an error. **Do not alert on it**; with a volatile fleet it
 is the normal overnight state.
 
+#### Where the rule is evaluated
+
+There is no scheduler. The close rule is checked opportunistically on the request
+path, which is one fewer moving part than a background timer and costs nothing when
+rounds are measured in tens of minutes.
+
+It has to be checked on **claim as well as submit**, and the second one is not an
+optimization. The first branch above is triggered by work arriving, so a submission
+is always there to notice it. The second is triggered by *time*, and time does not
+arrive on any request. Picture the ordinary case: every worker in the fleet has
+submitted, none reached `round_target_steps`, and the round has a few minutes left
+on its backstop. Nobody can claim — too little of the round remains to be worth a
+budget — so nobody submits, so nothing evaluates the rule. The round stays open
+forever. The run stops advancing, every worker gets `204` on every poll, and no
+request anywhere returns an error.
+
+Checking on claim closes it: any worker still awake enough to poll moves the run on,
+and gets handed the freshly opened round instead of another empty `204`. Found in
+M4a, where three workers wedged a run in exactly this way.
+
+The same omission had quietly disabled the reopen rule above. Reopening an empty
+round is reached only through the close check, and the close check only ran after a
+submission — at which point the round has a submission by definition and the reopen
+condition is false. So the paragraph above described behaviour that could not
+happen: an empty round sat past its deadline indefinitely, and the first machine
+back found a round with no time left to claim against. It works now for the same
+reason the wedge is gone — the check runs where the idle fleet actually shows up,
+which is the poll.
+
 #### Single-contributor rounds: accept, but surface
 
 Nothing above prevents one machine from supplying all of `round_target_steps` while
@@ -301,6 +330,31 @@ This converts hardware heterogeneity into **data coverage** rather than weight
 concentration, which is the outcome you want: extra capacity buys diversity, not a
 louder vote on the same shard.
 
+**And the budget must not outgrow the dataset.** Bucket count is sized from the step
+budget and then capped at the run's total, because there is no more data to give.
+The budget beside it has to be cut to match, or the two silently disagree and the
+mechanism above inverts: a worker asks for more data than the run has, is given
+everything, and then does many passes over it — precisely the overfitting the
+scaling exists to prevent, arriving through the one path the scaling cannot see.
+
+M4a hit this hard. Once measured throughput replaced the cold-start guess, a fast
+worker on a small run was budgeted **14,268 steps over 352 training samples — about
+81 passes on a run configured for one**, and every worker in the round was handed the
+identical whole dataset. Aggregation then weighted three copies of one piece of work
+as three independent contributions.
+
+So the budget is clamped to what the shard it was actually given supports, at the
+run's own `target_passes`. In the healthy case the clamp is arithmetically a no-op:
+the bucket count was derived from the budget, so converting it back always returns at
+least the budget. It only bites in the case it exists for.
+
+When it bites, the claim logs it. A run whose whole dataset is smaller than what one
+machine chews through in a round is **misconfigured, not broken** — the work is
+honest and the budget is now correct — but the fix is the run's shape (more buckets,
+more data, or shorter rounds) and only an operator can make it. Sharding has stopped
+happening, and nothing else in the system would say so: bucket coverage still looks
+perfectly even, because every worker trained every bucket.
+
 #### Guard against one worker dominating
 
 Even with bucket scaling, an A100 among 3060s may carry a large share of a round's
@@ -397,6 +451,19 @@ silently averaged in.
 ```
 
 Note step 3 has no version check. That is deliberate — see Finding E and §7.
+
+**What a failure at any step costs.** The split is between infrastructure and
+everything else. An unreachable coordinator or object store — after the client
+has exhausted its own retries — costs the round in progress: the worker abandons
+the lease, backs off, and claims again. It must not be fatal, because on an
+unscheduled fleet a worker that exits is a machine that has stopped contributing
+permanently, and nobody is watching to notice. Everything else *is* fatal: a
+bug is not something a worker can retry its way out of, and a machine failing
+every round forever while taking leases is worse than one the host agent
+restarts (§7).
+
+That split did not exist until M4a, where the object store went away mid-round
+and all three workers exited on the spot.
 
 ### 4.3 The trainer
 
@@ -678,6 +745,27 @@ variant. The plain weighted mean (`lr_outer = 1`, `β = 0`) is the conservative
 fallback and reduces to straightforward federated averaging. **M4 must A/B these two
 against a single-node baseline** rather than assuming the momentum variant helps.
 
+#### Evaluating the result: a separate process, not part of the close
+
+`rounds.eval_loss` is held-out loss for the adapter a round published, and it is
+what every convergence claim in M4 is read off. It is computed by
+`scripts/evalround.py`, which picks up closed rounds whose `eval_loss` is still
+`NULL`, and it is **not** called from the close.
+
+The close runs on the request thread of whichever worker's submission happened
+to end the round. A forward pass over several hundred held-out samples is
+minutes of CPU, so putting it there would hold that worker's HTTP response open
+for the whole of it — and land the cost on one arbitrary contributor rather than
+on the operator. It also keeps the coordinator's dependencies as small as §6.5
+wants them: the evaluator needs torch and transformers, and runs wherever those
+already live, which does not have to be the coordinator box.
+
+Idempotent by construction, and never on the critical path: nothing a worker or
+the coordinator reads depends on `eval_loss`, so an evaluator that is down slows
+nobody down — the column simply fills in late. This is also the natural shape for
+the extension the roadmap describes, where eval becomes a task type dispatched
+like any other once the coordinator-side path stops being comfortable.
+
 ### 5.3 The `SyncBackend` seam
 
 The entire sync layer reduces to two methods:
@@ -775,7 +863,7 @@ workers       id, contributor_id, compute_profile_json, image_tag,
 runs          id, status, base_model, base_precision, lora_cfg_json,
               dataset_ref, hyperparams_json, current_round, target_rounds,
               outer_momentum_ref, requires_json, data_classification,
-              created_at
+              required_image, num_buckets, created_at
               -- requires_json: { backend, min_vram_mb, needs: [...] }  §6.7
               -- data_classification: open | internal | restricted     §6.9
 rounds        run_id, idx, base_adapter_ref, status, target_steps,
@@ -783,7 +871,8 @@ rounds        run_id, idx, base_adapter_ref, status, target_steps,
               result_adapter_ref, distinct_contributors,             -- §3.2
               eval_loss, adapter_divergence                          -- §5.2
 tasks         id, run_id, round_idx, buckets_json, local_steps, status,
-              worker_id, lease_expires_at, attempts, created_at
+              worker_id, lease_expires_at, attempts, last_heartbeat_steps,
+              max_runtime_sec, created_at                          -- §5.1, §8
 submissions   task_id, artifact_ref, steps_completed, tokens_seen,
               metrics_json, accepted, reject_reason, received_at
 buckets       run_id, bucket_idx, times_trained, last_round
@@ -875,6 +964,41 @@ what the worker demonstrates.
 | Artifact store down | Same as coordinator down, from the worker's side. In v1 they share a VM, so in practice these fail together |
 | Coordinator VM lost | **The failure that matters.** In v1 the database and every checkpoint are on one machine, so this loses both unless backups are genuinely off-box. See §6.6 — separate volume, off-box SQLite dump each round close, off-box copy of the latest round adapter |
 | Artifact volume lost, VM survives | Recoverable from the off-box dump + latest adapter: resume the run rather than restart it. Loses older checkpoint history |
+| Close dies partway through | The round is given back (`status` returns to `open`) and the next submit or claim retries it. The result adapter is keyed by `(run, round)`, so the retry overwrites rather than duplicating |
+| Coordinator killed *during* a close | No exception to catch, so this one is detection rather than recovery: the round is left in `closing`, which is unclaimable and unreopenable. `invariants.check` reports it as `stuck_close` |
+
+#### What "broken" means, concretely
+
+Most of the table above is degradation an unscheduled fleet is supposed to
+absorb. Two rows are not: a round wedged in `closing`, and a lease nobody will
+ever reclaim. Both are silent — every worker gets `204` forever and no request
+returns an error — so neither is discoverable by watching traffic.
+
+`ganymede/coordinator/invariants.py` is the list of things that must be true of
+the database, checkable in one pass and non-zero on failure, so it works as a
+cron check:
+
+```
+python3 -m ganymede.coordinator.invariants --db … --run-id …
+```
+
+It reports **double leases** (one worker holding two leases in a round),
+**repeat-before-coverage** (a bucket trained twice in a round while another goes
+untouched), **stuck leases** and **stuck closes**, a **closed round that
+published no adapter** despite accepting work, an **active run pointing at a
+round that does not exist**, and **submissions attached to a lease that was
+already reclaimed**.
+
+Deliberately excluded: idleness. An unscheduled fleet is idle most of the time,
+and §3.2 is explicit that this is normal operation. Alerting on it would train
+the operator to ignore the alert that matters. The transients get grace periods
+for the same reason — a lease sits briefly past its expiry by design, because
+expiry is lazy.
+
+The same module reports **coverage** for a run, which is not an invariant but is
+the diagnostic for §3.5: `distinct_trained` climbing with a small `spread` is
+coverage advancing; `whole_dataset_tasks` above zero means the run stopped
+sharding and everyone is training everything.
 
 ### 6.5 Deployment
 

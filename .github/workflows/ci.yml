@@ -137,12 +137,19 @@ jobs:
             echo "the error should name the missing variable"; exit 1; }
 
   slow:
-    name: Slow suite (real models)
-    # Downloads Qwen3-0.6B and Dolly and trains on CPU -- ~10 minutes, and it
-    # depends on HuggingFace being reachable, so it does not gate a push.
+    name: Slow suite (real models, real fleets)
+    # Downloads Qwen3-0.6B and Dolly and trains on CPU, and stands up three
+    # worker processes against a real coordinator and MinIO for the M4a
+    # concurrency suite. Tens of minutes, and it depends on HuggingFace being
+    # reachable, so it does not gate a push.
+    #
+    # The concurrency tests are wall-clock sensitive in one direction only: a
+    # slow runner means fewer steps per round, not a failed assertion, because
+    # every budget is derived from measured throughput. What they do need is
+    # cores -- three torch processes share whatever the runner has.
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

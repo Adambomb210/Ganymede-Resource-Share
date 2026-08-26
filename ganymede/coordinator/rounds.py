@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -25,6 +26,8 @@ from ganymede.coordinator.db import immediate
 # Fallback wall-clock ceiling for task rows written before max_runtime_sec
 # existed. One hour matches the default lease, so the two bounds agree.
 DEFAULT_MAX_RUNTIME_SEC = 3600
+
+log = logging.getLogger("ganymede.coordinator.rounds")
 
 
 def utcnow() -> datetime:
@@ -365,6 +368,20 @@ def claim_task(
         )
         if plan is None:
             return None
+
+        if plan.data_limited:
+            # The run has less data than this machine can chew through in a
+            # round. Not an error -- the budget was cut to fit and the work is
+            # honest -- but it means every worker in the round is being handed
+            # most or all of the same dataset, so the shards have stopped being
+            # shards. The fix is the run's shape (more buckets, a bigger
+            # dataset, or shorter rounds), which only an operator can make, so
+            # it has to be said out loud somewhere they will see it.
+            log.warning(
+                "run %s: worker %s is data-limited -- budget cut to %d steps over "
+                "%d/%d buckets. The dataset is small relative to this fleet's speed.",
+                run_id, worker_id, plan.local_steps, plan.n_buckets, run["num_buckets"],
+            )
 
         # Minimum viable throughput (3.5). Below some speed a worker costs more
         # than it contributes: it holds a lease and a full ~25 MB round trip to

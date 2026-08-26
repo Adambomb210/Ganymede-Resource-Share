@@ -26,6 +26,12 @@ class Budget:
     throughput_steps_per_min: float
     throughput_source: str  # "measured" | "calibrated" | "cold_start"
     usable_sec: int
+    # True when the run's whole dataset was smaller than the worker's time-based
+    # budget, so the budget was cut down to what the data supports. Not an error
+    # -- it is the honest answer -- but it means this machine could have done
+    # more work than the run has data for, which is a fact about the run's
+    # shape that an operator wants to know. See plan_budget.
+    data_limited: bool = False
 
 
 def usable_seconds(
@@ -124,6 +130,23 @@ def bucket_count(
     return max(1, min(n, total_buckets))
 
 
+def steps_for_buckets(
+    n_buckets: int,
+    samples_per_bucket: int,
+    samples_per_step: int,
+    target_passes: float = 1.0,
+) -> int:
+    """How many steps ``n_buckets`` of data justify -- the inverse of bucket_count.
+
+    Needed because ``bucket_count`` clamps at the run's total: a worker that
+    wants more data than the run *has* is given everything, and the step budget
+    that asked for more than everything then no longer matches the shard it got.
+    """
+    if samples_per_step <= 0:
+        raise ValueError(f"samples_per_step must be positive, got {samples_per_step}")
+    return int(n_buckets * samples_per_bucket * target_passes // samples_per_step)
+
+
 def meets_floor(candidate_steps: int, median_steps: float, floor_frac: float) -> bool:
     """Minimum viable throughput gate (3.5).
 
@@ -181,12 +204,42 @@ def plan_budget(
         local_steps, samples_per_step, samples_per_bucket, total_buckets, target_passes
     )
 
+    # Close the loop that bucket_count's clamp opens. bucket_count sizes the
+    # shard to the budget and then caps it at the run's total, so a worker fast
+    # enough to want more data than the run has is handed every bucket -- and
+    # the budget that asked for more than everything is left untouched beside
+    # it. The two then disagree, and the worker quietly does many more passes
+    # over its shard than `target_passes` asked for.
+    #
+    # Observed under M4a, and not marginally: on a small dataset a measured
+    # throughput produced a budget of 14,268 steps over 352 training samples --
+    # about 81 passes on a run configured for one. That is precisely the
+    # overfitting bucket_count exists to prevent, arriving through the one path
+    # bucket_count cannot see. Worse, every worker in the round is handed the
+    # same whole dataset, so the shards stop being shards and aggregation
+    # weights three copies of one piece of work as three contributions.
+    #
+    # Clamping here is a no-op whenever the cap did not bite: n_buckets was
+    # derived from local_steps, so converting it back always returns at least
+    # local_steps. It only does something in the case it is there for.
+    supported = steps_for_buckets(n_buckets, samples_per_bucket, samples_per_step,
+                                  target_passes)
+    data_limited = supported < local_steps
+    if data_limited:
+        local_steps = supported
+        # A run whose entire dataset is smaller than one optimizer step has
+        # nothing to hand out; better to say so with a 204 than to lease a
+        # shard for zero work.
+        if local_steps <= 0:
+            return None
+
     return Budget(
         local_steps=local_steps,
         n_buckets=n_buckets,
         throughput_steps_per_min=throughput,
         throughput_source=source,
         usable_sec=usable,
+        data_limited=data_limited,
     )
 
 

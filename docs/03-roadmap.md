@@ -756,6 +756,9 @@ Exit criteria:
 blocker than it looks: the two things M4 proves need very different setups, and only
 one of them needs other people.
 
+**M4a is done** — see "M4a status" below. What follows is the original plan; the
+status section records what running it actually turned up.
+
 ### M4a — Protocol under real concurrency (solo, ~2 days)
 
 Run **several worker processes against your own machine**. On one GPU they time-slice
@@ -802,6 +805,160 @@ outcome, not a signal to abandon the approach.
 
 ---
 
+## M4a status — built and run
+
+**Three real worker processes, one real coordinator, one real object store, a
+multi-round run driven to completion — repeatedly.** Everything the rest of the
+suite fakes is real here: separate OS processes with separate SQLite
+connections, separate torch runtimes and separate contributors, racing each
+other through claim, heartbeat, submit and close.
+
+```
+ganymede/coordinator/invariants.py   what "broken" means, checked over the DB
+scripts/evalround.py                 held-out loss per closed round (§5.2)
+tests/test_worker_concurrency.py     the fleet, the kill, the four criteria
+```
+
+Processes rather than threads, deliberately. Threads share a GIL, a torch
+runtime and a process image, which serializes exactly the thing under test — and
+you cannot `SIGKILL` a thread, so the second exit criterion would have had
+nothing to kill.
+
+| Exit criterion | State |
+|---|---|
+| Three concurrent workers complete several rounds with no double-leasing and no stuck tasks | **met.** Four rounds, every one closed with a cohort of three, `invariants.check` clean over the database the three racing processes left behind |
+| Killing one mid-round costs that round's work for that worker and nothing else | **met.** `SIGKILL`, not `terminate` — a machine that loses power never gets to abandon its lease, so the polite path is the wrong one to test. The lease is reclaimed, the survivors keep submitting, rounds keep closing |
+| Bucket coverage advances rather than re-training the same shards | **met**, after a fix. All 32 buckets trained, spread of one round between the most- and least-trained |
+| Per-round loss descends across rounds | **met, in the only sense this hardware can settle** — see below |
+
+### The numbers
+
+Held-out loss for each round's *aggregated* adapter, and inter-worker divergence
+at the moment of aggregation:
+
+```
+round      0        1        2        3
+loss     4.878    4.589    4.491    4.472     monotone, −0.41 nats
+diverge  0.657    0.312    0.030    0.006
+```
+
+The loss curve says aggregation **carries** the training signal: three workers
+train disjoint shards, their adapters are averaged into one, and the average is
+better at the task than the round before. That is the property the whole design
+rests on, and it is testable at any scale where the data has something in it to
+learn.
+
+The divergence curve is the more interesting one. §5.2 records divergence
+because it measures precisely what DiLoCo trades away — more local steps means
+more drift means a less meaningful mean — and *growing* drift across rounds is
+the signal that `local_steps` is too high. Here it collapses by two orders of
+magnitude, which is what agreement looks like: workers on different shards
+finding the same solution because there is one to find.
+
+**What none of this claims.** It is a 107k-parameter model over forty held-out
+examples of synthetic data. It says nothing about convergence at 1.7B, nothing
+about whether aggregation *beats* single-node on wall-clock, and nothing about
+mixed-speed fleets. All of that is M4b's, and it needs genuinely parallel
+hardware.
+
+### What running it found
+
+Seven things. Six are protocol bugs, and not one of them was reachable from a
+unit test: each needs several machines, real elapsed time, or a real outage
+before it exists at all.
+
+1. **The close rule was never evaluated on the passage of time.** `maybe_close`
+   ran only after a submission — and the second branch of the close rule
+   (`elapsed ≥ max_round_sec`) is triggered by *time*, which does not arrive on
+   any request. So: every worker submits, none reaches `target_steps`, none can
+   claim because too little of the round is left to be worth a budget, and the
+   round stays open **forever**. The run stops advancing, every worker gets
+   `204` on every poll, and nothing anywhere returns an error. The rule is now
+   checked on claim too, so any worker still awake moves the run on.
+
+2. **That same omission had silently disabled the empty-round reopen.** §3.2
+   says a round that hits its backstop with nothing submitted reopens with a
+   fresh deadline, because an idle fleet overnight is normal operation. That
+   path is reached only through the close check — which only ran *after a
+   submission*, at which point the round has one by definition and the reopen
+   condition is false. Specified, implemented, and unreachable. It works now for
+   the same reason the wedge is gone: the check runs where an idle fleet
+   actually shows up, which is the poll.
+
+3. **The step budget could outgrow the dataset.** `bucket_count` caps a worker's
+   shard at the run's total, and nothing fed that cap back into the budget
+   sitting beside it. Once measured throughput replaced the cold-start guess, a
+   worker was budgeted **14,268 steps over 352 training samples — about 81
+   passes on a run configured for one** — and every worker in the round was
+   handed the identical whole dataset, so aggregation weighted three copies of
+   one piece of work as three contributions. Exactly the overfitting §3.5's
+   bucket scaling exists to prevent, arriving by the one path that scaling
+   cannot see. Budgets are now clamped to the data they were actually given, and
+   a claim that hits the clamp logs it: the run's *shape* is wrong, and only an
+   operator can fix that.
+
+4. **A storage outage killed the workers outright.** MinIO went away mid-round
+   and all three exited on the spot, on an unhandled exception out of the upload.
+   §6.4 says a worker rides this out and retries with backoff; on an unscheduled
+   volunteer fleet, exiting is the worst available behaviour, because the
+   machines that were contributing stop permanently and nobody is watching to
+   notice. Infrastructure failures now cost the round in progress, not the
+   worker. Everything else still stops it — a bug is not something a worker can
+   retry its way out of, and a machine failing every round forever while taking
+   leases is worse than one the host agent restarts.
+
+5. **`--max-rounds` counted tasks, not rounds.** A worker that finishes its step
+   budget while the round is still open claims again, routinely several times
+   over. So `--max-rounds 20` stopped all three workers *inside round 0*, having
+   taken twenty tiny cold-start tasks each, before the round they were all
+   working had closed. The run stalled and nothing reported a problem.
+
+6. **A close that dies partway wedged the round permanently.** `closing` is
+   claimed by exactly one caller and released only when that caller finishes,
+   and everything in between is storage I/O and tensor arithmetic. A failed
+   close now gives the round back, and the next request retries it. The case
+   with no exception to catch — a coordinator killed between the two writes —
+   is detection rather than recovery, and is what `invariants.check` reports as
+   `stuck_close`.
+
+7. **The seventh was in the harness**, and is worth writing down because it cost
+   an hour and looked exactly like a protocol failure: **a subprocess whose
+   stdout is an unread `subprocess.PIPE` blocks forever once the pipe fills** —
+   about 64 KB, which a worker logging at INFO reaches in under a minute. Two of
+   three workers froze mid-round holding leases, and the symptom was
+   indistinguishable from a coordinator that had stopped handing out work.
+
+### And one bug in the test itself, which passed
+
+The first version of the loss assertion was worthless, and worth recording
+*because* it was green.
+
+The synthetic dataset was random words in, random words out. There is no
+learnable structure in that at all, so held-out loss cannot move for any reason
+except noise — and the measurement bore that out: **5.185 → 5.146 → 5.151 →
+5.150**. Total movement 0.7%, not even monotone. It satisfied
+`losses[-1] < losses[0]` and demonstrated nothing whatsoever about aggregation.
+
+A test that cannot fail for the reason it claims to test is worse than no test,
+because it reads as evidence. Each response is now a deterministic function of
+one token in its instruction, so the assertion has something real to detect, and
+the threshold sits well outside what noise on forty examples produces. That one
+change is the difference between the two curves above.
+
+### Two things worth knowing before M4b
+
+- **`invariants.py` is the M5 alerting hook, early.** It exits non-zero, so it
+  is already usable as a cron check, and it deliberately says nothing about an
+  idle fleet — §3.2 is explicit that idleness is normal operation, and alerting
+  on it would train the operator to ignore the alert that matters.
+- **A worker re-loads the base model for every task**, and takes several tasks
+  per round when its budget is small relative to the round. At the measured M2
+  setup cost of 110 s on a 1.7B model, three tasks in a round is 330 s of setup
+  against one round of work. Not a correctness problem and not M4a's to fix, but
+  it will show up as soon as rounds run on real models.
+
+---
+
 ## M5 — Operations
 
 **~2 days.**
@@ -838,19 +995,27 @@ Exit criteria:
 ## Sequencing
 
 ```
-M0 ─────────► M2 ─┐
- │  training       ├──► M4a ──► M4b ──► M5
- └──► M1 ─────► M3 ┘   solo    rented
+M0 ─────────► M2 ──────► M4a ──► M4b ──► M5
+ │  training              solo    rented
+ └──► M1 ─────► M3
      coordinator
 ```
 
 M1 depends on M0 only for the LoRA config shape (needed by the acceptance gates), so
-the two tracks can overlap if there's a second person. M4a needs all four.
+the two tracks can overlap if there's a second person.
 
-**Everything through M4a is reachable with one machine and no contributors.** Only M4b
-needs genuinely parallel hardware, and renting it for an afternoon is cheaper and
-faster than waiting for volunteers — and it means the first person you *do* ask to
-install something is joining a system already known to work.
+**M4a turned out not to need M3** — the diagram used to route it through both tracks
+and no longer does. Three worker processes started by hand exercise the protocol
+exactly as well as three started by a host agent, and doing M4a first was the better
+order: M3's whole job is starting a worker, and it is cheaper to find a double-lease
+bug before there is a supervisor wrapped around it. Six protocol bugs came out of M4a,
+and every one of them would still have been there, harder to see, underneath M3.
+
+**Everything through M4a is reachable with one machine and no contributors** — and
+that is now demonstrated rather than predicted. Only M4b needs genuinely parallel
+hardware, and renting it for an afternoon is cheaper and faster than waiting for
+volunteers — and it means the first person you *do* ask to install something is
+joining a system already known to work.
 
 If you already have a fine-tuning pipeline to port, M0's trainer is a day rather than
 two, and the calibration harness is the only genuinely new build.

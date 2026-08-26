@@ -644,8 +644,16 @@ def test_clearance_gates_claim_and_manifest_visibility(client, store, conn, make
 def test_worker_below_throughput_floor_refused_for_this_run(client, store, conn, make_contributor, seeded_run):
     """A worker whose budget falls below the throughput floor relative to
     its peers is refused for that run (204) -- with a fast peer already
-    claimed, so a median exists to fall below."""
-    run_id = seeded_run()
+    claimed, so a median exists to fall below.
+
+    The run needs enough data that the *fast* peer's budget is not itself
+    clamped by ``plan_budget``'s data ceiling. On a small run every fast machine
+    is cut back to one pass over the dataset, which flattens the budgets the
+    floor compares and means nobody is below anybody -- correctly, since on that
+    run the fast machine really cannot do more. The floor separates workers by
+    speed only while speed is what limits them.
+    """
+    run_id = seeded_run(hyperparams={"samples_per_bucket": 3000})
     conn.execute(
         "INSERT INTO throughput (run_id, gpu_model, steps_per_min, samples, updated_at) "
         "VALUES (?, 'A100', 400.0, 1, ?)",
@@ -708,6 +716,32 @@ def test_claim_with_3_minutes_left_gets_204_with_retry_after(client, store, conn
     assert fw.claim(run_id) is None
     assert fw.last_response.status_code == 204
     assert fw.last_response.headers.get("Retry-After") is not None
+
+
+def test_the_poll_cadence_a_204_asks_for_is_the_deployment_s_own(
+    settings, store, conn, make_contributor, seeded_run
+):
+    """The number in Retry-After bounds how long a machine sits out after a
+    round closes. Hardcoding sixty seconds put a floor under that which a run
+    on short rounds cannot get below -- a fleet on five-minute rounds would
+    spend a fifth of every round waiting to be told there was work."""
+    from dataclasses import replace
+
+    from fastapi.testclient import TestClient
+
+    from ganymede.coordinator.app import create_app
+
+    run_id = seeded_run(max_round_sec=600, min_round_sec=0, target_steps=10**9)
+    past = rounds.utcnow() - timedelta(seconds=600 - 180)
+    conn.execute(
+        "UPDATE rounds SET opened_at=? WHERE run_id=? AND idx=0", (rounds._iso(past), run_id)
+    )
+
+    _, key = make_contributor()
+    client = TestClient(create_app(replace(settings, poll_interval_sec=7), store))
+    fw = FakeWorker(client, store, key)
+    assert fw.claim(run_id) is None
+    assert fw.last_response.headers["Retry-After"] == "7"
 
 
 def test_measured_throughput_folds_back_in_after_close(client, store, conn, make_contributor, seeded_run):
@@ -1079,3 +1113,113 @@ def test_a_resumed_lease_reports_the_same_budget_it_was_given(
 
     assert again["task_id"] == first["task_id"]
     assert again["max_runtime_sec"] == first["max_runtime_sec"]
+
+
+def test_a_close_that_dies_partway_gives_the_round_back(
+    conn, store, settings, make_contributor, seeded_run, client, monkeypatch
+):
+    """The failure with no symptom of its own.
+
+    ``closing`` is claimed by exactly one caller with a conditional UPDATE and
+    released only when that caller finishes. Everything in between is storage
+    I/O and tensor arithmetic. A close that dies in the middle -- a storage
+    timeout, an OOM, a coordinator restart -- would leave the round permanently
+    unclaimable: no worker could claim it, no submission could reopen it, and
+    the run would stop advancing with nothing anywhere returning an error.
+
+    So a failed close reopens the round, and the next submit or claim retries it.
+    """
+    # target_steps out of reach, so submitting does not close the round on its
+    # own and the close below is the one under test.
+    run_id = seeded_run(target_steps=10**9, min_round_sec=0, max_round_sec=3600)
+    _, key = make_contributor()
+    fw = FakeWorker(client, store, key)
+    fw.claim(run_id)
+    fw.submit(10)
+
+    boom = RuntimeError("storage went away mid-close")
+    calls = {"n": 0}
+    real_put = store.put_bytes
+
+    def flaky_put(key_, data):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise boom
+        return real_put(key_, data)
+
+    monkeypatch.setattr(store, "put_bytes", flaky_put)
+    with pytest.raises(RuntimeError, match="storage went away"):
+        closer.close_round(conn, store, run_id, 0, "forced")
+
+    rnd = conn.execute(
+        "SELECT status FROM rounds WHERE run_id = ? AND idx = 0", (run_id,)
+    ).fetchone()
+    assert rnd["status"] == "open", "the round was left wedged in 'closing'"
+
+    # And the retry succeeds, aggregating the same submission -- the work was
+    # never lost, only deferred.
+    monkeypatch.undo()
+    result = closer.close_round(conn, store, run_id, 0, "retry")
+    assert result is not None
+    assert result.accepted == 1
+    assert result.result_adapter_ref
+    rnd = conn.execute(
+        "SELECT status FROM rounds WHERE run_id = ? AND idx = 0", (run_id,)
+    ).fetchone()
+    assert rnd["status"] == "closed"
+
+
+def test_a_wedged_close_is_reported_by_the_invariant_checker(conn, seeded_run):
+    """Belt and braces: the reopen above handles a raised exception, but a
+    coordinator killed between the two writes leaves no exception to catch. That
+    case is detection rather than recovery, and this is what detects it."""
+    from datetime import timedelta as _timedelta
+
+    from ganymede.coordinator import invariants
+
+    run_id = seeded_run()
+    past = rounds._iso(rounds.utcnow() - _timedelta(hours=1))
+    conn.execute(
+        "UPDATE rounds SET status = 'closing', opened_at = ? WHERE run_id = ?",
+        (past, run_id),
+    )
+
+    assert "stuck_close" in {v.check for v in invariants.check(conn)}
+
+
+def test_an_empty_round_at_its_backstop_is_reopened_by_a_polling_worker(
+    client, store, conn, make_contributor, seeded_run
+):
+    """§3.2 says an empty round at its backstop reopens with a fresh deadline.
+    It says so because an idle fleet overnight is normal operation, not an
+    incident, and the run must be waiting when someone's machine wakes up.
+
+    That behaviour was implemented and unreachable. ``reopen_empty_round`` is
+    only called from ``maybe_close``, and ``maybe_close`` only ran after a
+    submission -- at which point the round has a submission by definition and
+    the reopen condition is false. Nothing else called it, so an empty round sat
+    past its deadline forever and the first worker back found a round it could
+    not usefully claim.
+
+    Evaluating the close rule on claim (see the claim endpoint) is what makes
+    the specified behaviour actually happen.
+    """
+    run_id = seeded_run(max_round_sec=600, min_round_sec=0, target_steps=10**9)
+    stale = rounds.utcnow() - timedelta(seconds=900)
+    conn.execute(
+        "UPDATE rounds SET opened_at=? WHERE run_id=? AND idx=0", (rounds._iso(stale), run_id)
+    )
+    conn.commit()
+
+    _, key = make_contributor()
+    fw = FakeWorker(client, store, key)
+    task = fw.claim(run_id)
+
+    rnd = conn.execute(
+        "SELECT status, opened_at FROM rounds WHERE run_id = ? AND idx = 0", (run_id,)
+    ).fetchone()
+    assert rnd["status"] == "open"
+    assert rounds._parse(rnd["opened_at"]) > stale, "the deadline was never refreshed"
+    # And with a fresh deadline there is a full round of time to budget against,
+    # so the worker that did the reopening gets work on the same request.
+    assert task is not None
