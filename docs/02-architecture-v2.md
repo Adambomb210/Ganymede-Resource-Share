@@ -1391,17 +1391,50 @@ Runs on the contributor's machine, outside the container. Owns everything about
 
 ```
 systemd timer, every N minutes:
-  1. Already running a Ganymede container for this GPU?     → exit
-  2. IdleBackend.is_idle()?                                 → if no, exit
+  1. IdleBackend.is_idle()?  → if no: stop any running worker, exit
+  2. Already running a Ganymede worker for this GPU on the right image? → exit
   3. GET /v1/manifest; if required image tag != local, pull it
   4. docker run --gpus all --stop-timeout 120 \
-       --user ganymede --cap-drop=ALL --security-opt=no-new-privileges \
+       --cap-drop=ALL --security-opt=no-new-privileges \
        --read-only --tmpfs /tmp --tmpfs /run/ganymede \
-       -v ganymede-hf-cache:/cache/hf \
+       -v <cache_dir>:/cache/hf \
+       -v <state_dir>:/var/lib/ganymede:ro \
        --memory=... --cpus=... --pids-limit=... \
        -e GANYMEDE_KEY -e COORDINATOR_URL \
        ganymede/worker-llm:<tag>
 ```
+
+Three corrections from M3, each of which the first version got wrong in a way
+that fails quietly:
+
+**Idleness is checked first.** The original order asked "already running?"
+first, which reads as an optimization — skip the idle probe when there is
+nothing to decide. Taken literally it means a running worker is never
+re-examined, so the pause sentinel prevents *new* workers and never stops the
+one currently holding the GPU. Someone who wants their machine back is not
+helped by "after this round".
+
+**Both mounts are bind mounts of real host directories, and the state mount is
+read-only.** Named volumes live under `/var/lib/docker` and are Docker's to
+manage, so the contributor's `/var/lib/ganymede/pause` and the file the worker
+polls would be two different files with the same name — the sentinel appears to
+work and does nothing. The same argument applies to the cache: §6.7's cap has to
+prune the directory the worker is actually filling. Read-only on the state mount
+because the worker only reads sentinels, and one that cannot write there cannot
+clear its own kill switch.
+
+**No `--user`, unless the agent is unprivileged.** The image already sets
+`USER ganymede`. Under systemd the agent holds the Docker socket by being root,
+so passing its own uid would run the worker as root and undo that. A
+rootless-Docker contributor still gets their own uid, which is what keeps the
+cache readable across an image rebuild.
+
+The manifest carries `required_image` per active run. When two active runs
+disagree — possible, since only one container runs at a time — the host takes
+the image named by the most runs, breaking ties toward the higher tag. Taking
+the *newest* run's image inverts under the case that matters: a fleet steady on
+one image with a single fresh run on another would have every contributor pull
+and restart to chase the run with the least work in it.
 
 ### 7.1 `IdleBackend`
 
@@ -1422,6 +1455,23 @@ The **pause sentinel** is the contributor's kill switch — `$GANYMEDE_STATE/pau
 coordinator, and no explanation required: create the file and Ganymede stops taking
 the GPU. Document it prominently; it's what makes the ask reasonable. Same mechanism
 as the stop sentinel (§4.4), deliberately.
+
+Because it must work with no network and no coordinator, it is also the one
+control that cannot be allowed to depend on the container runtime: `--pause`
+writes the file first and only then tries to stop anything, and a missing Docker
+daemon downgrades to a message rather than a traceback. The file is the
+mechanism; the command is a convenience that creates it.
+
+**A host agent that is only allowed to be idle is not the same as one that is
+idle.** `is_idle()` answers four questions in order — pause sentinel, active
+time window, GPU free, user idle — and the local backend returns *why*, not just
+whether. "Why do I never get work" is the most common support question a
+volunteer platform gets, and a bare bool has no answer to it.
+
+On Linux, user-idle time is **unknown** when `xprintidle` is absent, and unknown
+is treated as idle. A headless Linux box is the single most likely donated
+machine and has no input device at all; refusing to run there would exclude
+exactly the contributors the project most wants.
 
 **Verify before the rented-host phase:** whether running your own workload on a listed
 GPU affects platform reliability scoring (Review Finding M).

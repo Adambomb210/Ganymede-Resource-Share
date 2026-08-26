@@ -18,6 +18,7 @@ and disappear when it isn't.
 | [`docs/01-spec-review.md`](docs/01-spec-review.md) | Review of v1 — findings, decisions, and alternatives considered |
 | [`docs/02-architecture-v2.md`](docs/02-architecture-v2.md) | **Current architecture.** Supersedes v1 |
 | [`docs/03-roadmap.md`](docs/03-roadmap.md) | Milestones, exit criteria, and open questions |
+| [`INSTALL.md`](INSTALL.md) | **For contributors lending a machine.** Install, settings, and the off switch |
 
 ## Layout
 
@@ -26,10 +27,12 @@ and disappear when it isn't.
 | `ganymede/coordinator/` | The coordinator: API, round state machine, aggregation, storage |
 | `ganymede/trainer/` | The trainer a worker runs, plus the calibration and baseline harnesses |
 | `ganymede/worker/` | The worker package a contributor installs: probe, client, loop |
+| `ganymede/host/` | The host agent (§7): decides whether and what to run. Standard library only |
 | `docker/` | The three-layer worker image stack (§4.1) |
 | `configs/` | Run configs — one file feeds calibrate, baseline and `newrun` alike |
 | `scripts/` | Admin CLI — create a run, issue a key, evaluate rounds, GC, backup |
 | `deploy/` | Container image, compose file, env template |
+| `packaging/` | systemd, launchd and Task Scheduler units, and the three installers |
 | `tests/` | Unit tests per module, plus a fake-worker integration suite |
 
 ### Coordinator modules
@@ -67,6 +70,22 @@ and disappear when it isn't.
 | `control.py` | The §4.4 stop/pause sentinel files, with signals as an optimization |
 | `loop.py` | The §4.2 entrypoint loop, and the `ganymede-worker` CLI |
 
+### Host agent modules
+
+Nothing here imports anything outside the standard library. The host agent runs
+*outside* the container, on a machine where the only guaranteed thing is a
+Python interpreter — so it installs by copying a directory, and the docker path
+installs it with `--no-deps`.
+
+| File | What it owns |
+|---|---|
+| `config.py` | Settings. A file first and environment second, because a timer's environment is whatever the init system decided |
+| `idle.py` | §7.1's `IdleBackend`: pause sentinel, time window, GPU free, user idle across three platforms. Returns a reason, not just a bool |
+| `cache.py` | §6.7's cache cap with LRU eviction, and the `ganymede-cache` CLI |
+| `manifest.py` | §7 step 3 — which image this machine should run, including when two active runs disagree |
+| `runtime.py` | Starting and stopping: Docker and native, behind one protocol (§4.1's delivery table) |
+| `agent.py` | The tick, and the `ganymede-host` CLI a timer invokes |
+
 ```sh
 ganymede-worker --probe-only    # what to ask a contributor for when they get no work
 ```
@@ -76,6 +95,9 @@ ganymede-worker --probe-only    # what to ask a contributor for when they get no
 ```sh
 python3 -m ganymede.coordinator.invariants --db … --run-id …   # is anything wedged?
 python3 -m scripts.evalround --run-id … --watch                # fill in held-out loss
+
+ganymede-host --check                                          # what a contributor's machine resolved
+ganymede-cache --cap-gb 40 --dry-run                           # what eviction would reclaim
 ```
 
 The first exits non-zero on a violation, so it belongs in cron. It reports the two

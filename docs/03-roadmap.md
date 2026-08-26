@@ -750,6 +750,129 @@ Exit criteria:
 
 ---
 
+## M3 status — built, minus the three schedulers
+
+**The agent, the idle probe, the cache cap, the packaging and the contributor
+document.** Everything §7 describes now exists and is tested; what is *not*
+established is that any of the three schedulers actually fires, because none of
+them exists on a Linux CI container.
+
+```
+ganymede/host/config.py     settings, file-first because a timer has no environment
+ganymede/host/idle.py       7.1's IdleBackend across three platforms
+ganymede/host/cache.py      6.7's cache cap with LRU eviction
+ganymede/host/manifest.py   7 step 3: what image should this machine run
+ganymede/host/runtime.py    docker and native, behind one protocol
+ganymede/host/agent.py      the tick, and the CLI a timer invokes
+packaging/                  systemd, launchd, Task Scheduler, three installers
+INSTALL.md                  the contributor-facing document
+```
+
+**`ganymede/host` imports nothing outside the standard library.** No `requests`,
+no `huggingface_hub`, no Docker SDK. That constraint is the delivery story: the
+host agent runs *outside* the container on a machine where the only guaranteed
+thing is a Python interpreter, so it installs by copying a directory. It costs
+about thirty lines of hand-built `docker` argv over `client.containers.run(...)`
+and it is worth every one of them.
+
+| Exit criterion | State |
+|---|---|
+| Machine idles → worker starts within one timer interval | **met in the agent, unproven in the scheduler.** The tick is asserted; that a timer fires it on a real machine is not something a container can show |
+| `pause` → running container stops, no new ones start | **met**, and the spec's step order had to be inverted to get it — see below |
+| Manifest tag bump → agent pulls and restarts, no manual step | **met** |
+| From-scratch install on a clean OS image | **met for the package, not for the scheduler.** A `python:3.11-slim` container with no git, no docker and no systemd, which found three real bugs |
+| `INSTALL.md` states a minimum free disk, and the cap holds across two runs with different base models | **met.** 35 GB, derived from the image stack plus one base model, named as a constant so the document and the `--check` warning cannot drift |
+
+### Where the spec was wrong
+
+Three places, all found by building against it.
+
+1. **§7's step order disables the kill switch.** The block lists "already
+   running a Ganymede container?" first and `is_idle()` second, which reads as
+   an optimization — skip the idle probe when there is nothing to decide. Taken
+   literally a running worker is never re-examined, so the pause sentinel would
+   prevent *new* workers and never stop the one currently holding the GPU.
+   Someone who wants their machine back is not helped by "after this round".
+   Idleness is evaluated first now, and a running worker on a no-longer-idle
+   machine is stopped.
+
+2. **Named volumes made the kill switch a no-op.** §7 mounts
+   `-v ganymede-hf:/cache/hf` and `docker/README.md` adds
+   `-v ganymede-state:/var/lib/ganymede`. A named volume lives under
+   `/var/lib/docker` and is Docker's to manage — so the contributor's
+   `/var/lib/ganymede/pause` and the file the worker polls inside the container
+   were **two different files with the same name**. The sentinel appeared to
+   work and did nothing; only the agent-level stop was ever real, which is
+   precisely the mechanism §4.4 says correctness must not rest on. The same
+   argument applies to the cache: §6.7's cap was pruning a host directory
+   nothing was filling. Both are bind mounts now, and the state mount is
+   read-only, since the worker only reads sentinels and one that cannot write
+   there cannot clear its own kill switch.
+
+3. **`--user` as written runs the worker as root.** §7 and the README both pass
+   it unconditionally. Under systemd the agent holds the Docker socket by being
+   root, so `--user 0:0` would quietly undo the `USER ganymede` the image sets
+   for itself. Passing nothing leaves the image's own unprivileged user in
+   place; a rootless-Docker contributor still gets their own uid.
+
+### One gap in the coordinator
+
+`/v1/manifest` returned everything about an active run except `required_image`
+— the single field §7 step 3 exists to consume. The column has existed since
+M1 and `newrun` has always written it; nothing ever read it back out. Without
+it there is literally nothing for the host agent to reconcile against, and the
+image check would have fallen through to §4.2 step 5, where a worker that has
+already claimed can only abandon.
+
+### What the clean container found
+
+The roadmap's guess was right: a fresh image "catches the undocumented
+dependency and the 'works because your shell already had it' bug, which is most
+of the value." Three, none visible on the development machine.
+
+1. **`pip install .` dragged torch onto the host** — about 2 GB the docker path
+   already has inside the worker image and will never load outside it. The
+   stdlib-only rule made the host agent installable with `--no-deps`; nothing
+   had ever checked that the *installer* took advantage of it.
+2. **`--check` printed its failure above the report explaining it.** stdout is
+   block-buffered when it is a pipe — which it is whenever an install script
+   captures it — and stderr is not. Invisible on a terminal, guaranteed in the
+   place it matters.
+3. **The stated minimum free disk was a number nothing enforced.** A minimum
+   people can ignore silently is a minimum they stop believing.
+
+### And two XML files that never parsed
+
+Both scheduler documents were malformed on their first draft, in the two ways
+this class of file fails *silently*.
+
+The plist had `--once` written into a rationale comment, and **XML forbids a
+doubled hyphen inside a comment** — which is a delightful trap, because the flag
+being documented is the thing that breaks the file. launchd's response to a
+plist it cannot parse is to decline to load it and say nothing. The Task
+Scheduler document declared UTF-16 while being ASCII on disk, which every parser
+rejects before reading a single element.
+
+In both cases the contributor's install "succeeds", nothing ever ticks, and
+there is no error anywhere to find. `tests/test_packaging.py` now parses all
+four scheduler files and asserts the things that fail quietly — comment syntax,
+declared encoding, the element order the Task Scheduler importer demands, and
+that the three platforms still agree on a cadence, since the exit criterion is
+stated in timer intervals and a platform that has drifted has a different
+criterion.
+
+### Still needs a real machine
+
+| Blocked | Why |
+|---|---|
+| The systemd timer firing | No systemd in a Linux CI container. `systemd-analyze verify` is the closest available check and needs the package installed |
+| The launchd job firing | Needs a Mac. So does the `ioreg` idle path, and so does the LaunchAgent-vs-LaunchDaemon call, which rests on Metal being available in a session |
+| The Scheduled Task importing | Needs Windows. The XML parses and its element order is right; that `schtasks` accepts it is a separate claim |
+| `install-windows.ps1` running at all | No PowerShell on this box — it has never been executed, only read |
+| Idle detection against a real desktop | `xprintidle`, `ioreg` and `GetLastInputInfo` are all faked in tests. The predicate is tested; the three platform probes are not |
+
+---
+
 ## M4 — Multi-node convergence — *the milestone that proves the thesis*
 
 **Splits in two, because you currently have only your own hardware.** That's less of a
