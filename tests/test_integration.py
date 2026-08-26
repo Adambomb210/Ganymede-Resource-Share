@@ -641,6 +641,21 @@ def test_clearance_gates_claim_and_manifest_visibility(client, store, conn, make
     assert run_id in {r["run_id"] for r in int_manifest["runs"]}
 
 
+def test_manifest_reports_required_image(client, make_contributor, seeded_run):
+    """7 step 3 reconciles the host's local image against this field before the
+    container ever starts -- if the manifest doesn't carry it, there is nothing
+    for the host agent to reconcile against."""
+    with_image = seeded_run(run_id="run-pinned", required_image="ganymede/worker-llm:v3")
+    without_image = seeded_run(run_id="run-unpinned")
+
+    _, key = make_contributor()
+    manifest = client.get("/v1/manifest", headers={"Authorization": f"Bearer {key}"}).json()
+    by_id = {r["run_id"]: r for r in manifest["runs"]}
+
+    assert by_id[with_image]["required_image"] == "ganymede/worker-llm:v3"
+    assert by_id[without_image]["required_image"] is None
+
+
 def test_worker_below_throughput_floor_refused_for_this_run(client, store, conn, make_contributor, seeded_run):
     """A worker whose budget falls below the throughput floor relative to
     its peers is refused for that run (204) -- with a fast peer already

@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  Ganymede host agent tick (docs/02-architecture-v2.md section 7, section 4.1).
+  Windows is the pip + Scheduled Task path by default (Docker Desktop/WSL2 is
+  the fallback for contributors who want container isolation, also section
+  4.1, and is a per-machine "runtime: docker" choice in host.json, not
+  something this task needs to know about).
+
+  Two tokens in this file are filled in by install-windows.ps1 before import,
+  because their real values are per-machine and baking a placeholder is
+  honest where baking a guess would not be:
+
+    __GANYMEDE_HOST_EXE__   absolute path to the installed ganymede-host.exe
+                             (pip's Scripts directory is not reliably on PATH
+                             for a task run outside an interactive shell)
+    __GANYMEDE_USER__       DOMAIN\User or COMPUTERNAME\User to run the task
+                             as. Baking a real username into a template
+                             shipped to every contributor makes no sense; the
+                             installer resolves the current user on the
+                             machine it is actually running on.
+
+  Both substitutions happen on a copy of this file, so re-running the
+  installer is idempotent and this template never changes on disk.
+
+  Element order matters here: Task Scheduler's XML importer is stricter than
+  a general purpose parser and rejects a file with these in the wrong order,
+  which is RegistrationInfo, Triggers, Principals, Settings, Actions.
+-->
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>Ganymede</Author>
+    <Description>Runs "ganymede-host --once" on a schedule. Idle detection, the pause sentinel, and everything else about whether to actually start a worker live in the agent itself (docs/02-architecture-v2.md section 7.1); this task's only job is to invoke it, unconditionally, every interval, the same way the systemd timer and launchd job do on the other two platforms.</Description>
+    <URI>\Ganymede\ganymede-host</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <!--
+      Five minutes, matching packaging/ganymede-host.timer's cadence (see
+      that file for the full reasoning). StartBoundary is a fixed past
+      timestamp; any past date works, because Repetition with no Duration
+      element means "repeat at this Interval forever," so what matters is
+      the interval, not when it nominally started.
+    -->
+    <TimeTrigger>
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>2024-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>__GANYMEDE_USER__</UserId>
+      <!--
+        LeastPrivilege, not admin. The native worker needs no elevation, and
+        the container runtime on Windows goes through Docker Desktop's named
+        pipe, which a member of the local "docker-users" group can reach
+        without an elevated token; install-windows.ps1 checks that
+        membership when runtime is set to docker rather than asking for
+        HighestAvailable here. Running this task elevated for a job that
+        does not need it would just be a bigger blast radius for no benefit.
+      -->
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <!--
+      Stop and refuse to start on battery. A laptop that starts fine tuning
+      an LLM while unplugged is a contributor who now has a hot lap and a
+      dead battery through no visible action of their own, exactly the kind
+      of surprise that makes someone uninstall and not come back. Missing
+      some idle window while unplugged costs nothing that matters; draining
+      a volunteer's battery costs the volunteer.
+    -->
+    <DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <!--
+      Deliberately false: Task Scheduler's own idle gate would duplicate,
+      and could disagree with, IdleBackend.is_idle() (section 7.1), which is
+      the one predicate all three platforms are meant to share. Better one
+      source of truth than a Windows only second opinion; this task fires
+      every interval unconditionally, same as the systemd timer and the
+      launchd job, and the agent's own tick decides step two (is it idle) in
+      Python.
+    -->
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <!--
+      A sleeping laptop is off, not idle but available; waking it every five
+      minutes just to ask whether it is idle is an intrusive, battery
+      costly thing to do to hardware nobody offered for that. If the
+      machine is genuinely idle while awake, the next tick after it wakes
+      on its own catches it well within the exit criterion's one interval
+      budget.
+    -->
+    <WakeToRun>false</WakeToRun>
+    <!--
+      Generous relative to a five minute cadence: a single tick may need to
+      pull a new image tag (section 7, step 3) over a contributor's home
+      connection before it can even start the worker, and a tick killed
+      mid pull for exceeding a short limit is worse than one that
+      occasionally overlaps its own cadence, which MultipleInstancesPolicy
+      set to IgnoreNew already prevents.
+    -->
+    <ExecutionTimeLimit>PT30M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>__GANYMEDE_HOST_EXE__</Command>
+      <Arguments>--once</Arguments>
+      <!--
+        Config and sentinel paths on Windows are PROGRAMDATA\Ganymede\
+        (host.json, pause, stop; see ganymede/host/config.py's Windows
+        branch). The working directory does not need to be that path for
+        the agent to find them, since it resolves them itself, but pointing
+        it there anyway means any relative path mistake fails obviously
+        instead of writing into System32.
+      -->
+      <WorkingDirectory>%PROGRAMDATA%\Ganymede</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Ganymede host agent tick (docs/02-architecture-v2.md §7, §4.1). macOS has no
+  container path (§6.8/§4.1 -- Apple Silicon has no GPU passthrough story), so
+  this drives `ganymede-host --once`, a pip-installed console script, exactly
+  like the systemd timer drives the same binary on Linux.
+
+  LaunchAgent, not LaunchDaemon -- the real decision on this platform, argued
+  here rather than left implicit:
+
+  A LaunchDaemon runs system-wide with no user session, which sounds like
+  strictly more idle time to harvest. But the *worker* this agent launches is
+  the native pip path here (no container to isolate it), and native GPU
+  compute on macOS goes through Metal, which is far more reliably available
+  inside a logged-in user's session than from a session-less root daemon --
+  headless Metal access before/without login is a known soft spot, not
+  something to build the one thing that must work on. A LaunchAgent that only
+  runs while the contributor is logged in trades a bit of idle time (the
+  window between logout and next login, which is small for a laptop that's
+  usually just locked, not logged out) for GPU access that actually works.
+  §7.1's HIDIdleTime read via `ioreg` still works fine either way -- it is a
+  per-session idle counter -- so that predicate did not decide this; Metal
+  availability did.
+
+  Consequence worth documenting for the contributor: if you fully log out
+  (not just lock the screen), the agent stops ticking until you log back in.
+  For most laptop volunteers that's rare; it is not zero.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ganymede.host</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/ganymede-host</string>
+        <string>--once</string>
+    </array>
+
+    <!--
+      5 minutes, matching the Linux timer's cadence (see ganymede-host.timer
+      for the full reasoning: it's cheap next to host.json's 900s idle floor,
+      and it's what the "idles -> starts within one interval" exit criterion
+      is measured against). StartInterval fires every N seconds since the
+      *previous* run finished, which is what we want for a tick that should
+      just keep polling rather than land on a wall-clock instant.
+    -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <!--
+      Run once as soon as the agent loads (login, or `launchctl load`) rather
+      than waiting a full 5 minutes for the first tick -- a contributor who
+      just installed this and is watching for it to work should not have to
+      wait out a cold interval before seeing anything happen.
+    -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!--
+      Not a long-running process (`--loop` exists for platforms where a timer
+      is more trouble than a process; macOS is not one of them), so nothing
+      here should be restarted on exit -- StartInterval already governs the
+      next run.
+    -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <!--
+      Under /var/log/ganymede/, created and chowned to the contributor by
+      install-macos.sh -- a LaunchAgent runs as the logged-in user, and
+      /var/log itself is root-owned and not writable by that user by default.
+    -->
+    <key>StandardOutPath</key>
+    <string>/var/log/ganymede/host-agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/ganymede/host-agent.err</string>
+
+    <!--
+      No EnvironmentVariables key here on purpose: GANYMEDE_KEY belongs in
+      host.json (chmod 600, owned by the contributor -- see
+      install-macos.sh), not in this plist. ~/Library/LaunchAgents plists are
+      world-readable by default (0644), same reasoning as keeping the key out
+      of the systemd unit file.
+    -->
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

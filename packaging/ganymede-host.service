@@ -1,0 +1,45 @@
+# Host agent tick (docs/02-architecture-v2.md §7). The timer owns the cadence;
+# this unit only knows how to run one tick and stop, which is what
+# `Type=oneshot` + `--once` gives us -- no long-lived process to leak state
+# across ticks, no restart policy to reason about.
+[Unit]
+Description=Ganymede host agent (one tick)
+Documentation=https://github.com/ganymede-project/ganymede
+# Docker must be up before a tick that might `docker run` a worker; a tick that
+# races the daemon during boot just fails and gets picked up by the next timer
+# fire, but there's no reason to spend one on a race we can avoid for free.
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ganymede-host --once
+# The key lives here, not in this file: EnvironmentFile is root-owned 0600 by
+# the installer, so `systemctl cat` and `systemctl show` -- both readable by
+# any local user -- never leak GANYMEDE_KEY. A key baked into the unit file
+# would sit in /etc/systemd/system with unit-file permissions (world-readable
+# by default), which is precisely the leak this avoids.
+EnvironmentFile=-/etc/ganymede/host.env
+
+# --- Docker access: the User=root choice, and what it does and doesn't buy ---
+# The agent talks to /var/run/docker.sock, which by design is root-equivalent:
+# anything that can reach that socket can bind-mount the host root into a
+# container and read/write it as root. Putting the agent in the `docker` group
+# instead of running it as root would not sandbox it at all -- it would just
+# spell the same privilege differently while pretending otherwise. So this
+# runs as root, deliberately, and the hardening below is what's still honest
+# to claim given that starting point.
+User=root
+
+# NoNewPrivileges and ProtectSystem/PrivateTmp still narrow *this process's*
+# own footprint (no setuid escalation, no writing outside what's listed, no
+# shared /tmp) -- worth having even though none of it constrains what a
+# container launched through the Docker socket can do once it's running.
+# Docker socket access is the actual privilege boundary here, not this unit.
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+ReadWritePaths=/var/lib/ganymede /var/log/ganymede
+
+[Install]
+WantedBy=multi-user.target

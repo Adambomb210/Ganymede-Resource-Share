@@ -134,7 +134,7 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
     @app.get(f"/{API_VERSION}/manifest")
     def manifest(conn: ConnDep, contributor: ContribDep) -> dict:
         runs = conn.execute(
-            """SELECT id, base_model, base_precision, requires_json,
+            """SELECT id, base_model, base_precision, requires_json, required_image,
                       data_classification, status, current_round, target_rounds
                FROM runs WHERE status = 'active'"""
         ).fetchall()
@@ -144,6 +144,11 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                 "base_model": r["base_model"],
                 "base_precision": r["base_precision"],
                 "requires": json.loads(r["requires_json"]),
+                # 7 step 3 exists to consume this: the host agent reconciles its
+                # local image against it *before* the container ever starts, so
+                # a worker never wastes a claim discovering the mismatch itself
+                # (4.2 step 5 is the in-container backstop, not the primary path).
+                "required_image": r["required_image"],
                 "current_round": r["current_round"],
                 "target_rounds": r["target_rounds"],
             }

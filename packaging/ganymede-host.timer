@@ -1,0 +1,32 @@
+# Cadence for the host agent tick (docs/02-architecture-v2.md §7).
+#
+# Interval: 5 minutes. The exit criterion is "machine idles -> worker starts
+# within one timer interval", so this number is a user-visible latency, not a
+# tuning knob to set-and-forget. `user_idle_sec` (host.json, default 900s/15min)
+# already keeps the agent off a machine someone is using, so a 5-minute poll on
+# top of that adds at most 5 minutes to a 15-minute wait -- barely noticeable --
+# while still being infrequent enough that a oneshot Python process checking
+# `docker inspect` and an idle probe is not a meaningful wake-up cost for a
+# laptop. A shorter interval buys little (the 900s floor dominates either way);
+# a much longer one (e.g. 30 min) would make the exit criterion embarrassing.
+[Unit]
+Description=Run the Ganymede host agent every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+# A fleet of contributor machines installed from the same package would
+# otherwise all fire their first tick at the same offset from boot, and then
+# stay in lockstep -- every one of them hitting GET /v1/manifest in the same
+# few seconds, every 5 minutes, forever. 60s of jitter spreads that out; it's
+# small next to the 5 min cadence so it doesn't meaningfully change the exit
+# criterion's latency.
+RandomizedDelaySec=60
+# Catches up a tick that was missed while the machine was asleep or off,
+# instead of waiting up to 5 minutes after wake for the next scheduled fire --
+# a laptop that's been closed for a week shouldn't have to wait for the timer
+# to notice it's back.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
