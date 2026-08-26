@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from ganymede.host.config import HostConfig
+from ganymede.host.config import CONTAINER_CACHE_DIR, CONTAINER_STATE_DIR, HostConfig
 
 log = logging.getLogger("ganymede.host.runtime")
 
@@ -199,12 +199,17 @@ class DockerRuntime:
         Two differences from the spec block in 7, both from the README having
         been run for real in M2:
 
-        - ``-v ganymede-state:/var/lib/ganymede``. 7 lists only the HF cache
-          volume. Without the state volume the contributor's `pause` and `stop`
-          sentinels cannot reach inside a ``--read-only`` container at all, so
-          4.4's portable stop mechanism -- the one that is not a signal -- would
-          have nowhere to land. The kill switch is what makes the ask
-          reasonable (7.1); it does not get to depend on signals arriving.
+        - The state directory is mounted, which 7 omits entirely, and **both
+          mounts are bind mounts rather than the named volumes in the README**.
+          Without a state mount the contributor's `pause` and `stop` sentinels
+          cannot reach inside a ``--read-only`` container at all, so 4.4's
+          portable stop mechanism -- the one that is not a signal -- would have
+          nowhere to land. And a *named* state volume is worse than none: the
+          contributor creates `/var/lib/ganymede/pause`, the worker polls a
+          Docker-managed directory of the same name holding a different file,
+          and the kill switch appears to work while doing nothing. The same
+          argument applies to the cache: 6.7's cap has to prune the directory
+          the worker is really filling, not one that merely shares its name.
         - ``--user`` is passed only when the agent is *not* root, where 7 and
           the README both pass it unconditionally. Under systemd the agent
           needs the Docker socket and usually has it by being root -- and
@@ -230,8 +235,11 @@ class DockerRuntime:
             # mounts are where they land. Not optional.
             "--tmpfs", "/tmp",
             "--tmpfs", "/run/ganymede",
-            "-v", f"{cfg.hf_volume}:/cache/hf",
-            "-v", f"{cfg.state_volume}:/var/lib/ganymede",
+            "-v", f"{cfg.resolved_cache_dir()}:{CONTAINER_CACHE_DIR}",
+            # Read-only: the worker only *reads* the sentinels (its own writes
+            # go to /tmp and /run/ganymede), and a worker that cannot write here
+            # cannot forge or clear the contributor's kill switch.
+            "-v", f"{cfg.resolved_state_dir()}:{CONTAINER_STATE_DIR}:ro",
             "--memory", cfg.memory,
             "--cpus", cfg.cpus,
             "--pids-limit", str(cfg.pids_limit),

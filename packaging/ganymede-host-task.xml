@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="UTF-16"?>
+<?xml version="1.0" encoding="UTF-8"?>
 <!--
   Ganymede host agent tick (docs/02-architecture-v2.md section 7, section 4.1).
   Windows is the pip + Scheduled Task path by default (Docker Desktop/WSL2 is

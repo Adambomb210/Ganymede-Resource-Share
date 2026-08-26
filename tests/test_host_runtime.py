@@ -79,18 +79,30 @@ def test_the_writable_mounts_read_only_makes_necessary_are_all_there():
     assert ("--tmpfs", "/run/ganymede") in pairs
 
 
-def test_the_state_volume_is_mounted_so_the_pause_switch_can_reach_inside():
-    """7.1's kill switch is a file. Under --read-only it has nowhere to land
-    without this mount, and the contributor's only remaining stop mechanism
-    would be a signal -- which 4.4 is explicit must not be what correctness
-    rests on."""
-    argv = runtime_mod.DockerRuntime(_config()).run_argv("img:v1", {})
-    assert ("-v", "ganymede-state:/var/lib/ganymede") in list(zip(argv, argv[1:]))
+def test_the_state_mount_is_the_hosts_own_directory_not_a_named_volume(tmp_path):
+    """7.1's kill switch is a file, and it has to be *the same file* the worker
+    polls. A named volume would give the worker a Docker-managed directory of
+    the same name holding a different file: the contributor creates `pause`,
+    nothing happens, and nothing anywhere reports an error."""
+    cfg = _config(state_dir=str(tmp_path))
+    argv = runtime_mod.DockerRuntime(cfg).run_argv("img:v1", {})
+    assert ("-v", f"{tmp_path}:/var/lib/ganymede:ro") in list(zip(argv, argv[1:]))
 
 
-def test_the_hf_cache_volume_is_mounted_so_a_base_model_is_pulled_once():
+def test_the_state_mount_is_read_only_so_a_worker_cannot_clear_its_own_kill_switch():
     argv = runtime_mod.DockerRuntime(_config()).run_argv("img:v1", {})
-    assert ("-v", "ganymede-hf:/cache/hf") in list(zip(argv, argv[1:]))
+    mounts = [b for a, b in zip(argv, argv[1:]) if a == "-v"]
+    state = [m for m in mounts if "/var/lib/ganymede" in m]
+    assert state and all(m.endswith(":ro") for m in state)
+
+
+def test_the_cache_mount_is_the_directory_the_cap_actually_prunes(tmp_path):
+    """6.7's LRU has to be evicting the bytes the worker is writing. Pointing
+    the container at a named volume while the agent prunes a host path means a
+    cap that reports success against a directory nothing fills."""
+    cfg = _config(cache_dir=str(tmp_path))
+    argv = runtime_mod.DockerRuntime(cfg).run_argv("img:v1", {})
+    assert ("-v", f"{tmp_path}:/cache/hf") in list(zip(argv, argv[1:]))
 
 
 def test_resource_limits_come_from_config():

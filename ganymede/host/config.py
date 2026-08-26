@@ -35,11 +35,19 @@ from typing import Any
 # on the box and a judgement call about what counts as ours.
 DEFAULT_CONTAINER_NAME = "ganymede-worker"
 
-# Named volumes rather than bind mounts. A bind mount into a read-only container
-# needs a host path that exists with the right ownership before the first run,
-# which is a support conversation; a named volume Docker creates itself.
-DEFAULT_HF_VOLUME = "ganymede-hf"
-DEFAULT_STATE_VOLUME = "ganymede-state"
+# Where the container sees the two host directories. Bind mounts, not named
+# volumes -- a named volume is Docker's to manage and lives under
+# /var/lib/docker, which breaks both of the things these mounts exist for. The
+# contributor's `pause` file (7.1) has to be the *same file* the worker polls,
+# and 6.7's cache cap has to be pruning the directory the worker is actually
+# filling. A named volume makes each of those two different places that look
+# alike, and the failure is silent in both directions.
+CONTAINER_CACHE_DIR = "/cache/hf"
+CONTAINER_STATE_DIR = "/var/lib/ganymede"
+
+# The uid the worker image runs as (docker/worker-core.Dockerfile). The cache
+# bind mount has to be writable by it, which the installer arranges.
+CONTAINER_UID = 1000
 
 # 4.1: the image the `llm_finetune` runs name. The *tag* comes from the
 # manifest (7 step 3) -- this is only the repository half.
@@ -142,8 +150,6 @@ class HostConfig:
     # --- where things live ----------------------------------------------
     state_dir: str = ""
     cache_dir: str = ""
-    hf_volume: str = DEFAULT_HF_VOLUME
-    state_volume: str = DEFAULT_STATE_VOLUME
     cache_cap_gb: float = DEFAULT_CACHE_CAP_GB
 
     # --- when it may run -------------------------------------------------
