@@ -40,6 +40,8 @@ ganymede-issue-key = "scripts.issue_key:main"
 ganymede-calibrate = "ganymede.trainer.calibrate:main"
 ganymede-baseline = "ganymede.trainer.baseline:main"
 ganymede-worker = "ganymede.worker.loop:main"
+ganymede-host = "ganymede.host.agent:main"
+ganymede-cache = "ganymede.host.cache:main"
 
 [tool.setuptools.packages.find]
 include = ["ganymede*"]
