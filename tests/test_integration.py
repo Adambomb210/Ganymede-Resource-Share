@@ -1000,15 +1000,67 @@ def test_required_image_is_none_unless_the_run_sets_one(
     assert task["required_image"] is None
 
 
-def test_a_run_can_demand_an_image_tag(
+def test_a_matching_worker_gets_the_task_and_sees_the_requirement(
     client, make_contributor, seeded_run, register_worker
 ):
     _, key = make_contributor()
-    run_id = seeded_run(required_image="ganymede/worker-llm:v3")
-    wid = register_worker(key)
+    seeded_run(required_image="ganymede/worker-llm:v3")
+    wid = register_worker(key, image_tag="ganymede/worker-llm:v3")
+
     task = client.post("/v1/tasks/claim", headers={"Authorization": f"Bearer {key}"},
                        json={"worker_id": wid}).json()
     assert task["required_image"] == "ganymede/worker-llm:v3"
+
+
+def test_a_worker_on_the_wrong_image_is_never_offered_the_task(
+    client, make_contributor, seeded_run, register_worker, conn
+):
+    """The image requirement is eligibility, not a worker-side courtesy check.
+
+    If the filter lived only in the worker, every ineligible worker would be
+    handed a lease it must immediately abandon -- marking a shard spoken for and
+    churning bucket counters once per poll interval, forever. That was observed
+    live before this check existed.
+    """
+    _, key = make_contributor()
+    run_id = seeded_run(required_image="ganymede/worker-llm:v3")
+    wid = register_worker(key, image_tag="ganymede/worker-llm:v2")
+
+    resp = client.post("/v1/tasks/claim", headers={"Authorization": f"Bearer {key}"},
+                       json={"worker_id": wid})
+
+    assert resp.status_code == 204
+    # No lease was created, so no shard was taken out of circulation.
+    assert conn.execute("SELECT COUNT(*) FROM tasks WHERE run_id = ?", (run_id,)).fetchone()[0] == 0
+
+
+def test_a_native_worker_is_never_offered_a_container_only_run(
+    client, make_contributor, seeded_run, register_worker
+):
+    """This is how 6.10 holds a restricted run to the container path: a native
+    install reports no image tag, so it cannot match one."""
+    _, key = make_contributor()
+    seeded_run(required_image="ganymede/worker-llm:v3")
+    wid = register_worker(key, image_tag=None)
+
+    resp = client.post("/v1/tasks/claim", headers={"Authorization": f"Bearer {key}"},
+                       json={"worker_id": wid})
+    assert resp.status_code == 204
+
+
+def test_a_run_with_no_image_requirement_still_takes_native_workers(
+    client, make_contributor, seeded_run, register_worker
+):
+    """The converse matters just as much: defaulting the requirement to anything
+    but None would silently exclude every macOS and Windows contributor."""
+    _, key = make_contributor()
+    seeded_run()
+    wid = register_worker(key, image_tag=None)
+
+    resp = client.post("/v1/tasks/claim", headers={"Authorization": f"Bearer {key}"},
+                       json={"worker_id": wid})
+    assert resp.status_code == 200
+    assert resp.json()["required_image"] is None
 
 
 def test_a_resumed_lease_reports_the_same_budget_it_was_given(

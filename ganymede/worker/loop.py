@@ -382,8 +382,15 @@ class Worker:
 
             honored, reason = self.can_honor(task)
             if not honored:
+                # Should be unreachable: the coordinator filters on the same
+                # facts at claim time. Reaching it means registration and the
+                # run disagree -- a driver update, a rebuilt image, a run
+                # retargeted mid-flight -- so abandon and let the next poll
+                # re-register the truth.
                 log.warning("declining task %s: %s", task["task_id"], reason)
                 self._abandon(task["task_id"])
+                if self.config.once:
+                    return 0
                 self._idle(IDLE_SLEEP_SEC)
                 continue
 

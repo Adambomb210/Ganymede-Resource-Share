@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+.venv/
+venv/
+
+# Local coordinator state and admin output.
+*.db
+*.db-wal
+*.db-shm
+ganymede.env
+calibration.json
+baseline.json
+
+# Sandbox-only: this environment's egress-proxy CA, copied into the build
+# context to build containers locally. Real CI has no such proxy.
+ccr-ca.crt
+*-proxied.Dockerfile

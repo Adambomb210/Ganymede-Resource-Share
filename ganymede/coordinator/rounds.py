@@ -260,6 +260,7 @@ def claim_task(
     profile: dict,
     settings,
     now: datetime | None = None,
+    worker_image_tag: str | None = None,
 ) -> TaskSpec | None:
     """Lease one task, or return None meaning 204 No Content.
 
@@ -283,6 +284,20 @@ def claim_task(
         ok, why = budget_mod.is_eligible(profile, json.loads(run["requires_json"]))
         if not ok:
             raise NotEligible(why or "profile does not meet run requirements")
+
+        # The image requirement is eligibility, not a worker-side courtesy check.
+        # The worker checks it too (4.2 step 5), but only as defense in depth
+        # against a mismatch that appeared after registration -- if the filter
+        # lived *only* there, every ineligible worker would be handed a lease it
+        # must immediately abandon, marking a shard spoken for and churning the
+        # bucket counters once per poll interval, forever. Observed live before
+        # this check existed.
+        required_image = run["required_image"]
+        if required_image and required_image != worker_image_tag:
+            raise NotEligible(
+                f"run requires image {required_image!r}, "
+                f"worker reports {worker_image_tag!r}"
+            )
 
         rnd = conn.execute(
             "SELECT * FROM rounds WHERE run_id = ? AND idx = ? AND status = 'open'",

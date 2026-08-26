@@ -25,6 +25,8 @@ and disappear when it isn't.
 |---|---|
 | `ganymede/coordinator/` | The coordinator: API, round state machine, aggregation, storage |
 | `ganymede/trainer/` | The trainer a worker runs, plus the calibration and baseline harnesses |
+| `ganymede/worker/` | The worker package a contributor installs: probe, client, loop |
+| `docker/` | The three-layer worker image stack (§4.1) |
 | `configs/` | Run configs — one file feeds calibrate, baseline and `newrun` alike |
 | `scripts/` | Admin CLI — create a run, issue a key, GC, backup |
 | `deploy/` | Container image, compose file, env template |
@@ -54,6 +56,19 @@ and disappear when it isn't.
 | `evaluate.py` | Held-out loss and the 20-prompt greedy smoke set |
 | `calibrate.py` | `ganymede-calibrate` — fit probe, throughput, recommended `local_steps` |
 | `baseline.py` | `ganymede-baseline` — multi-seed single-node reference for M4 |
+
+### Worker modules
+
+| Module | Responsibility |
+|---|---|
+| `probe.py` | The §6.9 self-test: allocation ceiling, precision support, bench score. Backends live in a registry, so AMD and Intel are one entry each |
+| `client.py` | The §6.2 API over stdlib `urllib` — worker-core stays dependency-light |
+| `control.py` | The §4.4 stop/pause sentinel files, with signals as an optimization |
+| `loop.py` | The §4.2 entrypoint loop, and the `ganymede-worker` CLI |
+
+```sh
+ganymede-worker --probe-only    # what to ask a contributor for when they get no work
+```
 
 The trainer's stack (`transformers`, `peft`, `datasets`) is an optional extra, not a
 base dependency: the coordinator never loads a base model — `newrun.py` derives the

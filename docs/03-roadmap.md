@@ -137,7 +137,7 @@ actually emits, and each would have failed quietly rather than loudly:
 
 ### The one design decision M0 had to settle
 
-**How a bucket index becomes rows** — now §4.6. Permute with `random.Random(data_seed)`,
+**How a bucket index becomes rows** — now §4.7. Permute with `random.Random(data_seed)`,
 carve the eval split off the front, slice the rest into exactly-equal buckets. The
 alternative (`hash(row) % num_buckets`) gives approximate bucket sizes, and every step
 budget in the system is arithmetic over that size.
@@ -286,7 +286,7 @@ than your data. Verify the current licence on the dataset card before use; these
 change.
 
 **Buckets: 64** — exactly 222 samples each once the 750-row eval split is carved
-out first, with 53 rows dropped to keep every bucket equal (§4.6). Per the sizing
+out first, with 53 rows dropped to keep every bucket equal (§4.7). Per the sizing
 rule below.
 
 A larger corpus will be wanted eventually, but that's an M4 question and not worth
@@ -612,7 +612,7 @@ off-box backup destination. Neither blocks M2.
 **~4–5 days** (was 3–4; the native path and the probe are new scope).
 
 The worker **package** first, then the image around it (§4.1). Entrypoint loop (§4.2),
-SIGTERM/abandon (§4.4), capability probe (§6.9), isolation flags (§4.5). The trainer is
+SIGTERM/abandon (§4.4), capability probe (§6.9), isolation flags (§4.6). The trainer is
 M0's, unchanged.
 
 Broad hardware compatibility is a goal (§0), so this milestone delivers `pip install
@@ -644,6 +644,77 @@ Exit criteria:
   reachable
 - HF cache volume: base model pulled once on first run, reused on every subsequent
   container start
+
+---
+
+## M2 status — built, minus the hardware
+
+**Done on this box; three exit criteria need machines it doesn't have.**
+
+```
+ganymede/worker/
+  probe.py    6.9 self-test, backend registry (cuda, rocm, xpu, mps, cpu)
+  client.py   the 6.2 surface over stdlib urllib
+  control.py  the 4.4 stop/pause sentinels
+  loop.py     the 4.2 loop, plus the ganymede-worker CLI
+docker/
+  torch-base.Dockerfile        CUDA + pinned torch, the layer that must not move
+  torch-base-cpu.Dockerfile    CPU stand-in, so the container path is CI-testable
+  worker-core.Dockerfile       ~30 MB: loop, client, probe. torch + stdlib only
+  worker-llm.Dockerfile        ~2 GB: transformers, peft, datasets, bitsandbytes
+.github/workflows/ci.yml       tests + a real container build and smoke test
+```
+
+| Exit criterion | State |
+|---|---|
+| One real GPU claims from a real coordinator, trains, submits, loops | **met on CPU.** A containerized `worker-llm` ran 207 steps against a live uvicorn coordinator and real MinIO under `--read-only --cap-drop=ALL --security-opt=no-new-privileges`, non-root, and the coordinator closed the round and opened the next. Repeatable as `tests/test_worker_live.py`. **The GPU itself is yours** |
+| The same package runs natively on Linux/CUDA, macOS/MPS, Windows/CUDA | **needs three machines.** The backend registry (§4.5) makes each one an entry rather than a port, and the probe reports honestly on any of them — but "it registers correctly on a Mac" is a claim only a Mac can settle |
+| The probe reports a machine ineligible without failing registration | met — nothing in the probe raises; a machine where every measurement failed still produces a valid profile and is simply never eligible |
+| Read-only rootfs works with the declared writable mounts | met, and asserted in CI on every push |
+| `docker stop` mid-training → lease released → another worker picks the shard up | partially: abandon-on-stop is covered by tests, and the sentinel path works. The two-worker handoff needs a second machine to be worth calling proven |
+| Egress allowlist enforced; worker functions with three destinations reachable | **not done.** Needs a firewall to enforce, which this container does not have |
+| HF cache volume: base model pulled once, reused on every container start | met — observed directly. Setup was 110 s on a cold cache and 19 s on a warm one, same image, same model |
+
+### What the live rounds found
+
+Running it rather than reasoning about it turned up four things, three of which
+no test would have caught:
+
+1. **`required_image` was checked only by the worker.** The coordinator offered
+   the task anyway, so an ineligible worker was handed a lease it had to abandon
+   — once per poll interval, marking a shard spoken for and churning bucket
+   counters each time. The database recorded **seven leases in under three
+   minutes, all abandoned**, before the check moved into the coordinator's
+   eligibility filter where it belonged. The worker-side check stays as defense
+   in depth for the case where registration and the run disagree.
+2. **Setup time was not reserved in the budget.** A round measured **110 s of
+   setup against 46 s of training** — loading a 0.6B model with a warm cache cost
+   2.4× the work it enabled. `usable_seconds` reserved download, upload and
+   margin but not that, so every worker was handed more steps than it could
+   reach and delivered short every round with nothing reporting a problem. It is
+   a fixed per-task cost, so it now sits beside download and upload as
+   `est_setup_sec` rather than being folded into a rate, where the error would
+   have scaled with round length.
+3. **`worker-core` shipped without numpy.** `--no-deps` kept torch from being
+   reinstalled and dropped numpy with it — and `safetensors.torch.save` converts
+   through numpy. The image probed fine, registered fine, would have trained a
+   full round, and died on the one line that serializes the result. CI now
+   round-trips a tensor through safetensors inside the built image, because
+   "does it start" was never the right question.
+4. **`newrun` wrote to a bucket it never ensured**, so a first deployment
+   depended on the coordinator having been started at least once beforehand —
+   an unwritten prerequisite whose symptom is a boto stack trace.
+
+### Still needs your hardware
+
+| Blocked | Why |
+|---|---|
+| The GPU round | A CPU round proves the protocol, not the card |
+| macOS/MPS and Windows/CUDA registration | Three platforms, three machines. The code paths exist; the evidence does not |
+| AMD (ROCm) and Intel (XPU) | Wired into the registry and labelled `untested` (§4.5). Deferred by your call, and structured so adopting them is filling in an entry rather than a refactor |
+| Egress allowlist | Needs a firewall to enforce it against |
+| Pushing images to a registry | Needs credentials and a decision about where they live |
+
 
 ---
 

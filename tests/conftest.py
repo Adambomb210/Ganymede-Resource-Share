@@ -202,11 +202,11 @@ def register_worker(client):
     """Register a worker and return its id."""
     def _register(key: str, backend: str = "cuda", device: str = "RTX 3060",
                   vram_mb: int = 12288, supports: list[str] | None = None,
-                  probe: dict | None = None) -> str:
+                  probe: dict | None = None, image_tag: str | None = None) -> str:
         resp = client.post(
             "/v1/workers/register",
             headers={"Authorization": f"Bearer {key}"},
-            json={"compute_profile": {
+            json={"image_tag": image_tag, "compute_profile": {
                 "backend": backend, "device_name": device, "vram_mb": vram_mb,
                 "supports": supports if supports is not None else ["bf16", "fp16", "nf4"],
                 "probe": probe or {"alloc_max_mb": vram_mb - 1000, "bench_score": 40.0},

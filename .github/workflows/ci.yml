@@ -1,0 +1,158 @@
+name: CI
+
+# The Linux container path is the primary deployment target for any third-party
+# host, and it is the path a Windows-based developer exercises least
+# (docs/03-roadmap.md, *Developing on Windows*). Left to manual testing its bugs
+# surface late -- at exactly the moment you are asking a volunteer to install
+# something. So CI builds and smoke-tests it on every commit.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          # CPU torch: the runner has no GPU, and the default wheel would pull
+          # several GB of CUDA libraries to sit unused.
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e '.[dev,trainer]'
+
+      - name: Fast suite
+        # `slow` needs HuggingFace downloads and minutes of CPU training; it is
+        # covered by the nightly job below rather than on every push.
+        run: python -m pytest tests/ -q -m "not slow"
+
+  container:
+    name: Worker container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build torch-base (CPU stand-in)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/torch-base-cpu.Dockerfile
+          tags: ganymede/torch-base:cpu
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build worker-core
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/worker-core.Dockerfile
+          build-args: |
+            TORCH_BASE=ganymede/torch-base:cpu
+            GANYMEDE_VERSION=ci
+          tags: ganymede/worker-core:ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Probe runs inside the container
+        # The entrypoint's own self-report. If the image cannot describe its own
+        # hardware it cannot register, and every other failure downstream would
+        # be harder to read than this one.
+        run: |
+          docker run --rm ganymede/worker-core:ci --probe-only --skip-bench | tee profile.json
+          python -c "
+          import json, sys
+          p = json.load(open('profile.json'))
+          assert p['backend'] == 'cpu', p['backend']
+          assert 'fp32' in p['supports'], p['supports']
+          print('probe ok:', p['device_name'], p['supports'])
+          "
+
+      - name: The image can do the job it exists for
+        # Starting is not the bar. worker-core's whole purpose is to deserialize
+        # a base adapter, train, and serialize the result -- and safetensors
+        # converts through numpy, so an image missing it probes fine, registers
+        # fine, trains a full round, and dies on the line that saves the output.
+        # That happened once. This is why it cannot happen twice.
+        run: |
+          docker run --rm --entrypoint python ganymede/worker-core:ci -c "
+          import torch
+          from ganymede.coordinator.aggregate import save_adapter, load_adapter, manifest_of
+          from ganymede.worker.client import CoordinatorClient
+          from ganymede.worker.control import ControlFiles
+          from ganymede.worker.loop import Worker
+
+          adapter = {'m.lora_A.default.weight': torch.randn(8, 16)}
+          restored = load_adapter(save_adapter(adapter))
+          assert torch.equal(adapter['m.lora_A.default.weight'],
+                             restored['m.lora_A.default.weight'])
+          assert manifest_of(restored)
+          print('adapter round-trip ok')
+          "
+
+      - name: Read-only rootfs works with the declared mounts
+        # An M2 exit criterion, and the flag most likely to surprise: transformers,
+        # Triton and torch.compile all write caches. Expect to find one or two more
+        # paths on a new base image -- add them explicitly rather than reverting to
+        # a writable rootfs, which would defeat the point.
+        run: |
+          docker run --rm \
+            --read-only \
+            --tmpfs /tmp --tmpfs /run/ganymede \
+            -v ganymede-ci-hf:/cache/hf \
+            -v ganymede-ci-state:/var/lib/ganymede \
+            --cap-drop=ALL --security-opt=no-new-privileges \
+            ganymede/worker-core:ci --probe-only --skip-bench > /dev/null
+          echo "read-only rootfs ok"
+
+      - name: The container refuses to start without its configuration
+        # A worker that started and silently did nothing would be the worst
+        # outcome for a volunteer: it looks like it is contributing.
+        run: |
+          set +e
+          output=$(docker run --rm ganymede/worker-core:ci 2>&1)
+          status=$?
+          set -e
+          echo "$output"
+          [ $status -ne 0 ] || { echo "expected a non-zero exit"; exit 1; }
+          echo "$output" | grep -q "GANYMEDE_COORDINATOR_URL" || {
+            echo "the error should name the missing variable"; exit 1; }
+
+  slow:
+    name: Slow suite (real models)
+    # Downloads Qwen3-0.6B and Dolly and trains on CPU -- ~10 minutes, and it
+    # depends on HuggingFace being reachable, so it does not gate a push.
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e '.[dev,trainer]'
+      - name: Slow suite
+        run: python -m pytest tests/ -q -m slow

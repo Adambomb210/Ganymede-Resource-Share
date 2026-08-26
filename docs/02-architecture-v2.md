@@ -354,7 +354,7 @@ package, and every delivery path wraps the same code:
 
 | Host | Path | Isolation |
 |---|---|---|
-| Linux + NVIDIA, third-party host | Container | Full §4.5 hardening |
+| Linux + NVIDIA, third-party host | Container | Full §4.6 hardening |
 | Linux + NVIDIA, own hardware | Container or `pip` + systemd | Contributor's choice |
 | macOS + Apple Silicon | `pip` + launchd (**no container** — §6.8) | OS-level only |
 | Windows + NVIDIA | `pip` + Scheduled Task, or Docker Desktop/WSL2 | Weakest natively |
@@ -499,7 +499,49 @@ arrives early enough.
 The same reasoning covers the contributor's pause control (§7.1) — one sentinel-file
 mechanism, two files, three platforms.
 
-### 4.5 Isolation (baseline, unchanged in spirit from v1 §3.4)
+### 4.5 Backends: CUDA now, AMD and Intel by construction
+
+§6.9's promise is that new hardware needs no coordinator change — someone turns up
+with an Arc card or a ROCm box, the probe passes, and they are eligible. That
+promise is kept in exactly one place: `ganymede/worker/probe.py`'s `BACKENDS`
+table. Adding a backend is filling in an entry; nothing in the loop, the client,
+the coordinator, or the schema knows how many there are.
+
+| Backend | Hardware | State |
+|---|---|---|
+| `cuda` | NVIDIA | Supported |
+| `mps` | Apple silicon | Supported. Native install only — no container (§6.8) |
+| `cpu` | Anything | Supported. Registers, rarely clears a run's throughput floor |
+| `rocm` | AMD | **Wired, untested.** Never run on real hardware |
+| `xpu` | Intel Arc / Data Center | **Wired, untested.** Never run on real hardware |
+
+The untested two report `backend_maturity: "untested"` in their profile rather
+than implying the same confidence as CUDA. What they need to become supported is
+a machine, not a design change.
+
+Two details in that table are load-bearing rather than incidental:
+
+**ROCm is detected before CUDA, and by `torch.version.hip`.** A PyTorch ROCm
+build reports `torch.cuda.is_available() == True` and exposes the entire
+`torch.cuda` API — AMD chose that so CUDA code runs unmodified, which is a gift
+for portability and a trap for detection. Availability cannot tell them apart.
+Check CUDA first and every AMD machine in the fleet registers as NVIDIA; the
+coordinator's throughput table then keys two different architectures under one
+entry and averages them into a number that describes neither.
+
+**The allocation ceiling is measured only where OOM is catchable.** CUDA, ROCm
+and XPU raise a catchable exception, so the ceiling is found by climbing until
+failure. CPU and MPS do not: memory there is the system's, and exhausting it
+invokes the kernel's OOM killer, which sends an uncatchable SIGKILL. Those
+backends ask the OS instead. This is not defensive theorising — probing a 0.6B
+model at 1024 tokens killed the M0 calibration harness outright, which is also
+why the fit probe now runs in a child process.
+
+`nf4` is gated on backend, not on whether `bitsandbytes` imports. A CPU image
+that happens to ship a bitsandbytes wheel must not advertise nf4 support, or it
+wins a lease for a run it cannot honor.
+
+### 4.6 Isolation (baseline, unchanged in spirit from v1 §3.4)
 
 - `--user` non-root, `--cap-drop=ALL`, `--security-opt=no-new-privileges`
 - Read-only rootfs, with explicit writable mounts:
@@ -527,7 +569,7 @@ Stronger sandboxing (gVisor/Kata) stays deferred to Phase 2 — but note it's th
 that's being protected here, and every v1 host is either yours or a person you vouch
 for.
 
-### 4.6 Bucketing: how a bucket index becomes rows
+### 4.7 Bucketing: how a bucket index becomes rows
 
 The coordinator never sees the dataset. It sends a worker a list of bucket indices and
 the run's `num_buckets`, and the worker derives its own rows. So the mapping has to be a
@@ -1285,7 +1327,7 @@ GPU affects platform reliability scoring (Review Finding M).
   "dataset_ref": "hf://databricks/databricks-dolly-15k",
   "buckets": [17, 143, 288, 401, 655],   // count scales with the budget — §3.4
   "num_buckets": 64,                     // the worker maps indices to rows itself
-  "seed": 1734021,                       // derived from (run, round, task) — §4.6
+  "seed": 1734021,                       // derived from (run, round, task) — §4.7
 
   "hyperparams": {
     "lr": 2e-4,
@@ -1294,7 +1336,7 @@ GPU affects platform reliability scoring (Review Finding M).
     "grad_accum": 8,
     "prompt_format": "dolly-v1",
     "completion_only": true,
-    "eval_size": 750,                    // held out before bucketing — §4.6
+    "eval_size": 750,                    // held out before bucketing — §4.7
     "data_seed": 20260826,               // defines the partition; fixed per run
     "samples_per_bucket": 222            // derived: (rows - eval_size) // buckets
   },
@@ -1314,7 +1356,7 @@ than a run-wide constant (§3.4).
 **`num_buckets`, `seed` and the four data hyperparameters are not decoration.** The
 coordinator never sends the data, so a worker reconstructs its rows from
 `(dataset_ref, data_seed, eval_size, num_buckets)` and then shuffles them with `seed`
-(§4.6). Bucket indices without a bucket total are not an assignment. `seed` is derived
+(§4.7). Bucket indices without a bucket total are not an assignment. `seed` is derived
 as `blake2b(run_id/round_idx/task_id)` rather than drawn at random, so a retried task
 reproduces its own ordering and the derivation survives a coordinator restart —
 Python's `hash()` would not, since it salts string hashing per process.

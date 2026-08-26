@@ -212,7 +212,7 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             try:
                 spec = rounds.claim_task(
                     conn, run_id, body.worker_id, contributor.clearance,
-                    profile, settings,
+                    profile, settings, worker_image_tag=worker["image_tag"],
                 )
             except rounds.NotEligible as exc:
                 reasons.append(f"{run_id}: {exc}")
