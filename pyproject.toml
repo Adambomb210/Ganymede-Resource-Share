@@ -33,3 +33,6 @@ include = ["ganymede*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "slow: needs the network (a HuggingFace config fetch) or is otherwise not fast",
+]

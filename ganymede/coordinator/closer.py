@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import weakref
 from dataclasses import dataclass
 from datetime import datetime
 
 from ganymede.coordinator import aggregate, rounds
+from ganymede.coordinator.config import DEFAULT_DOMINANCE_CAP, DEFAULT_NORM_REJECT_K
 from ganymede.coordinator.db import immediate
 from ganymede.coordinator.store import Store, base_adapter_key, momentum_key
 
@@ -40,21 +42,29 @@ class CloseResult:
 # cache by key. Without this every submit re-downloads and re-parses ~25 MB just
 # to learn a key set the coordinator already knew -- eight workers a round would
 # pay for that eight times over an artifact none of them changed.
-_MANIFEST_CACHE: dict[str, dict] = {}
+# Keyed by the Store the bytes actually live in, not by the ref string alone. A
+# key path is only unique *within* a bucket: the same run id recreated against
+# fresh storage, or a process holding two stores, would otherwise be served a
+# manifest describing an adapter it never read. Weak keys so a discarded Store
+# takes its cache with it.
+_MANIFEST_CACHE: "weakref.WeakKeyDictionary[object, dict[str, dict]]" = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def expected_manifest(store: Store, base_adapter_ref: str) -> dict:
     """Key set and shapes a submission must match, from the round's base adapter."""
-    cached = _MANIFEST_CACHE.get(base_adapter_ref)
+    per_store = _MANIFEST_CACHE.setdefault(store, {})
+    cached = per_store.get(base_adapter_ref)
     if cached is None:
         cached = aggregate.manifest_of(
             aggregate.load_adapter(store.get_bytes(base_adapter_ref))
         )
         # One entry per round; a long run would otherwise accumulate one dict
         # per round for the lifetime of the process.
-        if len(_MANIFEST_CACHE) > 4:
-            _MANIFEST_CACHE.clear()
-        _MANIFEST_CACHE[base_adapter_ref] = cached
+        if len(per_store) > 4:
+            per_store.clear()
+        per_store[base_adapter_ref] = cached
     return cached
 
 
@@ -124,25 +134,38 @@ def close_round(
     round_idx: int,
     reason: str,
     now: datetime | None = None,
-) -> CloseResult:
-    """Aggregate a round's accepted submissions and advance the run."""
+    settings=None,
+) -> CloseResult | None:
+    """Aggregate a round's accepted submissions and advance the run.
+
+    Returns None when another caller is already closing this round. Closing is
+    driven opportunistically from the request path, so two workers whose
+    submissions land together will both evaluate the close rule and both find
+    it satisfied -- that is the normal case, not an error.
+    """
     now = now or rounds.utcnow()
+    norm_k = getattr(settings, "norm_reject_k", DEFAULT_NORM_REJECT_K)
+    cap = getattr(settings, "dominance_cap", DEFAULT_DOMINANCE_CAP)
+
+    # Claim the close atomically. Reading the status and then writing it in a
+    # separate statement leaves a window where two callers both see 'open' and
+    # both run the whole aggregate-and-advance path; the loser then fails on the
+    # rounds-table UNIQUE constraint, which reaches a blameless worker as a 500.
+    # The conditional UPDATE makes exactly one caller the winner, and it is the
+    # same write that fences off late submissions with a clean 409.
+    with immediate(conn):
+        claimed = conn.execute(
+            """UPDATE rounds SET status = 'closing'
+               WHERE run_id = ? AND idx = ? AND status = 'open'""",
+            (run_id, round_idx),
+        ).rowcount
+    if not claimed:
+        return None
 
     run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
     rnd = conn.execute(
         "SELECT * FROM rounds WHERE run_id = ? AND idx = ?", (run_id, round_idx)
     ).fetchone()
-    if rnd is None or rnd["status"] != "open":
-        raise ValueError(f"round {run_id}/{round_idx} is not open")
-
-    # Move to 'closing' first. A worker that submits between this write and the
-    # end of aggregation gets a clean 409 rather than having its work silently
-    # dropped from a round that was already being averaged.
-    with immediate(conn):
-        conn.execute(
-            "UPDATE rounds SET status = 'closing' WHERE run_id = ? AND idx = ?",
-            (run_id, round_idx),
-        )
 
     subs = conn.execute(
         """SELECT s.*, t.worker_id FROM submissions s
@@ -172,7 +195,7 @@ def close_round(
 
     # Gate 4: cohort-relative outlier rejection, only meaningful now.
     if adapters:
-        norm_results = aggregate.check_norms(adapters, k=5.0)
+        norm_results = aggregate.check_norms(adapters, k=norm_k)
         surviving, surviving_subs = [], []
         for adapter, sub, res in zip(adapters, kept, norm_results, strict=True):
             if res.accepted:
@@ -200,7 +223,7 @@ def close_round(
 
     if adapters:
         weights = aggregate.dense_weights(
-            [int(s["steps_completed"]) for s in kept], keys, cap=2.0
+            [int(s["steps_completed"]) for s in kept], keys, cap=cap
         )
         momentum = None
         if run["outer_momentum_ref"]:
@@ -273,7 +296,11 @@ def close_round(
 
 
 def maybe_close(
-    conn: sqlite3.Connection, store: Store, run_id: str, now: datetime | None = None
+    conn: sqlite3.Connection,
+    store: Store,
+    run_id: str,
+    now: datetime | None = None,
+    settings=None,
 ) -> CloseResult | None:
     """Evaluate the close rule for a run's current round and act on it.
 
@@ -290,7 +317,7 @@ def maybe_close(
     idx = int(run["current_round"])
     close, reason = rounds.should_close(conn, run_id, idx, now)
     if close:
-        return close_round(conn, store, run_id, idx, reason, now)
+        return close_round(conn, store, run_id, idx, reason, now, settings)
 
     # Backstop reached with nothing submitted: restart the clock, silently.
     rounds.reopen_empty_round(conn, run_id, idx, now)

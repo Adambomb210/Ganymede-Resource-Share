@@ -45,6 +45,13 @@ COLD_START_STEPS_PER_MIN = 3.0
 # The conservative arm of the 5.2 A/B: lr_outer = 1, beta = 0 reduces the outer step
 # to a plain weighted mean. Both modes ship; a fresh run gets this one until M4 says
 # the momentum variant is better on LoRA adapters specifically.
+# Gate 4's tolerance and the aggregation dominance cap. Named here rather than
+# written into the call sites so that GANYMEDE_NORM_REJECT_K and
+# GANYMEDE_DOMINANCE_CAP are actually reachable from a deployment -- a tunable
+# nobody reads is worse than no tunable, because the operator believes it works.
+DEFAULT_NORM_REJECT_K = 5.0
+DEFAULT_DOMINANCE_CAP = 2.0
+
 DEFAULT_COMBINE_MODE = "mean"
 DEFAULT_LR_OUTER = 1.0
 DEFAULT_OUTER_MOMENTUM = 0.9  # only consulted when combine mode is "diloco"
@@ -113,8 +120,8 @@ class Settings:
             est_download_sec=_env_int("GANYMEDE_EST_DOWNLOAD_SEC", 60),
             est_upload_sec=_env_int("GANYMEDE_EST_UPLOAD_SEC", 30),
             safety_margin_sec=_env_int("GANYMEDE_SAFETY_MARGIN_SEC", 60),
-            norm_reject_k=_env_float("GANYMEDE_NORM_REJECT_K", 5.0),
-            dominance_cap=_env_float("GANYMEDE_DOMINANCE_CAP", 2.0),
+            norm_reject_k=_env_float("GANYMEDE_NORM_REJECT_K", DEFAULT_NORM_REJECT_K),
+            dominance_cap=_env_float("GANYMEDE_DOMINANCE_CAP", DEFAULT_DOMINANCE_CAP),
             throughput_floor_frac=_env_float("GANYMEDE_THROUGHPUT_FLOOR", 0.10),
             gc_keep_rounds=_env_int("GANYMEDE_GC_KEEP_ROUNDS", 3),
         )

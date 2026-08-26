@@ -278,7 +278,7 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         expected = closer.expected_manifest(store, rnd["base_adapter_ref"])
         accepted, reason = closer.gate_submission(conn, store, task_id, expected)
 
-        result = closer.maybe_close(conn, store, task["run_id"])
+        result = closer.maybe_close(conn, store, task["run_id"], settings=settings)
         return {
             "accepted": accepted,
             "reject_reason": reason,
