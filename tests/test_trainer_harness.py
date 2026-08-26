@@ -177,3 +177,59 @@ def test_only_the_first_seed_carries_the_smoke_set(run_cfg, tiny_rows, tiny_mode
     assert result["per_seed"][1]["smoke"] is None
     assert len(result["per_seed"][0]["smoke"]) == len(__import__(
         "ganymede.trainer.evaluate", fromlist=["SMOKE_PROMPTS"]).SMOKE_PROMPTS)
+
+
+# --------------------------------------------------------------------------
+# The throughput feedback loop, both directions
+# --------------------------------------------------------------------------
+
+
+def test_submitted_metrics_carry_the_key_the_coordinator_folds_throughput_by(
+    tiny_model_dir, tiny_lora_cfg, tiny_rows, conn, seeded_run
+):
+    """``closer.close_round`` folds a submission's throughput in only when
+    *both* ``steps_per_min`` and ``gpu_model`` are present.
+
+    Omitting ``gpu_model`` fails silently in the worst way: every round still
+    closes, every submission is still accepted, and the estimate simply never
+    updates -- so budgets stay at the cold-start guess for the life of the run
+    and nothing anywhere reports a problem.
+    """
+    from ganymede.coordinator import aggregate
+    from ganymede.trainer import model as M
+    from ganymede.trainer import train as T
+    from scripts.newrun import build_seed_adapter
+
+    run_id = seeded_run(run_id="fb")
+    task = T.Task(
+        task_id="fb", run_id=run_id, round_idx=0, base_model=tiny_model_dir,
+        base_precision="fp32", lora_cfg=tiny_lora_cfg, dataset_ref="hf://unused",
+        buckets=[0], num_buckets=8,
+        hyperparams={"seq_len": 32, "micro_batch": 2, "grad_accum": 1,
+                     "eval_size": 40, "data_seed": 5, "gradient_checkpointing": False},
+        local_steps=2, seed=3,
+    )
+    seed_bytes = aggregate.save_adapter(build_seed_adapter(tiny_model_dir, tiny_lora_cfg))
+    metrics = T.run_task(task, seed_bytes, rows=tiny_rows, device=CPU).metrics
+
+    assert metrics["gpu_model"] == M.device_name(CPU)
+    assert metrics["steps_per_min"] > 0
+
+    # Exactly what close_round does with them.
+    rounds.update_throughput(conn, run_id, metrics["gpu_model"], float(metrics["steps_per_min"]))
+    stored = conn.execute(
+        "SELECT gpu_model, steps_per_min FROM throughput WHERE run_id = 'fb'"
+    ).fetchone()
+    assert stored["gpu_model"] == metrics["gpu_model"]
+
+
+def test_calibration_and_the_trainer_name_the_same_device_identically(tiny_model_dir):
+    """The two halves of the loop must agree on the join key.
+
+    Calibration writes ``throughput[<name>]``; the trainer reports
+    ``gpu_model`` for the coordinator to fold in; a worker reports
+    ``device_name`` when it claims. One implementation, so they cannot drift.
+    """
+    from ganymede.trainer import model as M
+
+    assert C.describe_device(CPU)["name"] == M.device_name(CPU)

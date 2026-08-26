@@ -62,24 +62,23 @@ DEFAULT_MEASURE_STEPS = 12
 def describe_device(device: torch.device) -> dict[str, Any]:
     """What the coordinator keys throughput on, plus enough to debug a surprise.
 
-    ``name`` must match what a worker reports as ``device_name`` in its
-    ``compute_profile`` (6.9), because that string is the join key between this
-    file and ``rounds.claim_task``. Both read ``torch.cuda.get_device_name``, so
-    they agree by construction rather than by convention.
+    ``name`` comes from ``model.device_name``, the single implementation shared
+    with the trainer's submitted metrics and with what a worker reports as
+    ``device_name`` in its ``compute_profile`` (6.9). That string is the join key
+    between this file and ``rounds.claim_task``.
     """
     info: dict[str, Any] = {
         "type": device.type,
         "torch": torch.__version__,
         "platform": f"{platform.system()} {platform.machine()}",
     }
+    info["name"] = model_mod.device_name(device)
     if device.type == "cuda":
         props = torch.cuda.get_device_properties(device)
-        info["name"] = torch.cuda.get_device_name(device)
         info["vram_gb"] = round(props.total_memory / 1024**3, 2)
         info["capability"] = f"{props.major}.{props.minor}"
         info["driver"] = torch.version.cuda
     else:
-        info["name"] = f"cpu:{platform.processor() or platform.machine()}"
         info["vram_gb"] = None
     return info
 

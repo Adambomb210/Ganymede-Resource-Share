@@ -24,6 +24,8 @@ and disappear when it isn't.
 | Path | What it is |
 |---|---|
 | `ganymede/coordinator/` | The coordinator: API, round state machine, aggregation, storage |
+| `ganymede/trainer/` | The trainer a worker runs, plus the calibration and baseline harnesses |
+| `configs/` | Run configs — one file feeds calibrate, baseline and `newrun` alike |
 | `scripts/` | Admin CLI — create a run, issue a key, GC, backup |
 | `deploy/` | Container image, compose file, env template |
 | `tests/` | Unit tests per module, plus a fake-worker integration suite |
@@ -42,6 +44,26 @@ and disappear when it isn't.
 | `closer.py` | Gating, aggregation, publishing the next round's base adapter |
 | `app.py` | The HTTP surface |
 
+### Trainer modules
+
+| Module | Responsibility |
+|---|---|
+| `data.py` | Dataset resolution, bucketing, prompt format, loss masking. No model — pure enough to test in milliseconds |
+| `model.py` | Base loading at the run's pinned precision, LoRA attach, adapter serialization |
+| `train.py` | `run_task` and the one optimizer loop the baseline shares |
+| `evaluate.py` | Held-out loss and the 20-prompt greedy smoke set |
+| `calibrate.py` | `ganymede-calibrate` — fit probe, throughput, recommended `local_steps` |
+| `baseline.py` | `ganymede-baseline` — multi-seed single-node reference for M4 |
+
+The trainer's stack (`transformers`, `peft`, `datasets`) is an optional extra, not a
+base dependency: the coordinator never loads a base model — `newrun.py` derives the
+adapter manifest from `config.json` on a meta device — and the coordinator box is the
+one machine in the system that should stay small.
+
+```sh
+pip install -e '.[trainer]'      # only on machines that train
+```
+
 ## Development
 
 ```sh
@@ -52,6 +74,12 @@ python3 -m pytest tests/ -q
 The integration suite runs against an in-memory object store, so it needs no
 containers. `tests/test_store.py` exercises the real S3 path against MinIO in
 Docker and skips cleanly when Docker is unavailable.
+
+The trainer suite is offline too: it trains a genuine 107k-parameter `Qwen3ForCausalLM`
+with a real tokenizer, built in the fixture. Same architecture as the bring-up model,
+so target modules, parameter naming and shapes are all the production ones — at a size
+where a full run costs milliseconds. The claims that need a real model live in
+`tests/test_trainer_cpu.py` behind `-m slow`.
 
 ## v1 scope
 

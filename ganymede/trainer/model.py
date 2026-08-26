@@ -17,6 +17,7 @@ names are what we write.
 
 from __future__ import annotations
 
+import platform
 from typing import Any
 
 import torch
@@ -41,6 +42,27 @@ def pick_device(prefer: str | None = None) -> torch.device:
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def device_name(device: torch.device) -> str:
+    """The string throughput is keyed by, everywhere it is keyed.
+
+    This is a join key, not a label. ``closer.close_round`` folds a submission's
+    ``steps_per_min`` into ``throughput[gpu_model]``; ``rounds.claim_task`` looks
+    the next budget up by the worker's reported ``device_name``; and
+    ``ganymede-calibrate`` writes ``throughput[<name>]`` into calibration.json.
+    All three must produce the identical string for the same card or the lookups
+    silently miss -- and a miss is invisible, because the coordinator simply
+    falls back to the cold-start guess forever and the only symptom is step
+    budgets that never improve.
+
+    One function, so they agree by construction rather than by convention.
+    """
+    if device.type == "cuda":
+        return torch.cuda.get_device_name(device)
+    if device.type == "mps":
+        return "mps:apple-silicon"
+    return f"cpu:{platform.processor() or platform.machine()}"
 
 
 def load_base(base_model: str, precision: str, device: torch.device | None = None):

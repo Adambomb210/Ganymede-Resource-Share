@@ -450,3 +450,116 @@ def test_newrun_refuses_a_partition_that_cannot_exist(tiny_base_model, settings,
                         dataset_rows=200, eval_size=100)
     assert newrun.main(argv, settings=settings, store=store) == 1
     assert "fewer than one row" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# --from-config: one file for calibrate, baseline and newrun
+# --------------------------------------------------------------------------
+
+
+def _run_config(base_model: str, **overrides) -> dict:
+    cfg = {
+        "run_id": "fromcfg",
+        "base_model": base_model,
+        "base_precision": "bf16",
+        "lora_cfg": {"rank": 4, "alpha": 8, "dropout": 0.05,
+                     "target_modules": TARGET_MODULES.split(",")},
+        "dataset_ref": "hf://databricks/databricks-dolly-15k",
+        "dataset_rows": 1000,
+        "num_buckets": 5,
+        "hyperparams": {"lr": 3e-4, "micro_batch": 2, "grad_accum": 4,
+                        "eval_size": 100, "data_seed": 77, "prompt_format": "dolly-v1"},
+        "target_rounds": 3, "target_steps": 100,
+        "min_round_sec": 0, "max_round_sec": 60,
+        "classification": "open",
+    }
+    cfg.update(overrides)
+    return cfg
+
+
+def test_a_run_config_can_replace_every_flag(tiny_base_model, settings, store, tmp_path):
+    """Calibrating one configuration and creating a run from another is a
+    mistake with no symptom -- the run trains, its budgets are just sized for a
+    model nobody measured. One file for all three tools removes the chance."""
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps(_run_config(tiny_base_model)))
+
+    assert newrun.main(["--from-config", str(path)], settings=settings, store=store) == 0
+
+    conn = sqlite3.connect(settings.db_path)
+    row = conn.execute(
+        "SELECT base_model, base_precision, num_buckets, lora_cfg_json, hyperparams_json "
+        "FROM runs WHERE id = 'fromcfg'").fetchone()
+    assert row[0] == tiny_base_model
+    assert row[1] == "bf16"
+    assert row[2] == 5
+    assert json.loads(row[3])["rank"] == 4
+    hp = json.loads(row[4])
+    assert hp["lr"] == 3e-4
+    assert hp["data_seed"] == 77
+    assert hp["samples_per_bucket"] == (1000 - 100) // 5
+
+
+def test_explicit_flags_beat_the_config_file(tiny_base_model, settings, store, tmp_path):
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps(_run_config(tiny_base_model)))
+
+    assert newrun.main(
+        ["--from-config", str(path), "--run-id", "flagwins", "--num-buckets", "10"],
+        settings=settings, store=store,
+    ) == 0
+
+    conn = sqlite3.connect(settings.db_path)
+    n = conn.execute("SELECT num_buckets FROM runs WHERE id = 'flagwins'").fetchone()[0]
+    assert n == 10
+    hp = json.loads(conn.execute(
+        "SELECT hyperparams_json FROM runs WHERE id = 'flagwins'").fetchone()[0])
+    assert hp["samples_per_bucket"] == (1000 - 100) // 10  # rederived, not copied
+
+
+def test_a_stale_samples_per_bucket_in_the_file_is_ignored(tiny_base_model, settings, store, tmp_path):
+    """It is a derived value. Trusting the file would let an edit to
+    ``num_buckets`` that forgot to update it mis-size every budget in the run."""
+    cfg = _run_config(tiny_base_model, run_id="stale")
+    cfg["hyperparams"]["samples_per_bucket"] = 99999
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps(cfg))
+
+    assert newrun.main(["--from-config", str(path)], settings=settings, store=store) == 0
+
+    conn = sqlite3.connect(settings.db_path)
+    hp = json.loads(conn.execute(
+        "SELECT hyperparams_json FROM runs WHERE id = 'stale'").fetchone()[0])
+    assert hp["samples_per_bucket"] == (1000 - 100) // 5
+
+
+def test_missing_settings_are_listed_by_flag_name(settings, store, capsys):
+    assert newrun.main(["--run-id", "nope"], settings=settings, store=store) == 1
+    err = capsys.readouterr().err
+    assert "--base-model" in err and "--dataset-rows" in err
+
+
+def test_an_unreadable_config_fails_before_touching_the_database(settings, store, capsys):
+    assert newrun.main(["--from-config", "/nonexistent/run.json"],
+                       settings=settings, store=store) == 1
+    assert "--from-config" in capsys.readouterr().err
+
+
+def test_the_checked_in_bringup_config_is_self_consistent():
+    """``samples_per_bucket`` in the file is documentation of a derived value.
+    If it drifts from what plan_partition computes, the file is stale and a
+    reader would be misled about how the corpus is actually split."""
+    import pathlib
+
+    from ganymede.trainer import data as data_mod
+
+    for name in ("bringup-1.7b.json", "cpu-probe-0.6b.json"):
+        cfg = json.loads((pathlib.Path("configs") / name).read_text())
+        partition = data_mod.plan_partition(
+            n_rows=cfg["dataset_rows"], num_buckets=cfg["num_buckets"],
+            eval_size=cfg["hyperparams"]["eval_size"],
+            data_seed=cfg["hyperparams"]["data_seed"],
+        )
+        assert cfg["hyperparams"]["samples_per_bucket"] == partition.samples_per_bucket, name
+        # 6.10's band: below ~100 a worker's shard is statistical noise.
+        assert 100 <= partition.samples_per_bucket <= 500, name

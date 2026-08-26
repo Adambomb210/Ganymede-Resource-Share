@@ -29,18 +29,40 @@ there is no recovery path. It's what goes into a worker's `GANYMEDE_KEY`.
 
 ```
 docker compose exec coordinator python3 -m scripts.newrun \
+    --from-config configs/bringup-1.7b.json
+```
+
+Use the **same file** you calibrated with. Calibrating one configuration and
+then creating a run from a slightly different one is a mistake with no symptom:
+the run trains normally, its budgets are simply sized for a model nobody
+measured. Individual flags still work and override the file, so
+`--from-config ... --run-id my-second-run` is the usual way to start another.
+
+Everything can also be passed as flags, without a config file:
+
+```
+docker compose exec coordinator python3 -m scripts.newrun \
     --run-id my-first-run \
     --base-model Qwen/Qwen3-1.7B-Base --base-precision bf16 \
-    --dataset dolly15k --num-buckets 64 --target-rounds 20 \
+    --dataset hf://databricks/databricks-dolly-15k \
+    --dataset-rows 15011 --eval-size 750 --data-seed 20260826 \
+    --num-buckets 64 --target-rounds 20 \
     --target-steps 2000 --min-round-sec 300 --max-round-sec 2400 \
     --lora-r 16 --lora-alpha 32 --lora-dropout 0.05 \
     --target-modules q_proj,k_proj,v_proj,o_proj
 ```
 
+`--dataset-rows`, `--eval-size` and `--data-seed` are not optional detail: they
+define the partition every worker re-derives for itself (§4.6), and
+`samples_per_bucket` -- which every step budget in the run is arithmetic over --
+is computed from them. `ganymede-calibrate` reports the row count as
+`run.dataset_rows`.
+
 Building the seed adapter only fetches the base model's `config.json` -- not
 its weights -- but the container does need outbound network access to
-HuggingFace for that one request. Use `--dry-run` first to sanity-check the
-adapter (tensor count, size) without writing anything.
+HuggingFace for that one request. `--dry-run` sanity-checks a config (tensor
+count, adapter size, bucket sizes) without writing anything, and without
+needing a configured coordinator -- so it works before you have one deployed.
 
 ## What to change for a real deployment
 

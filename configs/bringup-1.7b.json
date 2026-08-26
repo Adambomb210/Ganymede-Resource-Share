@@ -1,0 +1,33 @@
+{
+  "run_id": "bringup-1",
+  "base_model": "Qwen/Qwen3-1.7B-Base",
+  "base_precision": "bf16",
+  "lora_cfg": {
+    "rank": 16,
+    "alpha": 32,
+    "dropout": 0.05,
+    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"]
+  },
+  "dataset_ref": "hf://databricks/databricks-dolly-15k",
+  "dataset_rows": 15011,
+  "num_buckets": 64,
+  "hyperparams": {
+    "lr": 2e-4,
+    "weight_decay": 0.0,
+    "max_grad_norm": 1.0,
+    "seq_len": 1024,
+    "micro_batch": 2,
+    "grad_accum": 8,
+    "prompt_format": "dolly-v1",
+    "completion_only": true,
+    "eval_size": 750,
+    "data_seed": 20260826,
+    "samples_per_bucket": 222,
+    "target_passes": 1.0
+  },
+  "target_rounds": 20,
+  "target_steps": 2000,
+  "min_round_sec": 300,
+  "max_round_sec": 900,
+  "classification": "open"
+}

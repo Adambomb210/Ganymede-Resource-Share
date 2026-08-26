@@ -35,10 +35,16 @@ LORA_CFG = {"rank": 8, "alpha": 16, "dropout": 0.05,
             "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"]}
 CPU = torch.device("cpu")
 
+# Tuned for a CPU smoke run, not for quality. seq_len 256 covers the large
+# majority of Dolly responses and halves the cost of every forward; the higher
+# learning rate makes 20 steps produce a movement in held-out loss that is
+# unambiguously larger than eval noise. The real recipe lives in
+# configs/bringup-1.7b.json.
 HYPERPARAMS = {
-    "lr": 2e-4, "seq_len": 512, "micro_batch": 2, "grad_accum": 4,
+    "lr": 5e-4, "seq_len": 256, "micro_batch": 2, "grad_accum": 4,
     "eval_size": 750, "data_seed": 20260826, "gradient_checkpointing": False,
 }
+EVAL_EXAMPLES = 24
 
 
 @pytest.fixture(scope="module")
@@ -75,24 +81,25 @@ def test_training_lowers_held_out_loss(dolly):
         task_id="cpu-descent", run_id="cpu", round_idx=0,
         base_model=BASE_MODEL, base_precision="fp32", lora_cfg=LORA_CFG,
         dataset_ref=DATASET, buckets=[3, 17, 42], num_buckets=64,
-        hyperparams=HYPERPARAMS, local_steps=24, seed=7,
+        hyperparams=HYPERPARAMS, local_steps=20, seed=7,
     )
     seed_bytes = aggregate.save_adapter(build_seed_adapter(BASE_MODEL, LORA_CFG))
     partition = D.plan_partition(
         n_rows=len(dolly), num_buckets=64,
         eval_size=HYPERPARAMS["eval_size"], data_seed=HYPERPARAMS["data_seed"],
     )
-    held_out = partition.eval_indices()[:64]
+    held_out = partition.eval_indices()[:EVAL_EXAMPLES]
 
+    # One model load, two evaluations: the adapter is swapped in place. Loading
+    # a 0.6B model on CPU is ~100 s, which would otherwise be most of this
+    # test's runtime, paid three times instead of once.
     tokenizer = M.load_tokenizer(BASE_MODEL)
+    scorer = M.attach_lora(M.load_base(BASE_MODEL, "fp32", device=CPU), LORA_CFG)
 
     def held_out_loss_of(adapter_bytes: bytes) -> float:
-        base = M.load_base(BASE_MODEL, "fp32", device=CPU)
-        peft_model = M.attach_lora(
-            base, LORA_CFG, init_from=aggregate.load_adapter(adapter_bytes)
-        )
+        M.load_lora_state(scorer, aggregate.load_adapter(adapter_bytes))
         return E.held_out_loss(
-            peft_model, tokenizer, dolly, held_out,
+            scorer, tokenizer, dolly, held_out,
             seq_len=HYPERPARAMS["seq_len"], micro_batch=2, device=CPU,
         ).loss
 
@@ -100,7 +107,7 @@ def test_training_lowers_held_out_loss(dolly):
     result = T.run_task(task, seed_bytes, rows=dolly, device=CPU)
     after = held_out_loss_of(result.adapter_bytes)
 
-    assert result.steps == 24
+    assert result.steps == 20
     assert after < before, f"held-out loss did not improve: {before:.4f} -> {after:.4f}"
 
 

@@ -353,6 +353,11 @@ def run_task(
         "loss_tail_mean": round(sum(losses[-10:]) / len(losses[-10:]), 5) if losses else None,
         "stopped_early": stopped_early,
         "device": device.type,
+        # closer.close_round folds throughput back in only when *both*
+        # steps_per_min and gpu_model are present; without this key the
+        # measured-throughput feedback loop never engages and every budget in
+        # the run stays at the cold-start guess.
+        "gpu_model": model_mod.device_name(device),
         "base_precision": task.base_precision,
     }
 

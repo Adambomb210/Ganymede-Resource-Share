@@ -400,29 +400,68 @@ Note step 3 has no version check. That is deliberate — see Finding E and §7.
 
 ### 4.3 The trainer
 
-`transformers` + `peft` + a hand-written loop, ~250 lines. Owns the sync boundary
-explicitly:
+`transformers` + `peft` + a hand-written loop. Owns the sync boundary explicitly:
 
 ```python
-def run_task(task, base_adapter_bytes, on_step, should_stop):
+def run_task(task, base_adapter_bytes, on_step, should_stop) -> TrainResult:
+    rows      = resolve_dataset(task.dataset_ref)
+    partition = plan_partition(len(rows), task.num_buckets,
+                               hp.eval_size, hp.data_seed)   # see 4.6
     model = load_base(task.base_model, precision=task.base_precision)  # cached
     model = attach_lora(model, task.lora_cfg, init_from=base_adapter_bytes)
-    opt   = AdamW(lora_params(model), lr=task.hyperparams.lr)  # fresh each round
-    data  = load_buckets(task.dataset_ref, task.buckets, seed=task.seed)
+    opt   = AdamW(lora_params(model), lr=hp.lr)              # fresh each round
+    data  = micro_batches(partition.rows_for(task.buckets),
+                          hp.micro_batch, seed=task.seed)
 
-    for step, batch in enumerate(data):
-        if step >= task.local_steps or should_stop():
+    for step in range(task.local_steps):
+        if should_stop() or elapsed() > task.max_runtime_sec:
             break
-        loss = model(**batch).loss
-        loss.backward(); opt.step(); opt.zero_grad()
-        on_step(step, loss.item())
+        for _ in range(hp.grad_accum):                       # one optimizer step
+            loss = model(**next(data)).loss
+            (loss / hp.grad_accum).backward()
+        clip_grad_norm_(lora_params(model), hp.max_grad_norm)
+        opt.step(); opt.zero_grad()
+        on_step(step, loss)
 
-    return save_lora_safetensors(model), step, metrics
+    return TrainResult(save_lora_safetensors(model), step, metrics)
 ```
+
+Implemented in `ganymede/trainer/`. Three details the sketch makes explicit, because
+each is a correctness issue rather than a style choice:
+
+- **A step is an optimizer step, not a micro-batch.** The round closes on accumulated
+  steps (§3.2) and `budget.plan_budget` reads `samples_per_step = micro_batch *
+  grad_accum`. Counting micro-batches would inflate both the close and the throughput
+  estimate by `grad_accum` — two errors that partly cancel, which is the worst way for
+  it to be wrong.
+- **The loss is divided by `grad_accum` before `backward()`**, so the accumulated
+  gradient is the mean over the effective batch rather than its sum. Without it the
+  effective learning rate scales with `grad_accum`, and a run's `lr` would quietly mean
+  something different on a 24 GB card than on a 12 GB one.
+- **`steps_per_min` in the returned metrics excludes model load.** The coordinator
+  multiplies it by usable seconds, so it must be a *rate*; a figure blended with a
+  fixed setup cost mis-sizes budgets by an amount that depends on round length. Setup
+  is reported separately as `setup_sec`, and `GANYMEDE_SAFETY_MARGIN_SEC` is the
+  setting that has to cover it.
 
 Inner optimizer state is **not** carried across rounds — that's standard DiLoCo: fresh
 inner optimizer each round, momentum lives only in the outer step on the coordinator.
 It also means nothing optimizer-shaped needs to survive preemption.
+
+#### Prompt formatting and loss masking
+
+The bring-up model is a **base** model, so there is no chat template and the format is
+ours to define. It is therefore *named and versioned* (`prompt_format: "dolly-v1"`)
+rather than inlined: the M0 baseline and the M4 distributed run must be formatted
+identically or the comparison measures the format change instead of the aggregation,
+and a format living as an f-string in two files will eventually differ in one.
+
+Loss is **completion-only** by default — prompt tokens are masked out. One non-obvious
+consequence: truncation must cut the *prompt* from the left, never the completion.
+Right-truncating the concatenation, which is the obvious implementation, removes the
+completion entirely on a long example and leaves every label masked; cross-entropy over
+zero unmasked tokens is a NaN, and one NaN micro-batch poisons the whole accumulated
+optimizer step.
 
 ### 4.4 Stopping cleanly
 
@@ -487,6 +526,44 @@ infer it.
 Stronger sandboxing (gVisor/Kata) stays deferred to Phase 2 — but note it's the host
 that's being protected here, and every v1 host is either yours or a person you vouch
 for.
+
+### 4.6 Bucketing: how a bucket index becomes rows
+
+The coordinator never sees the dataset. It sends a worker a list of bucket indices and
+the run's `num_buckets`, and the worker derives its own rows. So the mapping has to be a
+**pure function of values every party already holds** — `(dataset_ref, data_seed,
+eval_size, num_buckets)` — and must not depend on row content, on the machine, on the
+Python version, or on the iteration order of anything.
+
+Nothing in the system cross-checks this. Two workers that disagreed would both train,
+both submit, and both pass every acceptance gate; the run would silently be training on
+the wrong sharding.
+
+**The scheme:** permute `range(n_rows)` with `random.Random(data_seed)`, take the first
+`eval_size` as the held-out split, and slice the remainder into `num_buckets` **exactly
+equal** buckets. `samples_per_bucket = (n_rows - eval_size) // num_buckets`; the
+`n_train % num_buckets` leftover rows are dropped.
+
+Four decisions in that sentence, each load-bearing:
+
+| Decision | Alternative | Why this one |
+|---|---|---|
+| Permute-then-slice | `hash(row) % num_buckets` | Exact bucket sizes, so `samples_per_bucket` is a derived fact and every step budget is exact arithmetic over it. Content hashing also means a dataset revision that fixes a typo can move that row to another bucket, invisibly |
+| `random.Random` | `torch.randperm`, numpy | CPython's Mersenne Twister and the shuffle over it are documented stable across versions and platforms. Torch's RNG stream carries no such promise, and a container worker and a native Windows worker do not share a torch build (§4.1) |
+| Eval carved out **before** bucketing | Sample an eval set afterward | A held-out row that is also a training row makes held-out loss measure memorization — and it fails *upward*, looking better than a correct split |
+| Drop the remainder | Uneven final bucket | At most `num_buckets - 1` rows (53 of 15,011 at bring-up, 0.4%) buys exact equality, which is what the budget arithmetic needs |
+
+`samples_per_bucket` is therefore **derived, never chosen**. `scripts/newrun.py`
+computes it by calling `plan_partition` itself rather than reimplementing the formula,
+so the coordinator's budgets and the workers' rows cannot drift apart.
+
+The stream **cycles** rather than stopping when a shard is exhausted, reshuffling each
+pass. A worker is budgeted a number of steps; stopping early because the shard ran out
+would under-deliver against that budget and stall the round with no error anywhere.
+`plan_budget` sizes the bucket assignment to cover the budget in `target_passes`, so
+cycling is the exception — and when it happens the epoch count is reported in the
+submission metrics, since dataset exhaustion is the first thing to check if M4's
+convergence looks flat (§6.10).
 
 ---
 
@@ -1195,8 +1272,8 @@ GPU affects platform reliability scoring (Review Finding M).
   "job_type": "llm_finetune",
   "required_image": "ganymede/worker-llm:v3",
 
-  "base_model": "meta-llama/Meta-Llama-3.1-8B",
-  "base_precision": "nf4",
+  "base_model": "Qwen/Qwen3-1.7B-Base",
+  "base_precision": "bf16",
   "lora_cfg": {
     "rank": 16,
     "alpha": 32,
@@ -1205,16 +1282,21 @@ GPU affects platform reliability scoring (Review Finding M).
   },
   "base_adapter_url": "https://…presigned-GET…",
 
-  "dataset_ref": "s3://ganymede/data/combat-robot-sim-v2",
+  "dataset_ref": "hf://databricks/databricks-dolly-15k",
   "buckets": [17, 143, 288, 401, 655],   // count scales with the budget — §3.4
-                                         // bucket total scales with dataset size
+  "num_buckets": 64,                     // the worker maps indices to rows itself
+  "seed": 1734021,                       // derived from (run, round, task) — §4.6
 
   "hyperparams": {
     "lr": 2e-4,
-    "seq_len": 2048,
+    "seq_len": 1024,
     "micro_batch": 2,
     "grad_accum": 8,
-    "seed": 20260825
+    "prompt_format": "dolly-v1",
+    "completion_only": true,
+    "eval_size": 750,                    // held out before bucketing — §4.6
+    "data_seed": 20260826,               // defines the partition; fixed per run
+    "samples_per_bucket": 222            // derived: (rows - eval_size) // buckets
   },
 
   "local_steps": 250,          // derived per-worker from throughput — §3.4
@@ -1228,6 +1310,14 @@ Changes from v1 §5: round binding, bucket sharding (I), pinned `base_precision`
 explicit `lora_cfg` (needed by the §5.1 shape gate), presigned base adapter URL, seed
 (L6), lease and heartbeat intervals (L1), and a per-worker `local_steps` budget rather
 than a run-wide constant (§3.4).
+
+**`num_buckets`, `seed` and the four data hyperparameters are not decoration.** The
+coordinator never sends the data, so a worker reconstructs its rows from
+`(dataset_ref, data_seed, eval_size, num_buckets)` and then shuffles them with `seed`
+(§4.6). Bucket indices without a bucket total are not an assignment. `seed` is derived
+as `blake2b(run_id/round_idx/task_id)` rather than drawn at random, so a retried task
+reproduces its own ordering and the derivation survives a coordinator restart —
+Python's `hash()` would not, since it salts string hashing per process.
 
 **Still true, and still the point:** everything here except `required_image` is
 mutable without a rebuild. v1 §8's change-management table holds unchanged — with the

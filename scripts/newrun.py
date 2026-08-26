@@ -112,25 +112,101 @@ def build_seed_adapter(
 # --------------------------------------------------------------------------
 
 
+# Defaults for the values a run config can supply. Kept here rather than in
+# argparse so that "the flag was not given" and "the flag was given its default"
+# stay distinguishable -- without that distinction an explicit --eval-size 0
+# would be indistinguishable from silence and the config would win over it.
+_CONFIG_DEFAULTS = {
+    "lora_dropout": 0.0,
+    "eval_size": 750,
+    "data_seed": 0,
+    "prompt_format": "dolly-v1",
+}
+
+# CLI destination -> key in the run config file.
+_CONFIG_KEYS = {
+    "run_id": "run_id",
+    "base_model": "base_model",
+    "base_precision": "base_precision",
+    "dataset_ref": "dataset_ref",
+    "dataset_rows": "dataset_rows",
+    "num_buckets": "num_buckets",
+    "target_rounds": "target_rounds",
+    "target_steps": "target_steps",
+    "min_round_sec": "min_round_sec",
+    "max_round_sec": "max_round_sec",
+    "data_classification": "classification",
+}
+
+_REQUIRED = (
+    "run_id", "base_model", "base_precision", "dataset_ref", "dataset_rows",
+    "num_buckets", "target_rounds", "target_steps", "min_round_sec",
+    "max_round_sec", "lora_r", "lora_alpha", "target_modules",
+)
+
+
+def _apply_run_config(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    """Fill unset arguments from a run config file, in place.
+
+    The same file feeds ``ganymede-calibrate`` and ``ganymede-baseline``. That is
+    the whole point: calibrating one configuration and then creating a run from a
+    slightly different one is a mistake with no symptom -- the run trains
+    normally, its budgets are simply sized for a model nobody measured.
+
+    Explicit flags win over the file, so a config can be reused with one value
+    nudged without editing it.
+    """
+    for dest, key in _CONFIG_KEYS.items():
+        if getattr(args, dest, None) is None and key in cfg:
+            setattr(args, dest, cfg[key])
+
+    lora = cfg.get("lora_cfg") or {}
+    if args.lora_r is None and "rank" in lora:
+        args.lora_r = int(lora["rank"])
+    if args.lora_alpha is None and "alpha" in lora:
+        args.lora_alpha = int(lora["alpha"])
+    if args.lora_dropout is None and "dropout" in lora:
+        args.lora_dropout = float(lora["dropout"])
+    if args.target_modules is None and "target_modules" in lora:
+        args.target_modules = ",".join(lora["target_modules"])
+
+    hp = cfg.get("hyperparams") or {}
+    for dest, key in (("eval_size", "eval_size"), ("data_seed", "data_seed"),
+                      ("prompt_format", "prompt_format")):
+        if getattr(args, dest) is None and key in hp:
+            setattr(args, dest, hp[key])
+
+    # The rest of hyperparams travels through untouched. samples_per_bucket is
+    # deliberately *not* taken from the file: it is recomputed from
+    # plan_partition below, so a stale file cannot mis-size the budgets.
+    merged = {k: v for k, v in hp.items() if k != "samples_per_bucket"}
+    merged.update(json.loads(args.hyperparams))
+    args.hyperparams = json.dumps(merged)
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python3 -m scripts.newrun",
         description="Create a new Ganymede run and mint round 0's seed adapter.",
     )
-    p.add_argument("--run-id", required=True)
-    p.add_argument("--base-model", required=True)
-    p.add_argument("--base-precision", required=True)
-    p.add_argument("--dataset", required=True, dest="dataset_ref")
-    p.add_argument("--num-buckets", type=int, required=True)
-    p.add_argument("--target-rounds", type=int, required=True)
-    p.add_argument("--target-steps", type=int, required=True)
-    p.add_argument("--min-round-sec", type=int, required=True)
-    p.add_argument("--max-round-sec", type=int, required=True)
-    p.add_argument("--lora-r", type=int, required=True)
-    p.add_argument("--lora-alpha", type=int, required=True)
-    p.add_argument("--lora-dropout", type=float, default=0.0)
     p.add_argument(
-        "--target-modules", required=True,
+        "--from-config", default=None,
+        help="run config JSON (see configs/README.md); explicit flags override it",
+    )
+    p.add_argument("--run-id", default=None)
+    p.add_argument("--base-model", default=None)
+    p.add_argument("--base-precision", default=None)
+    p.add_argument("--dataset", default=None, dest="dataset_ref")
+    p.add_argument("--num-buckets", type=int, default=None)
+    p.add_argument("--target-rounds", type=int, default=None)
+    p.add_argument("--target-steps", type=int, default=None)
+    p.add_argument("--min-round-sec", type=int, default=None)
+    p.add_argument("--max-round-sec", type=int, default=None)
+    p.add_argument("--lora-r", type=int, default=None)
+    p.add_argument("--lora-alpha", type=int, default=None)
+    p.add_argument("--lora-dropout", type=float, default=None)
+    p.add_argument(
+        "--target-modules", default=None,
         help="comma-separated, e.g. q_proj,k_proj,v_proj,o_proj",
     )
     p.add_argument(
@@ -153,14 +229,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     # of them mid-run repartitions the data under the workers, which is why
     # they belong to run creation and not to a later edit.
     p.add_argument(
-        "--dataset-rows", type=int, required=True,
+        "--dataset-rows", type=int, default=None,
         help="total rows in the dataset (ganymede-calibrate reports this as run.dataset_rows)",
     )
-    p.add_argument("--eval-size", type=int, default=750,
+    p.add_argument("--eval-size", type=int, default=None,
                    help="rows held out before bucketing; never trained on")
-    p.add_argument("--data-seed", type=int, default=0,
+    p.add_argument("--data-seed", type=int, default=None,
                    help="seed for the permutation that defines eval split and buckets")
-    p.add_argument("--prompt-format", default="dolly-v1",
+    p.add_argument("--prompt-format", default=None,
                    help="named format in ganymede.trainer.data.FORMATS")
     p.add_argument("--requires", default="{}", help="JSON object, budget.is_eligible shape")
     p.add_argument("--hyperparams", default="{}", help="JSON object merged into hyperparams_json")
@@ -192,11 +268,34 @@ def main(
     args = _build_arg_parser().parse_args(argv)
 
     try:
-        hyperparams = json.loads(args.hyperparams)
+        json.loads(args.hyperparams)
         requires = json.loads(args.requires)
     except json.JSONDecodeError as exc:
         print(f"error: --requires/--hyperparams must be valid JSON: {exc}", file=sys.stderr)
         return 1
+
+    if args.from_config:
+        try:
+            with open(args.from_config) as fh:
+                _apply_run_config(args, json.load(fh))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"error: --from-config: {exc}", file=sys.stderr)
+            return 1
+
+    for dest, fallback in _CONFIG_DEFAULTS.items():
+        if getattr(args, dest) is None:
+            setattr(args, dest, fallback)
+    if args.data_classification is None:
+        args.data_classification = "open"
+
+    missing = [d for d in _REQUIRED if getattr(args, d) is None]
+    if missing:
+        print("error: missing required settings: "
+              + ", ".join("--" + d.replace("_", "-") for d in missing)
+              + " (supply them as flags or in --from-config)", file=sys.stderr)
+        return 1
+
+    hyperparams = json.loads(args.hyperparams)
 
     target_modules = [m.strip() for m in args.target_modules.split(",") if m.strip()]
     if not target_modules:
@@ -232,6 +331,23 @@ def main(
             config_mod.DEFAULT_OUTER_MOMENTUM if args.combine_mode == "diloco" else 0.0
         )
 
+    # --dry-run validates a run config; making that require a configured
+    # coordinator (GANYMEDE_STORAGE_HOST and friends) would defeat the point,
+    # since the moment to check a config is before you have one deployed.
+    if args.dry_run:
+        adapter = build_seed_adapter(args.base_model, lora_cfg)
+        _print_summary({
+            "run_id": args.run_id,
+            "tensor_count": len(adapter),
+            "adapter_mb": len(save_adapter(adapter)) / (1024 * 1024),
+            "num_buckets": args.num_buckets,
+            "samples_per_bucket": partition.samples_per_bucket,
+            "dropped_rows": partition.dropped,
+            "round0_key": base_adapter_key(args.run_id, 0),
+            "dry_run": True,
+        })
+        return 0
+
     settings = settings or Settings.from_env()
     conn = connect(settings.db_path)
     init_schema(conn)
@@ -258,12 +374,8 @@ def main(
             "samples_per_bucket": partition.samples_per_bucket,
             "dropped_rows": partition.dropped,
             "round0_key": round0_key,
-            "dry_run": args.dry_run,
+            "dry_run": False,
         }
-
-        if args.dry_run:
-            _print_summary(summary)
-            return 0
 
         store = store or Store(settings.storage)
 

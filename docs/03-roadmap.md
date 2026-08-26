@@ -81,6 +81,84 @@ means re-running everything.
 
 ---
 
+## M0 status — built, minus what needs a GPU
+
+**Done, with one hard boundary.** Everything that can be written and mechanically
+validated without a GPU is written and validated. What is left is not code — it is
+*measurement*, and measurement needs the card.
+
+```
+ganymede/trainer/
+  data.py       dataset resolution, bucketing, prompt format, loss masking
+  model.py      base loading, LoRA attach, adapter serialization
+  train.py      run_task and the single optimizer loop
+  evaluate.py   held-out loss, the 20-prompt greedy smoke set
+  calibrate.py  ganymede-calibrate -> calibration.json
+  baseline.py   ganymede-baseline  -> baseline.json
+configs/
+  bringup-1.7b.json     the run: Qwen3-1.7B-Base, bf16, Dolly 15k, 64 buckets
+  cpu-probe-0.6b.json   Qwen3-0.6B-Base, for protocol testing without a GPU
+```
+
+| Exit criterion | State |
+|---|---|
+| Trainer runs, loss descends, adapter round-trips through safetensors | met on CPU — held-out loss falls on `Qwen3-0.6B-Base` over real Dolly, and the artifact passes the coordinator's own `check_structural` |
+| `ganymede-calibrate` produces a valid `calibration.json` | harness met; **the numbers need a GPU** |
+| The run fits the target card at the chosen `base_precision`, with headroom | **needs the card** — the fit probe is written and walks the ladder, but "does 1.7B bf16 fit a 12 GB 3060" is a question only the 3060 answers |
+| `baseline.json` exists with multiple seeds, mean and variance band | harness met; **the run needs a GPU** (~3.5 h/seed on CPU, and a CPU baseline is the wrong comparison anyway) |
+| ~20-prompt greedy smoke set exists, round-0 output recorded | set exists and generates; recording round 0 is one `--smoke-out` away from the baseline run |
+| Windows environment set up | **your machine** — long paths, `HF_HOME`, developer mode |
+
+Verified here rather than assumed: `Qwen/Qwen3-0.6B-Base` and
+`databricks/databricks-dolly-15k` (15,011 rows, CC BY-SA 3.0) are both current and
+fetchable; the bring-up config derives 64 × 222 samples with 53 rows dropped, and
+mints a 224-tensor, 24.53 MB adapter with **no weight download**, matching the sizes
+this document already claimed.
+
+### Three contract gaps, found by building M0 against M1's real output
+
+Each was invisible until the trainer was written against what the coordinator
+actually emits, and each would have failed quietly rather than loudly:
+
+1. **`num_buckets` and `seed` were missing from the claim payload.** The worker maps
+   bucket indices to rows itself — the coordinator never sees the data — so indices
+   without a total are not an assignment, and §4.3's loop referenced a `task.seed`
+   that was never sent. The M0 trainer could not have been written against M1's
+   output as it stood.
+2. **`claim_task` read `batch_size` for the budget; the task spec and the trainer
+   both say `micro_batch`.** A run config written for the trainer would have had the
+   coordinator sizing budgets for one effective batch while the worker trained with
+   another — wrong by exactly the ratio between them, in a number nothing
+   cross-checks.
+3. **`samples_per_bucket` defaulted to a hardcoded 234.** It is a fact about the
+   dataset. `newrun.py` now derives it by calling `plan_partition` itself rather than
+   reimplementing the formula, and a claim without it fails loudly instead of
+   silently mis-sizing every budget in the run.
+
+### The one design decision M0 had to settle
+
+**How a bucket index becomes rows** — now §4.6. Permute with `random.Random(data_seed)`,
+carve the eval split off the front, slice the rest into exactly-equal buckets. The
+alternative (`hash(row) % num_buckets`) gives approximate bucket sizes, and every step
+budget in the system is arithmetic over that size.
+
+### What genuinely needs your Windows + NVIDIA box
+
+| Blocked | Why it cannot be faked here |
+|---|---|
+| Real throughput numbers | A steps/min figure from CPU describes the CPU. Nothing in the system should read one |
+| The multi-seed baseline | M4 compares single-**GPU** against distributed-GPU; a CPU baseline answers a different question |
+| VRAM fit and `max_seq_len` | The probe is written; the answer is a property of the card |
+| `nf4` / `bitsandbytes` | CUDA-only. The trainer refuses the precision with a clear error rather than silently training at another one |
+
+The split is clean: this box supplies the harness and the proof that it runs; your
+machine supplies the numbers. Nothing in M1 or M2 waits on those numbers — the
+coordinator's cold-start default exists precisely so a run can start uncalibrated
+and converge on measured throughput within a round or two.
+
+
+---
+
 ## Bring-up model and dataset
 
 **Separate the model you're proving the system with from the model you actually want
@@ -207,7 +285,9 @@ with a known-good outcome, so that a bad result means your pipeline is wrong rat
 than your data. Verify the current licence on the dataset card before use; these
 change.
 
-**Buckets: 64** (~230 samples each), per the sizing rule below.
+**Buckets: 64** — exactly 222 samples each once the 750-row eval split is carved
+out first, with 53 rows dropped to keep every bucket equal (§4.6). Per the sizing
+rule below.
 
 A larger corpus will be wanted eventually, but that's an M4 question and not worth
 settling now. One caveat to carry forward when you get there: at 15k samples a round
@@ -318,7 +398,7 @@ for small datasets: 15k samples across 1000 buckets is 15 samples each, so a wor
 
 | Dataset size | Buckets | Samples/bucket |
 |---|---|---|
-| 15k | 64 | ~230 |
+| 15k | 64 | 222 (measured) |
 | 200k | 1000 | 200 |
 | 940k | 2048 | ~460 |
 
@@ -476,7 +556,7 @@ vastly faster than testing it against real GPUs.
 
 ## M1 status — built
 
-**Done.** 136 tests, nothing skipped, including the real-MinIO storage tests.
+**Done.** Now 228 tests with M0 alongside it, nothing skipped, including the real-MinIO storage tests.
 
 | Exit criterion | State |
 |---|---|

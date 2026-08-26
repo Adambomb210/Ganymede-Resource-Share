@@ -27,6 +27,36 @@ from ganymede.trainer import data as data_mod
 from ganymede.trainer import model as model_mod
 
 
+# Sequence positions scored at a time when upcasting logits to fp32. The upcast
+# is necessary -- summing cross-entropy in bf16 over hundreds of thousands of
+# tokens accumulates real error -- but doing it to a whole batch at once is an
+# out-of-memory waiting to happen: at Qwen3's 151k vocabulary, four sequences of
+# 1024 positions is 2.5 GB of fp32 logits for a *forward-only* pass. That lands
+# hardest exactly where eval is specified to run (docs/03-roadmap.md puts v1 eval
+# on the coordinator, which has no GPU and no reason to be a large machine).
+LOGIT_CHUNK = 128
+
+
+def _summed_nll(shift_logits, shift_labels, chunk: int) -> tuple[float, int]:
+    """Token-summed cross-entropy, upcasting a slice at a time."""
+    total = 0.0
+    n_tokens = 0
+    for start in range(0, shift_labels.shape[1], chunk):
+        piece_labels = shift_labels[:, start : start + chunk]
+        n = int((piece_labels != data_mod.IGNORE_INDEX).sum().item())
+        if n == 0:
+            continue  # an all-padding tail: skipping it also avoids a 0/0 NaN
+        piece = shift_logits[:, start : start + chunk, :].float()
+        total += float(torch.nn.functional.cross_entropy(
+            piece.reshape(-1, piece.size(-1)),
+            piece_labels.reshape(-1),
+            ignore_index=data_mod.IGNORE_INDEX,
+            reduction="sum",
+        ).item())
+        n_tokens += n
+    return total, n_tokens
+
+
 @dataclass
 class EvalResult:
     loss: float
@@ -56,6 +86,7 @@ def held_out_loss(
     completion_only: bool = True,
     device: torch.device | None = None,
     limit: int | None = None,
+    logit_chunk: int = LOGIT_CHUNK,
 ) -> EvalResult:
     """Token-weighted mean cross-entropy over the held-out split.
 
@@ -77,9 +108,9 @@ def held_out_loss(
     total_tokens = 0
     try:
         for start in range(0, len(indices), micro_batch):
-            chunk = indices[start : start + micro_batch]
+            batch_indices = indices[start : start + micro_batch]
             encoded = []
-            for i in chunk:
+            for i in batch_indices:
                 prompt, completion = formatter(rows[i])
                 encoded.append(
                     data_mod.encode_example(
@@ -98,16 +129,11 @@ def held_out_loss(
             # reading `out.loss`: that value is a mean over the batch's own
             # supervised tokens, and re-weighting a batch of means back into a
             # token-weighted total needs the token count anyway.
-            shift_logits = logits[:, :-1, :].float()
+            shift_logits = logits[:, :-1, :]
             shift_labels = labels[:, 1:]
-            nll = torch.nn.functional.cross_entropy(
-                shift_logits.reshape(-1, shift_logits.size(-1)),
-                shift_labels.reshape(-1),
-                ignore_index=data_mod.IGNORE_INDEX,
-                reduction="sum",
-            )
-            n_tokens = int((shift_labels != data_mod.IGNORE_INDEX).sum().item())
-            total_nll += float(nll.item())
+
+            nll, n_tokens = _summed_nll(shift_logits, shift_labels, logit_chunk)
+            total_nll += nll
             total_tokens += n_tokens
     finally:
         model.train(was_training)
