@@ -164,7 +164,7 @@ def seeded_run(conn, store):
         classification: str = "open",
         hyperparams: dict | None = None,
     ) -> str:
-        hp = {"batch_size": 8, "grad_accum": 1, "samples_per_bucket": 234,
+        hp = {"micro_batch": 8, "grad_accum": 1, "samples_per_bucket": 234,
               "target_passes": 1.0, "cold_start_steps_per_min": 30.0}
         hp.update(hyperparams or {})
         conn.execute(
@@ -210,3 +210,69 @@ def register_worker(client):
         assert resp.status_code == 200, resp.text
         return resp.json()["worker_id"]
     return _register
+
+
+# --------------------------------------------------------------------------
+# A real-but-tiny model, so the trainer is testable offline in milliseconds
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def tiny_model_dir(tmp_path_factory):
+    """A genuine Qwen3 checkpoint of ~107k parameters, with a real tokenizer.
+
+    This is the difference between a trainer test suite people run and one they
+    skip. The alternative -- ``Qwen/Qwen3-0.6B-Base`` -- needs a network round
+    trip and about a hundred seconds per load, which pushes every model-touching
+    test behind the ``slow`` marker and therefore out of the normal loop.
+
+    It is the *same architecture* the bring-up run uses (``Qwen3ForCausalLM``,
+    uniform full-attention layers), so the LoRA target modules, the parameter
+    naming, and the shapes of everything are the production ones. What it is not
+    is a model that can learn anything, so nothing here asserts about loss going
+    down; that claim needs the real model and lives in the slow suite.
+    """
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import AutoModelForCausalLM, PreTrainedTokenizerFast, Qwen3Config
+
+    path = tmp_path_factory.mktemp("tiny-qwen3")
+
+    vocab = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3}
+    vocab.update({f"w{i}": i + 4 for i in range(200)})
+    backend = Tokenizer(models.WordLevel(vocab=vocab, unk_token="<unk>"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="<unk>",
+        pad_token="<pad>", bos_token="<bos>", eos_token="<eos>",
+    ).save_pretrained(path)
+
+    AutoModelForCausalLM.from_config(
+        Qwen3Config(
+            vocab_size=len(vocab), hidden_size=64, intermediate_size=128,
+            num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+            head_dim=16, max_position_embeddings=128,
+            bos_token_id=1, eos_token_id=2, pad_token_id=0,
+        )
+    ).save_pretrained(path)
+
+    return str(path)
+
+
+@pytest.fixture
+def tiny_lora_cfg():
+    return {"rank": 4, "alpha": 8, "dropout": 0.0, "target_modules": ["q_proj", "v_proj"]}
+
+
+@pytest.fixture
+def tiny_rows():
+    """Synthetic rows in Dolly's shape, drawn from the tiny tokenizer's vocabulary."""
+    import random
+
+    rng = random.Random(0)
+    def words(n):
+        return " ".join(f"w{rng.randrange(200)}" for _ in range(n))
+
+    return [
+        {"instruction": words(6), "context": words(4) if i % 3 == 0 else "", "response": words(5)}
+        for i in range(400)
+    ]

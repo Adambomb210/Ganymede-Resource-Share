@@ -10,6 +10,7 @@ rather than fails when the Hub can't be reached.
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 
@@ -47,13 +48,16 @@ def tiny_base_model(tmp_path_factory) -> str:
     return str(d)
 
 
-def _newrun_argv(run_id: str, base_model: str, num_buckets: int = 5) -> list[str]:
+def _newrun_argv(run_id: str, base_model: str, num_buckets: int = 5,
+                 dataset_rows: int = 1000, eval_size: int = 100) -> list[str]:
     return [
         "--run-id", run_id,
         "--base-model", base_model,
         "--base-precision", "bf16",
         "--dataset", "dolly15k",
         "--num-buckets", str(num_buckets),
+        "--dataset-rows", str(dataset_rows),
+        "--eval-size", str(eval_size),
         "--target-rounds", "3",
         "--target-steps", "100",
         "--min-round-sec", "0",
@@ -378,3 +382,71 @@ def test_backup_copies_latest_result_and_momentum_refs(conn, store, settings) ->
     assert rc == 0
     assert dest.objects.get(result0) == b"result-0"
     assert dest.objects.get(mref) == b"momentum-bytes"
+
+
+# --------------------------------------------------------------------------
+# The data contract newrun derives (see ganymede/trainer/data.py)
+# --------------------------------------------------------------------------
+
+
+def test_newrun_derives_samples_per_bucket_from_the_real_partition(
+    tiny_base_model, settings, store, tmp_path
+):
+    """The coordinator's budget arithmetic reads this number, and the workers get
+    their rows from ``plan_partition``. Deriving it by *calling* plan_partition
+    rather than by reimplementing its arithmetic is what keeps them equal."""
+    from ganymede.trainer import data as data_mod
+
+    argv = _newrun_argv("spb", tiny_base_model, num_buckets=7,
+                        dataset_rows=1000, eval_size=90)
+    assert newrun.main(argv, settings=settings, store=store) == 0
+
+    conn = sqlite3.connect(settings.db_path)
+    hp = json.loads(conn.execute(
+        "SELECT hyperparams_json FROM runs WHERE id = 'spb'").fetchone()[0])
+
+    expected = data_mod.plan_partition(
+        n_rows=1000, num_buckets=7, eval_size=90, data_seed=0
+    ).samples_per_bucket
+    assert hp["samples_per_bucket"] == expected == (1000 - 90) // 7
+
+
+def test_newrun_stores_everything_a_worker_needs_to_rebuild_the_partition(
+    tiny_base_model, settings, store
+):
+    """``eval_size``, ``data_seed`` and ``prompt_format`` travel to every worker
+    inside ``hyperparams``. Without them a worker cannot reconstruct the split,
+    and the coordinator has no way to send the data itself."""
+    argv = _newrun_argv("contract", tiny_base_model) + [
+        "--data-seed", "4242", "--prompt-format", "dolly-v1",
+    ]
+    assert newrun.main(argv, settings=settings, store=store) == 0
+
+    conn = sqlite3.connect(settings.db_path)
+    hp = json.loads(conn.execute(
+        "SELECT hyperparams_json FROM runs WHERE id = 'contract'").fetchone()[0])
+    assert hp["eval_size"] == 100
+    assert hp["data_seed"] == 4242
+    assert hp["prompt_format"] == "dolly-v1"
+
+
+def test_explicit_hyperparams_win_over_the_derived_defaults(tiny_base_model, settings, store):
+    argv = _newrun_argv("override", tiny_base_model) + [
+        "--hyperparams", json.dumps({"samples_per_bucket": 11, "lr": 3e-4}),
+    ]
+    assert newrun.main(argv, settings=settings, store=store) == 0
+
+    conn = sqlite3.connect(settings.db_path)
+    hp = json.loads(conn.execute(
+        "SELECT hyperparams_json FROM runs WHERE id = 'override'").fetchone()[0])
+    assert hp["samples_per_bucket"] == 11
+    assert hp["lr"] == 3e-4
+
+
+def test_newrun_refuses_a_partition_that_cannot_exist(tiny_base_model, settings, store, capsys):
+    """More buckets than training rows is a run that could never dispatch a task;
+    better to say so at creation than to fail every claim."""
+    argv = _newrun_argv("impossible", tiny_base_model, num_buckets=500,
+                        dataset_rows=200, eval_size=100)
+    assert newrun.main(argv, settings=settings, store=store) == 1
+    assert "fewer than one row" in capsys.readouterr().err

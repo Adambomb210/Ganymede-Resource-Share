@@ -310,8 +310,23 @@ def claim_task(
             measured=tp_row["steps_per_min"] if tp_row else None,
             calibrated=calibrated,
             cold_start=hp.get("cold_start_steps_per_min", COLD_START_STEPS_PER_MIN),
-            samples_per_step=int(hp.get("batch_size", 8)) * int(hp.get("grad_accum", 1)),
-            samples_per_bucket=int(hp.get("samples_per_bucket", 234)),
+            # `micro_batch` is the name the task spec (8) and the trainer both
+            # use; `batch_size` is accepted only so run configs written before
+            # the trainer existed keep working. They must agree: the trainer
+            # reads micro_batch, so a run that set only batch_size would have
+            # the coordinator sizing budgets for one effective batch while the
+            # worker trained with another -- an error of exactly the ratio
+            # between them, in a number nothing else cross-checks.
+            samples_per_step=(
+                int(hp.get("micro_batch", hp.get("batch_size", 8)))
+                * int(hp.get("grad_accum", 1))
+            ),
+            # No default: samples_per_bucket is a fact about the dataset, and
+            # the coordinator never sees the dataset. newrun.py derives it from
+            # the same plan_partition the workers use and stores it here, so a
+            # run missing it is misconfigured rather than merely undecided --
+            # and a wrong bucket size silently mis-sizes every budget in the run.
+            samples_per_bucket=int(hp["samples_per_bucket"]),
             total_buckets=int(run["num_buckets"]),
             est_download_sec=settings.est_download_sec,
             est_upload_sec=settings.est_upload_sec,

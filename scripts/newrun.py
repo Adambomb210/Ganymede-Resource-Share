@@ -32,6 +32,7 @@ from ganymede.coordinator.aggregate import save_adapter
 from ganymede.coordinator.config import Settings
 from ganymede.coordinator.db import connect, immediate, init_schema
 from ganymede.coordinator.store import Store, base_adapter_key
+from ganymede.trainer import data as data_mod
 
 # The default seed for round 0's Kaiming-uniform init (see build_seed_adapter).
 # Fixed rather than random: a re-run of this script against the same base model
@@ -145,6 +146,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--classification", choices=["open", "internal", "restricted"],
         default="open", dest="data_classification",
     )
+    # --- the data contract (see ganymede/trainer/data.py) -------------------
+    # The coordinator never sees the dataset, so these four values are how a
+    # worker reconstructs the exact same partition. They are stored in
+    # hyperparams_json and passed through to every task verbatim; changing any
+    # of them mid-run repartitions the data under the workers, which is why
+    # they belong to run creation and not to a later edit.
+    p.add_argument(
+        "--dataset-rows", type=int, required=True,
+        help="total rows in the dataset (ganymede-calibrate reports this as run.dataset_rows)",
+    )
+    p.add_argument("--eval-size", type=int, default=750,
+                   help="rows held out before bucketing; never trained on")
+    p.add_argument("--data-seed", type=int, default=0,
+                   help="seed for the permutation that defines eval split and buckets")
+    p.add_argument("--prompt-format", default="dolly-v1",
+                   help="named format in ganymede.trainer.data.FORMATS")
     p.add_argument("--requires", default="{}", help="JSON object, budget.is_eligible shape")
     p.add_argument("--hyperparams", default="{}", help="JSON object merged into hyperparams_json")
     p.add_argument("--dry-run", action="store_true",
@@ -157,7 +174,8 @@ def _print_summary(summary: dict[str, Any]) -> None:
     print(f"run: {summary['run_id']}{tag}")
     print(f"  tensors:      {summary['tensor_count']}")
     print(f"  adapter size: {summary['adapter_mb']:.2f} MB")
-    print(f"  buckets:      {summary['num_buckets']}")
+    print(f"  buckets:      {summary['num_buckets']} x {summary['samples_per_bucket']} samples"
+          f" ({summary['dropped_rows']} rows dropped to keep them equal)")
     print(f"  round 0 key:  {summary['round0_key']}")
 
 
@@ -189,6 +207,25 @@ def main(
         "dropout": args.lora_dropout, "target_modules": target_modules,
     }
 
+    # Derived by calling plan_partition itself rather than by reimplementing its
+    # arithmetic. This number drives every step budget the coordinator issues
+    # (budget.plan_budget), and the workers get their rows from plan_partition --
+    # so a second copy of the formula that drifted by one would mis-size the
+    # whole run while both halves looked individually correct.
+    try:
+        partition = data_mod.plan_partition(
+            n_rows=args.dataset_rows, num_buckets=args.num_buckets,
+            eval_size=args.eval_size, data_seed=args.data_seed,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    hyperparams.setdefault("samples_per_bucket", partition.samples_per_bucket)
+    hyperparams.setdefault("eval_size", args.eval_size)
+    hyperparams.setdefault("data_seed", args.data_seed)
+    hyperparams.setdefault("prompt_format", args.prompt_format)
+
     outer_beta = args.outer_beta
     if outer_beta is None:
         outer_beta = (
@@ -218,6 +255,8 @@ def main(
             "tensor_count": len(adapter),
             "adapter_mb": len(adapter_bytes) / (1024 * 1024),
             "num_buckets": args.num_buckets,
+            "samples_per_bucket": partition.samples_per_bucket,
+            "dropped_rows": partition.dropped,
             "round0_key": round0_key,
             "dry_run": args.dry_run,
         }
