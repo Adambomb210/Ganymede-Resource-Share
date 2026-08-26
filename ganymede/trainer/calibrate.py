@@ -31,8 +31,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
+import os
 import platform
 import sys
+import tempfile
 import time
 from typing import Any
 
@@ -57,6 +60,12 @@ SEQ_LEN_LADDER = (512, 1024, 2048, 4096, 8192)
 # worker of that model for the entire run.
 DEFAULT_WARMUP_STEPS = 3
 DEFAULT_MEASURE_STEPS = 12
+
+# Wall-clock ceiling on one precision's fit probe. Generous, because a cold
+# HuggingFace cache means the child's first act is downloading several GB; it is
+# here so a wedged child cannot hang the calibration indefinitely, not to bound
+# normal operation.
+PROBE_TIMEOUT_SEC = 3600.0
 
 
 def describe_device(device: torch.device) -> dict[str, Any]:
@@ -103,6 +112,7 @@ def probe_fit(
     micro_batch: int,
     ladder: tuple[int, ...] = SEQ_LEN_LADDER,
     device: torch.device | None = None,
+    progress_path: str | None = None,
 ) -> dict[str, Any]:
     """Largest ``seq_len`` on this card at this precision, by trying them.
 
@@ -145,6 +155,12 @@ def probe_fit(
             result["ok"] = True
             result["max_seq_len"] = seq_len
             result["peak_vram_gb"] = _peak_vram_gb(device)
+            if progress_path:
+                # Written after every success so that a run killed at the next
+                # rung still reports the last one that worked. See
+                # probe_fit_isolated for why the process may simply vanish.
+                with open(progress_path, "w") as fh:
+                    json.dump(result, fh)
         except Exception as exc:  # noqa: BLE001
             if not _is_oom(exc):
                 result["error"] = f"{type(exc).__name__}: {exc}"
@@ -154,6 +170,90 @@ def probe_fit(
     if device.type == "cuda":
         torch.cuda.empty_cache()
     return result
+
+
+
+def _probe_entry(queue, kwargs: dict[str, Any]) -> None:
+    """Child-process entry point for :func:`probe_fit_isolated`."""
+    try:
+        device = torch.device(kwargs.pop("device_str"))
+        queue.put(probe_fit(device=device, **kwargs))
+    except BaseException as exc:  # noqa: BLE001 - the parent decides what it means
+        queue.put({"ok": False, "max_seq_len": None, "peak_vram_gb": None,
+                   "error": f"{type(exc).__name__}: {exc}"})
+
+
+def probe_fit_isolated(
+    base_model: str,
+    precision: str,
+    lora_cfg: dict[str, Any],
+    *,
+    micro_batch: int,
+    ladder: tuple[int, ...] = SEQ_LEN_LADDER,
+    device: torch.device | None = None,
+    timeout: float = PROBE_TIMEOUT_SEC,
+) -> dict[str, Any]:
+    """:func:`probe_fit` in a child process, because it is allowed to die.
+
+    The probe's entire job is to answer "what fits" *without* crashing, and
+    in-process it cannot always keep that promise. On CUDA an over-allocation
+    raises ``torch.cuda.OutOfMemoryError``, which is catchable — but on CPU (and
+    on Apple silicon with unified memory) the kernel's OOM killer sends SIGKILL,
+    which is not. A probe that can take the whole calibration run down with it
+    has failed at the one thing it exists to do.
+
+    So each precision is probed in a child process, and the child writes its last
+    successful rung to a file as it climbs. If the child is killed, the parent
+    still learns everything the child had proved before it died: the ladder is
+    monotonic, so "the highest rung it recorded" is the answer.
+
+    Spawn rather than fork: it is the only start method available on Windows, and
+    forking a process that has already initialized CUDA is unsafe anyway.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue()
+    device = device or model_mod.pick_device()
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        progress_path = fh.name
+
+    kwargs = {
+        "base_model": base_model, "precision": precision, "lora_cfg": lora_cfg,
+        "micro_batch": micro_batch, "ladder": ladder,
+        "device_str": str(device), "progress_path": progress_path,
+    }
+    child = ctx.Process(target=_probe_entry, args=(queue, kwargs), daemon=True)
+    child.start()
+    child.join(timeout)
+
+    if child.is_alive():
+        child.terminate()
+        child.join(5)
+
+    try:
+        if not queue.empty():
+            return queue.get_nowait()
+
+        # The child died without answering. Fall back to whatever it had proved.
+        try:
+            with open(progress_path) as fh:
+                partial = json.load(fh)
+            partial["error"] = (
+                f"probe process died at the rung above {partial['max_seq_len']} "
+                f"(exit {child.exitcode}); reporting the last rung it proved"
+            )
+            return partial
+        except (OSError, ValueError, KeyError):
+            return {
+                "ok": False, "max_seq_len": None, "peak_vram_gb": None,
+                "error": f"probe process died before any rung fit (exit {child.exitcode}) -- "
+                         f"out of memory at {ladder[0]} tokens, or killed by the OS",
+            }
+    finally:
+        try:
+            os.unlink(progress_path)
+        except OSError:
+            pass
 
 
 def measure_throughput(
@@ -275,6 +375,7 @@ def calibrate(
     warmup_steps: int = DEFAULT_WARMUP_STEPS,
     measure_steps: int = DEFAULT_MEASURE_STEPS,
     probe_precisions: tuple[str, ...] = ("bf16", "nf4"),
+    ladder: tuple[int, ...] = SEQ_LEN_LADDER,
     device: torch.device | None = None,
     rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -287,9 +388,9 @@ def calibrate(
 
     fits = {}
     for precision in probe_precisions:
-        fits[precision] = probe_fit(
+        fits[precision] = probe_fit_isolated(
             run_cfg["base_model"], precision, run_cfg["lora_cfg"],
-            micro_batch=int(hp["micro_batch"]), device=device,
+            micro_batch=int(hp["micro_batch"]), ladder=ladder, device=device,
         )
 
     throughput = measure_throughput(
@@ -367,6 +468,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--warmup-steps", type=int, default=DEFAULT_WARMUP_STEPS)
     p.add_argument("--measure-steps", type=int, default=DEFAULT_MEASURE_STEPS)
     p.add_argument("--probe-precisions", default="bf16,nf4", help="comma-separated; empty to skip the fit probe")
+    p.add_argument(
+        "--max-probe-seq-len", type=int, default=None,
+        help="stop the fit ladder here. An operator who will never run past 2048 "
+             "should not pay to discover whether 8192 fits",
+    )
     p.add_argument("--device", default=None, help="override device selection, e.g. cuda:1 or cpu")
     p.add_argument("--merge-into", default=None, help="existing calibration.json to fold this card's numbers into")
     return p
@@ -389,12 +495,21 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
+    ladder = SEQ_LEN_LADDER
+    if args.max_probe_seq_len:
+        ladder = tuple(n for n in ladder if n <= args.max_probe_seq_len)
+        if not ladder:
+            print(f"error: --max-probe-seq-len {args.max_probe_seq_len} is below the "
+                  f"smallest rung ({SEQ_LEN_LADDER[0]})", file=sys.stderr)
+            return 1
+
     result = calibrate(
         run_cfg,
         target_round_sec=args.target_round_sec,
         warmup_steps=args.warmup_steps,
         measure_steps=args.measure_steps,
         probe_precisions=precisions,
+        ladder=ladder,
         device=device,
     )
 

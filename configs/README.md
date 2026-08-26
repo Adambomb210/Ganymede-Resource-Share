@@ -44,6 +44,22 @@ Dolly's examples are short; the 8k-token ceiling that example was written for
 belongs to a different corpus, and paying for padding to 2048 on a 15k-sample
 instruction set buys nothing.
 
+## `smoke-round0-qwen3-1.7b.json`
+
+The round-0 generation smoke set for the bring-up model — an M0 exit criterion,
+and the only instrument watching a failure that held-out loss reports as fine.
+
+Twenty fixed prompts, decoded greedily. Not a metric: a tripwire. Generation
+quality can degrade while loss looks healthy, and prompt-format corruption is
+the specific case — it barely moves loss at all. Diff each round's output
+against the previous one; early rounds change most of the twenty, and a late
+round that suddenly changes most of them is worth stopping for. So is one where
+answers collapse toward each other.
+
+`ganymede-baseline --smoke-out <path>` writes this file. Re-record it on the
+machine you will compare against: greedy decoding is deterministic but not
+bit-portable, and a different device or dtype can flip a near-tie argmax.
+
 ## `cpu-probe-0.6b.json`
 
 Not a real run. `Qwen3-0.6B-Base` is small enough to train on CPU, which makes

@@ -1,0 +1,91 @@
+{
+  "model": "Qwen/Qwen3-1.7B-Base",
+  "base_precision": "bf16",
+  "prompt_format": "dolly-v1",
+  "round": 0,
+  "device": "cpu:x86_64",
+  "max_new_tokens": 64,
+  "note": "Round 0's model is the base model plus the seed adapter, and the seed adapter is a no-op (lora_B is exactly zero, so B @ A == 0). This is therefore the untuned base model's greedy output under the run's prompt format -- the reference every later round is diffed against. Decoding is greedy, but it is not bit-portable: a different device or dtype can flip a near-tie argmax and change a few tokens. Re-record on the machine you will actually compare against; what the tripwire watches is round N against round N-1 on one machine, not this file against yours.",
+  "completions": [
+    {
+      "instruction": "What is the capital of France?",
+      "completion": "The capital of France is Paris."
+    },
+    {
+      "instruction": "Explain photosynthesis in two sentences.",
+      "completion": "Photosynthesis is the process by which green plants and some other organisms use sunlight to synthesize food, primarily glucose, from water and carbon dioxide."
+    },
+    {
+      "instruction": "List three uses for baking soda.",
+      "completion": "Baking soda, also known as sodium bicarbonate, has several common uses in cooking and cleaning. Here are three primary uses:\n\n1. **Leavening Agent**: Baking soda is a powerful leavening agent that helps baked goods rise by producing carbon dioxide gas when it reacts with acidic ingredients like lemon juice,"
+    },
+    {
+      "instruction": "Who wrote the novel Moby-Dick?",
+      "completion": "The novel *Moby-Dick* was written by Herman Melville. It was first published in 1851 and is considered one of the greatest works of American literature. The story follows the obsessive captain Ahab and his quest to hunt down the white whale, Moby Dick."
+    },
+    {
+      "instruction": "Summarize the passage.",
+      "completion": "The Kuiper belt is a circumstellar disc in the outer Solar System, extending from the orbit of Neptune to approximately 50 AU from the Sun."
+    },
+    {
+      "instruction": "Translate to French: The weather is cold today.",
+      "completion": "Le temps est froid aujourd'hui."
+    },
+    {
+      "instruction": "What is 17 multiplied by 4?",
+      "completion": "To find the product of 17 and 4, we can break it down step by step. First, multiply 17 by 4:\n\n\\[ 17 \\times 4 = 68 \\]\n\nSo, 17 multiplied by 4 equals 68."
+    },
+    {
+      "instruction": "Write a one-line description of a lighthouse.",
+      "completion": "A lighthouse is a tall tower or building with a light at the top, used to guide ships safely through dangerous waters."
+    },
+    {
+      "instruction": "Give me a recipe for scrambled eggs.",
+      "completion": "Sure! Here's a simple recipe for scrambled eggs:\n\nIngredients:\n- 4 large eggs\n- Salt and pepper to taste\n- 1 tablespoon butter or oil\n- Optional: chopped vegetables (e.g., onions, mushrooms, spinach) for added flavor and nutrition\n\nInstructions:\n1. Crack the eggs into a"
+    },
+    {
+      "instruction": "Classify the sentiment: 'The service was slow but the food was excellent.'",
+      "completion": "The sentiment of the given statement is **mixed**. While the service was slow, which could be considered a negative aspect, the food was described as excellent, which is a positive point. Therefore, the overall sentiment leans more towards **positive** due to the positive aspect of the food, but it is not entirely positive"
+    },
+    {
+      "instruction": "What are the primary colors?",
+      "completion": "The primary colors are red, blue, and yellow. These colors cannot be created by mixing other colors, and they are the building blocks for all other colors in the color wheel."
+    },
+    {
+      "instruction": "Extract the year mentioned in the text.",
+      "completion": "1937"
+    },
+    {
+      "instruction": "Name two programming languages used for data science.",
+      "completion": "Python and R are two popular programming languages used for data science. Python is known for its simplicity and versatility, making it a popular choice for data analysis, machine learning, and web development. R, on the other hand, is specifically designed for statistical computing and graphics, making it a popular choice for data visualization and statistical"
+    },
+    {
+      "instruction": "Why do leaves change color in autumn?",
+      "completion": "Leaves change color in autumn due to a combination of environmental factors and physiological processes within the tree. As the days get shorter and temperatures drop, trees begin to prepare for winter by reducing the production of chlorophyll, the green pigment responsible for photosynthesis. This reduction in chlorophyll allows other pigments, such"
+    },
+    {
+      "instruction": "Rewrite this sentence to be more concise.",
+      "completion": "We stayed indoors due to the rain."
+    },
+    {
+      "instruction": "What is the boiling point of water at sea level?",
+      "completion": "The boiling point of water at sea level is 100 degrees Celsius (212 degrees Fahrenheit). This is the temperature at which water changes from a liquid to a gas under standard atmospheric pressure, which is 1 atmosphere (101.325 kPa) at sea level."
+    },
+    {
+      "instruction": "Describe the difference between a comet and an asteroid.",
+      "completion": "A comet is a small, icy body that orbits the Sun and is known for its tail, which is formed when the comet's ice sublimates (turns directly from a solid to a gas) as it approaches the Sun. This process creates a visible tail that can extend for millions of kilometers. Comets are"
+    },
+    {
+      "instruction": "Suggest a name for a coffee shop near a university.",
+      "completion": "Sure! Here are some suggestions for a coffee shop near a university:\n\n1. **Cafe U**: A simple and memorable name that directly references the university.\n2. **The Study Spot**: Emphasizes the coffee shop as a place for studying and relaxation.\n3. **Coffee Haven**: Suggests a cozy"
+    },
+    {
+      "instruction": "How many continents are there?",
+      "completion": "There are seven continents: Africa, Antarctica, Asia, Europe, North America, Australia (Oceania), and South America."
+    },
+    {
+      "instruction": "Write a haiku about winter.",
+      "completion": "Snowflakes fall,  \nWinter\u2019s chill embraces the land,  \nPeaceful silence reigns."
+    }
+  ]
+}

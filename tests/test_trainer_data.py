@@ -264,6 +264,18 @@ def test_a_partial_trailing_micro_batch_is_dropped():
     assert all(len(b) == 4 for b, _ in batches)
 
 
+def test_a_shard_smaller_than_one_micro_batch_raises_rather_than_hanging():
+    """The failure mode this replaces is the nastiest kind: not a crash.
+
+    Partial batches are dropped, so a too-small shard yields nothing -- and the
+    stream cycles, so "nothing" is an infinite loop incrementing an epoch
+    counter. The worker would hang holding its lease until it expired and look
+    like a slow straggler rather than a bug.
+    """
+    with pytest.raises(ValueError, match="smaller than a single batch"):
+        next(D.micro_batches([1, 2, 3], 4, seed=0))
+
+
 def test_stream_rejects_nonsense():
     with pytest.raises(ValueError):
         next(D.micro_batches([1, 2], 0, seed=0))

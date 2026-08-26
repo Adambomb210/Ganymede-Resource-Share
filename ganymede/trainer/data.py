@@ -305,6 +305,16 @@ def micro_batches(
         raise ValueError("micro_batch must be >= 1")
     if not rows:
         raise ValueError("no rows assigned")
+    if len(rows) < micro_batch:
+        # Partial batches are dropped (see below), so a shard smaller than one
+        # micro-batch yields nothing at all -- and because the stream cycles,
+        # "nothing at all" is an infinite loop incrementing an epoch counter,
+        # not an exception. A worker would hang holding a lease until it
+        # expired, and the round would look like a straggler rather than a bug.
+        raise ValueError(
+            f"{len(rows)} rows assigned but micro_batch is {micro_batch}: "
+            f"the shard is smaller than a single batch"
+        )
 
     epoch = 0
     emitted = 0

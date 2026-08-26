@@ -103,10 +103,10 @@ configs/
 | Exit criterion | State |
 |---|---|
 | Trainer runs, loss descends, adapter round-trips through safetensors | met on CPU — held-out loss falls on `Qwen3-0.6B-Base` over real Dolly, and the artifact passes the coordinator's own `check_structural` |
-| `ganymede-calibrate` produces a valid `calibration.json` | harness met; **the numbers need a GPU** |
+| `ganymede-calibrate` produces a valid `calibration.json` | harness met and run end to end — a complete `calibration.json` with fit, throughput and a recommended `local_steps`; **the numbers need a GPU** |
 | The run fits the target card at the chosen `base_precision`, with headroom | **needs the card** — the fit probe is written and walks the ladder, but "does 1.7B bf16 fit a 12 GB 3060" is a question only the 3060 answers |
-| `baseline.json` exists with multiple seeds, mean and variance band | harness met; **the run needs a GPU** (~3.5 h/seed on CPU, and a CPU baseline is the wrong comparison anyway) |
-| ~20-prompt greedy smoke set exists, round-0 output recorded | set exists and generates; recording round 0 is one `--smoke-out` away from the baseline run |
+| `baseline.json` exists with multiple seeds, mean and variance band | harness met and run end to end over two seeds — identical start, divergent paths, a band, and a printed M4 pass threshold; **the real run needs a GPU** (~3.5 h/seed on CPU, and a CPU baseline is the wrong comparison anyway) |
+| ~20-prompt greedy smoke set exists, round-0 output recorded | **met** — `configs/smoke-round0-qwen3-1.7b.json`, generated on the real bring-up model. Round 0 is base + seed adapter, and the seed adapter is a no-op, so this is a hardware-independent-in-principle reference (re-record on the machine you compare against; greedy decoding is deterministic but not bit-portable) |
 | Windows environment set up | **your machine** — long paths, `HF_HOME`, developer mode |
 
 Verified here rather than assumed: `Qwen/Qwen3-0.6B-Base` and
@@ -421,7 +421,7 @@ M4b does.
 |---|---|
 | `MAX_PATH` 260-char limit vs. HF cache paths | Enable Win32 long paths, and set `HF_HOME` to something short like `C:\hf` |
 | HF cache uses symlinks; Windows needs developer mode or admin | Enable developer mode, or accept that the cache silently doubles in size from copies |
-| `multiprocessing` uses spawn, not fork | Guard entry points with `if __name__ == "__main__"`; start with `num_workers=0` in the DataLoader |
+| `multiprocessing` uses spawn, not fork | Guard entry points with `if __name__ == "__main__"`. The trainer sidesteps this entirely — it uses a plain generator rather than a `DataLoader`, so there are no worker processes to spawn |
 | No cgroups for resource limits | Job Objects, or accept no limits on native installs. Container path is unaffected |
 | `bitsandbytes` is least reliable here | Irrelevant during bring-up — bf16 at 1.7B needs no quantization. Re-check before any `nf4` run |
 | Git line endings can corrupt scripts inside containers | `.gitattributes` pinning shell scripts to LF |
@@ -556,7 +556,7 @@ vastly faster than testing it against real GPUs.
 
 ## M1 status — built
 
-**Done.** Now 228 tests with M0 alongside it, nothing skipped, including the real-MinIO storage tests.
+**Done.** Now 234 tests with M0 alongside it, nothing skipped, including the real-MinIO storage tests.
 
 | Exit criterion | State |
 |---|---|

@@ -233,3 +233,57 @@ def test_calibration_and_the_trainer_name_the_same_device_identically(tiny_model
     from ganymede.trainer import model as M
 
     assert C.describe_device(CPU)["name"] == M.device_name(CPU)
+
+
+def test_the_fit_probe_survives_its_own_child_being_killed(tiny_model_dir, tiny_lora_cfg):
+    """A probe that can take down the calibration run has failed at its job.
+
+    On CUDA an over-allocation raises a catchable ``OutOfMemoryError``. On CPU
+    the kernel's OOM killer sends SIGKILL, which is not catchable — and that is
+    not hypothetical: probing a 0.6B model at 1024 tokens on this machine killed
+    the calibration process outright, which is what motivated the isolation.
+    """
+    fit = C.probe_fit_isolated(
+        tiny_model_dir, "fp32", tiny_lora_cfg,
+        micro_batch=1, ladder=(8, 16), device=CPU,
+    )
+    assert fit["ok"] and fit["max_seq_len"] == 16
+
+
+def test_a_dead_probe_reports_the_last_rung_it_proved(tiny_model_dir, tiny_lora_cfg, tmp_path):
+    """The ladder is monotonic, so the highest recorded rung is the answer even
+    when the child never got to say so itself."""
+    import json
+
+    progress = tmp_path / "progress.json"
+    C.probe_fit(
+        tiny_model_dir, "fp32", tiny_lora_cfg, micro_batch=1,
+        ladder=(8, 16, 32), device=CPU, progress_path=str(progress),
+    )
+    # The file is rewritten after every success, so it holds the final one.
+    assert json.loads(progress.read_text())["max_seq_len"] == 32
+
+
+def test_the_recorded_round0_smoke_set_covers_every_prompt():
+    """It is an M0 deliverable, and it drifts silently.
+
+    Adding a prompt to ``SMOKE_PROMPTS`` without re-recording leaves a reference
+    file that no longer covers the set it is compared against -- and ``diff_smoke``
+    zips the two, so the extra prompt is simply never checked. No error, just a
+    tripwire with a gap in it.
+    """
+    import json
+    import pathlib
+
+    from ganymede.trainer import data as D
+    from ganymede.trainer import evaluate as E
+
+    recorded = json.loads(
+        (pathlib.Path("configs") / "smoke-round0-qwen3-1.7b.json").read_text()
+    )
+    assert recorded["round"] == 0
+    assert recorded["prompt_format"] in D.FORMATS
+    assert [c["instruction"] for c in recorded["completions"]] == [
+        p["instruction"] for p in E.SMOKE_PROMPTS
+    ]
+    assert all(c["completion"].strip() for c in recorded["completions"])
