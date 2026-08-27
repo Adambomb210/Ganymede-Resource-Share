@@ -1341,6 +1341,12 @@ Solo and sequential: roughly **16–20 focused days** to M4, plus training wall-
 
 ## Phase 2 (not scheduled)
 
+A larger expansion — concurrent jobs, targeted placement, accounts with a points
+ledger, a web UI, and job types beyond fine-tuning — is being drafted separately
+in `04-platform-expansion.md`. It promotes and widens items 1, 2, and 9 below.
+That document is a draft with open questions still out; this list stays
+authoritative until it isn't.
+
 In rough order of when they'll start to hurt:
 
 1. **Spot-check redundancy and reputation scoring** — the first thing needed when the
