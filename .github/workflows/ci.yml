@@ -163,13 +163,17 @@ jobs:
 
       - name: launchd loads it
         if: runner.os == 'macOS'
-        # Informational for now. A CI runner's session is not a logged-in
-        # desktop, and this plist is a LaunchAgent precisely because Metal needs
-        # one (packaging/README.md), so a bootstrap failure here would say
-        # something about the runner rather than about the file. The lint above
-        # is the assertion; this is here to find out whether the load can be one
-        # too.
-        continue-on-error: true
+        # A real assertion, promoted from informational once the runner proved
+        # it could be one. `plutil` lints the file; only `launchctl` says
+        # launchd will *accept* it, and the distinction is not academic here --
+        # the Windows job spent two commits importing a task XML that every
+        # parser had already declared valid.
+        #
+        # The load is what the runner supports rather than what a contributor
+        # gets: a CI session is not a logged-in desktop, and this is a
+        # LaunchAgent precisely because Metal wants one (packaging/README.md).
+        # If this ever starts failing, check that before assuming the plist
+        # changed.
         run: |
           set -x
           launchctl load "$HOME/Library/LaunchAgents/com.ganymede.host.plist"

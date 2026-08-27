@@ -861,15 +861,55 @@ that the three platforms still agree on a cadence, since the exit criterion is
 stated in timer intervals and a platform that has drifted has a different
 criterion.
 
-### Still needs a real machine
+### Most of that turned out not to need one
 
-| Blocked | Why |
+The table above was written assuming this machine was the only one available.
+It is not: GitHub gives away macOS and Windows runners on a public repo, and
+its Linux runner is a VM with real systemd rather than the container this was
+developed in. The `host` job in `.github/workflows/ci.yml` now runs on all
+three every push, and it is cheap enough to do that because `tests_host/`
+needs nothing but `pytest` — 141 tests in under a second, no torch anywhere.
+
+| Was blocked | Now |
 |---|---|
-| The systemd timer firing | No systemd in a Linux CI container. `systemd-analyze verify` is the closest available check and needs the package installed |
-| The launchd job firing | Needs a Mac. So does the `ioreg` idle path, and so does the LaunchAgent-vs-LaunchDaemon call, which rests on Metal being available in a session |
-| The Scheduled Task importing | Needs Windows. The XML parses and its element order is right; that `schtasks` accepts it is a separate claim |
-| `install-windows.ps1` running at all | No PowerShell on this box — it has never been executed, only read |
-| Idle detection against a real desktop | `xprintidle`, `ioreg` and `GetLastInputInfo` are all faked in tests. The predicate is tested; the three platform probes are not |
+| The systemd unit | **Checked.** `systemd-analyze verify`, then the unit is actually *run*: once unconfigured, asserting it fails loudly, and once configured, asserting it ticks. That second one exercises `ProtectSystem=strict` against `ReadWritePaths`, the setting most likely to be silently wrong. The timer is asserted to schedule |
+| The launchd job | **Checked.** `plutil` lints the plist and `launchctl` loads it |
+| The Scheduled Task importing | **Checked.** `Register-ScheduledTask` imports it for real, and the registered action is verified to point at the agent with `--once` |
+| `install-windows.ps1` | **Parsed** by PowerShell's own parser. Still never *executed* |
+| The three idle probes | **Executed** rather than faked, on their own platforms |
+
+What genuinely still needs a real machine is smaller than it looked: whether a
+timer fires unattended over hours, whether the idle probes agree with a human
+at a desk, and whether the installers run end to end as a contributor would
+run them.
+
+### Three things only the real platforms could find
+
+1. **`os.kill(pid, 0)` is not a liveness probe on Windows.** It is the POSIX
+   idiom, it looks portable, and on Windows `os.kill` has no null signal —
+   every value except the two console-control events becomes
+   `TerminateProcess`. So the check in `NativeRuntime._alive` **killed the
+   process it was asking about**: the Windows job died mid-suite having
+   terminated its own pytest. Windows is a native-install platform (§4.1), so
+   that call would have been made against a contributor's worker every tick.
+   Liveness now goes through `OpenProcess` + `GetExitCodeProcess`, and start
+   time through `GetProcessTimes` — which also gives Windows the recycled-pid
+   guard it previously had none of.
+
+2. **A parser is not an importer.** The Task Scheduler XML shipped declaring
+   UTF-16 while being ASCII on disk, which every parser rejects. Declaring
+   UTF-8 instead fixed the parsers and broke the only consumer that matters:
+   `install-windows.ps1` reads the file into a .NET string, which is already
+   UTF-16 in memory, and the COM importer refuses a contrary encoding claim
+   inside one — `unable to switch the encoding`, at column 40. For two commits
+   the file parsed cleanly in Python and could not be registered on Windows at
+   all. It now carries no declaration, which satisfies both.
+
+3. **`bash` on a Windows runner is the WSL launcher.** A `bash -n` check
+   against the shell installers failed on nothing at all: `System32\bash.exe`
+   with no distro installed prints its own error in UTF-16 and exits 1. Not a
+   bug in anything, but a good reminder that a command's name is not a
+   contract.
 
 ---
 
