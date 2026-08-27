@@ -336,9 +336,7 @@ class NativeRuntime:
         not-running, which risks a second worker rather than risking killing
         something that is not ours.
         """
-        try:
-            os.kill(record.pid, 0)
-        except (ProcessLookupError, PermissionError, OSError):
+        if not _pid_alive(record.pid):
             return False
 
         actual = _process_start_time(record.pid)
@@ -412,6 +410,13 @@ class NativeRuntime:
         log.warning("native worker %s ignored the stop sentinel; signalling", record.pid)
         if self._alive(record):
             try:
+                # On Windows `os.kill` has no signal semantics at all: every
+                # value except the two console-control events is TerminateProcess.
+                # That is the right escalation here -- the worker has already
+                # ignored its sentinel for the whole grace period -- but it is
+                # worth knowing that this line is polite on POSIX and abrupt on
+                # Windows, which is 4.4's whole argument for the sentinel being
+                # the mechanism that counts.
                 os.kill(record.pid, getattr(signal, "SIGTERM", signal.SIGINT))
             except OSError:
                 pass
@@ -446,14 +451,67 @@ class NativeRuntime:
             pass
 
 
+# Windows process handles. `PROCESS_QUERY_LIMITED_INFORMATION` is the narrowest
+# right that answers both questions below, and unlike `PROCESS_QUERY_INFORMATION`
+# it is grantable across integrity levels.
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_STILL_ACTIVE = 259
+
+
+def _pid_alive(pid: int) -> bool:
+    """Is there a live process with this pid?
+
+    **Not `os.kill(pid, 0)`.** That is the POSIX idiom and it is actively
+    dangerous on Windows, where `os.kill` has no concept of a null signal:
+    every value other than the two console-control events becomes
+    `TerminateProcess`. So the portable-looking liveness probe *kills the
+    process it is asking about*. Found by the Windows CI job on its first run,
+    when the check terminated the test process that was running it -- and
+    Windows is a native-install platform (4.1), so this is the path a
+    contributor's worker would be on.
+    """
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            # PermissionError means it exists and belongs to someone else.
+            # That is not our worker, so treat it as gone either way -- the
+            # cautious direction, since the alternative is signalling a
+            # stranger's process.
+            return False
+
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        # A process that genuinely exited with 259 is indistinguishable from a
+        # running one through this API. That is a documented Windows wart and
+        # it errs toward "still running", which here costs one wasted grace
+        # period rather than a second worker.
+        return code.value == _STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _process_start_time(pid: int) -> float | None:
     """Epoch seconds at which `pid` started, or None where we cannot tell.
 
     Linux reads field 22 of ``/proc/<pid>/stat`` (start time in clock ticks
     since boot) and adds the boot time from ``/proc/stat``. macOS has no
-    ``/proc``, so it shells out to ``ps -o lstart=``. Windows has neither and
-    returns None, which `_alive` treats as "assume not ours".
+    ``/proc``, so it shells out to ``ps -o lstart=``. Windows has neither, and
+    goes to `GetProcessTimes` -- which matters more there than anywhere else,
+    because Windows is a native-install platform (4.1) and a recycled pid is
+    the failure this guard exists for.
     """
+    if os.name == "nt":
+        return _process_start_time_windows(pid)
     try:
         with open(f"/proc/{pid}/stat", "rb") as fh:
             data = fh.read().decode("utf-8", errors="replace")
@@ -482,6 +540,36 @@ def _process_start_time(pid: int) -> float | None:
         parsed = email.utils.parsedate_to_datetime(out.stdout.strip())
         return parsed.timestamp()
     except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        return None
+
+
+def _process_start_time_windows(pid: int) -> float | None:
+    """`GetProcessTimes` creation time, converted out of FILETIME.
+
+    FILETIME counts 100-nanosecond intervals since 1601-01-01 UTC; the epoch is
+    369 years and 89 leap days earlier than 1970, which is the constant below.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return None
+        try:
+            created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+            ok = kernel32.GetProcessTimes(
+                handle, ctypes.byref(created), ctypes.byref(exited),
+                ctypes.byref(kernel), ctypes.byref(user),
+            )
+            if not ok:
+                return None
+            ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+            return ticks / 10_000_000 - 11_644_473_600
+        finally:
+            kernel32.CloseHandle(handle)
+    except (OSError, AttributeError, ValueError):
         return None
 
 

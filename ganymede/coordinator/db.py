@@ -9,6 +9,8 @@ at first write, which is what makes the claim path safe under concurrency.
 from __future__ import annotations
 
 import sqlite3
+
+from ganymede.coordinator import eligibility
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -199,6 +201,10 @@ def _apply_additive_migrations(conn: sqlite3.Connection) -> list[str]:
 
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    # Lives in its own module because it is a diagnostic rather than
+    # protocol state: nothing in the round lifecycle reads it, and
+    # dropping the table would cost answers, not correctness.
+    conn.executescript(eligibility.SCHEMA)
     _apply_additive_migrations(conn)
 
 

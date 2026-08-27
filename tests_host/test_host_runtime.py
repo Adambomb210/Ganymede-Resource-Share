@@ -326,3 +326,48 @@ def test_for_config_picks_the_runtime_the_config_names():
 def test_an_unknown_runtime_name_is_rejected_loudly():
     with pytest.raises(ValueError):
         runtime_mod.for_config(_config(runtime="podman-maybe"))
+
+
+# --------------------------------------------------------------------------
+# Liveness, which is where the portable-looking idiom is a trap
+# --------------------------------------------------------------------------
+
+
+def test_liveness_never_signals_the_process_it_asks_about():
+    """`os.kill(pid, 0)` is the POSIX idiom and is dangerous on Windows, where
+    `os.kill` has no null signal: everything but the two console-control events
+    is TerminateProcess. The portable-looking probe kills what it asks about.
+
+    Found by the Windows CI job on its first run, when the check terminated the
+    pytest process running it. Windows is a native-install platform (4.1), so
+    the same call would have been made against a contributor's worker.
+
+    Asserted by pointing the probe at *this* process: if it ever goes back to
+    `os.kill`, this test stops existing rather than failing, which on Windows
+    is exactly the signal.
+    """
+    import os
+
+    assert runtime_mod._pid_alive(os.getpid()) is True
+
+
+def test_liveness_is_false_for_a_pid_that_cannot_exist():
+    # 2**22 - 1 is above the default Linux pid_max and is not a valid handle
+    # anywhere; the point is a negative answer rather than an exception.
+    assert runtime_mod._pid_alive(4_194_303) is False
+
+
+def test_start_time_is_a_plausible_epoch_for_this_process():
+    """The recycled-pid guard is only as good as this number. A platform that
+    returns None disables the guard -- which `_alive` treats as "not ours", the
+    cautious direction -- so what matters is that the platforms which *can*
+    answer return something in the right era rather than, say, ticks."""
+    import os
+    import time
+
+    started = runtime_mod._process_start_time(os.getpid())
+    if started is None:
+        pytest.skip("this platform cannot report a process start time")
+    assert 0 < started <= time.time() + 5
+    # This process started recently; a bad unit conversion lands centuries out.
+    assert time.time() - started < 24 * 3600

@@ -18,6 +18,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from ganymede.coordinator import budget as budget_mod
+from ganymede.coordinator import eligibility
 from ganymede.coordinator import closer, rounds
 from ganymede.coordinator.auth import AuthError, Contributor, authenticate
 from ganymede.coordinator.config import Settings
@@ -212,7 +213,12 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                    else json.loads(worker["compute_profile_json"]))
 
         candidates = _selectable_runs(conn, body.run_id, body.cached_base_models)
-        reasons: list[str] = []
+        # Every branch below records a verdict, including the ones that succeed.
+        # A stale "refused" left behind by a worker that has since started
+        # working would be worse than no record at all -- it is the answer a
+        # contributor would act on, and it would send them looking for a fault
+        # in a machine that is fine.
+        verdicts: list[eligibility.Verdict] = []
         for run_id in candidates:
             # Evaluate the close here too, not only after a submit. A round can
             # become closeable through the passage of time alone -- its backstop
@@ -231,10 +237,20 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                     profile, settings, worker_image_tag=worker["image_tag"],
                 )
             except rounds.NotEligible as exc:
-                reasons.append(f"{run_id}: {exc}")
+                verdicts.append(eligibility.Verdict(run_id, eligibility.REFUSED, str(exc)))
                 continue
             if spec is not None:
+                verdicts.append(eligibility.Verdict(run_id, eligibility.LEASED))
+                eligibility.record(conn, body.worker_id, verdicts)
                 return JSONResponse(_task_payload(spec, store, settings))
+            # Eligible, but this run had nothing to hand out: no open round, or
+            # too little of it left to be worth a budget. Not the worker's
+            # problem, and recorded separately from a refusal because a fleet
+            # that is uniformly idle is a different operator problem from a
+            # fleet that is uniformly refused.
+            verdicts.append(eligibility.Verdict(run_id, eligibility.IDLE))
+
+        eligibility.record(conn, body.worker_id, verdicts)
 
         # 204 is a legitimate answer, not an error: nothing eligible, or too
         # little of the round left to be worth a 25 MB round trip.
@@ -242,6 +258,39 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             status_code=204,
             headers={"Retry-After": str(settings.poll_interval_sec)},
         )
+
+    @app.get(f"/{API_VERSION}/workers/{{worker_id}}/eligibility")
+    def worker_eligibility(worker_id: str, conn: ConnDep, contributor: ContribDep) -> dict:
+        """Why this machine is or is not getting work (roadmap M5).
+
+        Scoped to the contributor who registered the worker. A refusal reason
+        names the run's requirements and the machine's measured profile, which
+        is exactly what a contributor needs and exactly what nobody else should
+        be able to enumerate across a fleet.
+        """
+        worker = conn.execute(
+            "SELECT * FROM workers WHERE id = ?", (worker_id,)
+        ).fetchone()
+        if worker is None or worker["contributor_id"] != contributor.id:
+            # 404 rather than 403: a worker id belonging to somebody else should
+            # not be distinguishable from one that does not exist.
+            raise HTTPException(status_code=404, detail="unknown worker")
+
+        answer = eligibility.explain(conn, worker_id)
+        return {
+            "worker_id": worker_id,
+            "last_polled": answer.checked_at,
+            "eligible_for_something": answer.any_eligible,
+            "runs": [
+                {"run_id": v.run_id, "outcome": v.outcome, "reason": v.reason}
+                for v in answer.verdicts
+            ],
+            # Echoed back because half of every refusal reason is a fact about
+            # this machine, and a contributor comparing "vram_mb 6144 < 8000"
+            # against what they think their card has needs to see what the
+            # coordinator actually measured (6.9).
+            "compute_profile": json.loads(worker["compute_profile_json"]),
+        }
 
     @app.post(f"/{API_VERSION}/tasks/{{task_id}}/heartbeat")
     def heartbeat(task_id: str, body: HeartbeatRequest, conn: ConnDep,
