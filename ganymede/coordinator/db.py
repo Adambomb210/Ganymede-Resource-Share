@@ -173,10 +173,12 @@ def connect(db_path: str) -> sqlite3.Connection:
 # lands later, as a KeyError deep in the claim path, on the one deployment that
 # has data worth keeping.
 #
-# Additive only, deliberately. Renames, drops and type changes need a real
-# migration with a version number and a plan; adding a nullable column does
-# not, and pretending otherwise here would mean writing a migration framework
-# before there is a second thing to migrate.
+# Additive only, deliberately. Renames, drops and type changes go through
+# ``migrations.py`` now -- the second thing to migrate arrived (docs/05). This
+# map stays for the columns it already carries: they were added before the
+# numbered runner existed, and moving them into a migration would make an
+# already-current database try to ADD a column it has. New shape changes belong
+# in ``migrations.py``, not here.
 _ADDED_COLUMNS: dict[str, dict[str, str]] = {
     "runs": {"required_image": "TEXT"},
     "tasks": {"max_runtime_sec": "INTEGER", "last_heartbeat_steps": "INTEGER"},
@@ -200,11 +202,23 @@ def _apply_additive_migrations(conn: sqlite3.Connection) -> list[str]:
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
+    # Import here, not at module top: ``migrations`` imports ``immediate`` from
+    # this module, and ``rounds`` (which several call sites pull in alongside
+    # ``db``) imports it too -- a top-level import would close the cycle before
+    # ``immediate`` is defined below.
+    from ganymede.coordinator import migrations
+
     conn.executescript(SCHEMA)
     # Lives in its own module because it is a diagnostic rather than
     # protocol state: nothing in the round lifecycle reads it, and
     # dropping the table would cost answers, not correctness.
     conn.executescript(eligibility.SCHEMA)
+    # Numbered, forward-only, version-cursored (docs/05). The legacy additive
+    # map still runs after it: migration 003's ``tasks`` rebuild copies only the
+    # columns the live table actually has, so a database old enough to lack
+    # ``max_runtime_sec`` / ``last_heartbeat_steps`` survives the rebuild and
+    # ``_apply_additive_migrations`` puts them back as nullable straight after.
+    migrations.apply_pending(conn)
     _apply_additive_migrations(conn)
 
 
