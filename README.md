@@ -48,6 +48,7 @@ and disappear when it isn't.
 | `rounds.py` | Round lifecycle, leases, the work-based close rule |
 | `closer.py` | Gating, aggregation, publishing the next round's base adapter |
 | `invariants.py` | What "broken" means, checked over the database. Non-zero exit, so it works as a cron check |
+| `eligibility.py` | Why a worker is never leased (M5). Verdicts recorded by the claim path, never re-derived |
 | `app.py` | The HTTP surface |
 
 ### Trainer modules
@@ -98,6 +99,14 @@ python3 -m scripts.evalround --run-id … --watch                # fill in held-
 
 ganymede-host --check                                          # what a contributor's machine resolved
 ganymede-cache --cap-gb 40 --dry-run                           # what eviction would reclaim
+```
+
+Two of those answer the operator's standing questions:
+
+```sh
+ganymede-status --db …                    # is it training, and who is contributing?
+ganymede-status --db … --alert            # silent when healthy, exit 1 when not -- for cron
+ganymede-eligibility --db … --fleet       # why nobody is getting work
 ```
 
 The first exits non-zero on a violation, so it belongs in cron. It reports the two

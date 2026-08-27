@@ -1149,6 +1149,69 @@ Exit criteria:
 
 ---
 
+## M5 status — the operator view, built early
+
+Three of M5's exit criteria landed alongside M3, because each of them turned
+out to be a report over facts the database already held rather than new
+instrumentation. §6.11's rule — the fleet inventory is derived, not maintained —
+is what makes that true: an inventory written down separately is one that goes
+stale and then lies.
+
+```
+ganymede/coordinator/invariants.py   what "broken" means (built during M4a)
+ganymede/coordinator/eligibility.py  why a worker is never leased
+scripts/status.py                    is it training, and who is contributing
+```
+
+| Exit criterion | State |
+|---|---|
+| Answer "is it training, and who is contributing?" in one glance | **met.** `ganymede-status` |
+| Alerted about a stalled run without having to look | **met.** `--alert` is silent on success and exits 1, so cron is the whole scheduler |
+| A worker that is never leased can be told *why* | **met.** `GET /v1/workers/{id}/eligibility`, and `--fleet` for the operator's side |
+| Distinct contributors per round is visible (§3.2) | **met.** Reported per round, with a median and a flag when most rounds close with one machine |
+| A full restore performed at least once | **not started.** `scripts/backup.py` has never been restored from |
+| Artifact volume has headroom, GC demonstrably keeping it | **not started** |
+
+### The alert had to be defined against idleness, not around it
+
+The obvious stall check fires on a healthy volunteer fleet every night. §3.2 is
+explicit that contributors come and go and that a round sitting open overnight
+is the design working — so an alert that cannot tell "nobody asked for work"
+from "workers asked and the round did not move" would go off constantly and
+train the operator to ignore the one that matters. That is the same reason
+`invariants.py` deliberately says nothing about idleness at all.
+
+A stall here therefore requires **both** halves: a round well past its own
+backstop, *and* evidence that workers were awake while it sat there. The second
+half only became available with the eligibility table, which records every
+poll — including the polls that were refused, which is exactly the machine an
+operator most wants counted as present. Together they are the M4a wedge
+signature: every worker polling, every poll answered 204, the round open
+forever, and nothing anywhere returning an error.
+
+### Recorded, not recomputed
+
+Every refusal reason in `eligibility.py` was produced by `rounds.claim_task` on
+a real poll and written down verbatim. Nothing re-derives eligibility, and that
+is the design rather than an implementation detail. A diagnostic that
+reimplements the decision it explains will eventually disagree with it, and a
+contributor told they are eligible for a run that keeps turning them away is
+worse off than one told nothing — the suspicion moves from their machine to the
+operator's competence. The claim path had been computing a reason for every run
+it declined and dropping the list on the floor since M1.
+
+Three outcomes are kept apart, because they are three different problems that
+read identically one worker at a time: `refused` carries the reason, `idle`
+means eligible but the run had nothing to hand out, and a worker with **no rows
+at all** has never completed a poll — so the fault is upstream of eligibility
+entirely, and the agent is not running or cannot reach the coordinator.
+
+Recording is best-effort by construction and tested that way: dropping the
+table must not turn a successful claim into a 500. A diagnostic that can break
+what it diagnoses is a worse trade than not knowing.
+
+---
+
 ## Sequencing
 
 ```
