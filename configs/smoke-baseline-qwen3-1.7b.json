@@ -1,0 +1,82 @@
+[
+  {
+    "instruction": "What is the capital of France?",
+    "completion": "Paris is the capital of France"
+  },
+  {
+    "instruction": "Explain photosynthesis in two sentences.",
+    "completion": "Photosynthesis is the process by which plants use sunlight, water, and carbon dioxide to produce oxygen and energy in the form of sugar."
+  },
+  {
+    "instruction": "List three uses for baking soda.",
+    "completion": "Baking soda can be used to clean your car, to remove stains from your clothes, and to deodorize your refrigerator."
+  },
+  {
+    "instruction": "Who wrote the novel Moby-Dick?",
+    "completion": "Moby-Dick was written by Herman Melville"
+  },
+  {
+    "instruction": "Summarize the passage.",
+    "completion": "The Kuiper belt is a circumstellar disc in the outer Solar System, extending from the orbit of Neptune to approximately 50 AU from the Sun."
+  },
+  {
+    "instruction": "Translate to French: The weather is cold today.",
+    "completion": "Le temps est froid aujourd'hui."
+  },
+  {
+    "instruction": "What is 17 multiplied by 4?",
+    "completion": "68"
+  },
+  {
+    "instruction": "Write a one-line description of a lighthouse.",
+    "completion": "A lighthouse is a tall structure that is used to signal ships and boats in distress."
+  },
+  {
+    "instruction": "Give me a recipe for scrambled eggs.",
+    "completion": "Here is a recipe for scrambled eggs:\n\n1. Crack 2 eggs into a bowl\n2. Add 1 tablespoon of milk\n3. Add 1 teaspoon of salt\n4. Whisk the eggs until they are well mixed\n5. Heat a pan over medium heat\n6. Add 1 tablespoon of"
+  },
+  {
+    "instruction": "Classify the sentiment: 'The service was slow but the food was excellent.'",
+    "completion": "Positive"
+  },
+  {
+    "instruction": "What are the primary colors?",
+    "completion": "The primary colors are red, blue, and yellow."
+  },
+  {
+    "instruction": "Extract the year mentioned in the text.",
+    "completion": "1937"
+  },
+  {
+    "instruction": "Name two programming languages used for data science.",
+    "completion": "Python and R are two popular programming languages used for data science."
+  },
+  {
+    "instruction": "Why do leaves change color in autumn?",
+    "completion": "Leaves change color in autumn because the chlorophyll in the leaves breaks down. Chlorophyll is the green pigment that plants use to absorb sunlight for photosynthesis. As the chlorophyll breaks down, other pigments in the leaves become visible. Red, blue, and yellow pigments are revealed."
+  },
+  {
+    "instruction": "Rewrite this sentence to be more concise.",
+    "completion": "Because it was raining, we decided to stay indoors."
+  },
+  {
+    "instruction": "What is the boiling point of water at sea level?",
+    "completion": "The boiling point of water is 100 degrees Celsius or 212 degrees Fahrenheit at sea level"
+  },
+  {
+    "instruction": "Describe the difference between a comet and an asteroid.",
+    "completion": "Comets are made of ice and dust, and they have a tail that is created when they approach the sun. Asteroids are made of rock and metal, and they do not have a tail."
+  },
+  {
+    "instruction": "Suggest a name for a coffee shop near a university.",
+    "completion": "A coffee shop near a university could be called \"The Study Spot\" or \"The Study Corner.\""
+  },
+  {
+    "instruction": "How many continents are there?",
+    "completion": "There are 7 continents"
+  },
+  {
+    "instruction": "Write a haiku about winter.",
+    "completion": "Snowflakes fall\nWinter's chill is felt\nWinter's beauty is seen"
+  }
+]

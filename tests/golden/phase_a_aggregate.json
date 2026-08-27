@@ -1,0 +1,184 @@
+{
+  "fixture_2": {
+    "adapter_divergence": 0.08431798219680786,
+    "combine_adapter_digest": "9849e90cfe64b61bd88226bcbc59afb5fb207219f61a911ffdc9d97e6b74a1ef",
+    "combine_momentum_is_none": true,
+    "dense_weights": [
+      0.6,
+      0.4
+    ],
+    "n": 2,
+    "per_tensor_norms_combined": {
+      "l0.k.A": 1.18283284,
+      "l0.k.B": 1.18266988,
+      "l0.q.A": 1.12323165,
+      "l0.q.B": 1.15454042,
+      "l1.o.A": 1.12309861,
+      "l1.o.B": 1.13775504,
+      "l1.v.A": 1.11450219,
+      "l1.v.B": 1.19516265,
+      "untouched": 15.45762348
+    },
+    "steps": [
+      120,
+      80
+    ]
+  },
+  "fixture_3": {
+    "adapter_divergence": 0.4475785394509633,
+    "check_norms": [
+      {
+        "accepted": true,
+        "detail": null,
+        "reason": null
+      },
+      {
+        "accepted": true,
+        "detail": null,
+        "reason": null
+      },
+      {
+        "accepted": false,
+        "detail": "l0.q.A: norm=78.27 > 5.0x median=1.569",
+        "reason": "norm_outlier"
+      },
+      {
+        "accepted": true,
+        "detail": null,
+        "reason": null
+      }
+    ],
+    "combine_digest": "f80d8cd0b092bfc9990f9e8c03bba4054cb51c9b37ed105271c03977ffafa094",
+    "combine_zero_guard_digest": "4187931f466766eea160c6091e041117fecd3adbcd0072a1ced7bed5915df2cd",
+    "dense_weights_capped": [
+      0.19801980198,
+      0.207920792079,
+      0.405940594059,
+      0.188118811881
+    ],
+    "n": 4,
+    "steps": [
+      200,
+      210,
+      5000,
+      190
+    ],
+    "zero_guard_untouched_is_exact_base": true
+  },
+  "fixture_4": {
+    "beta": 0.9,
+    "combine_digest_reduce1": "582c9ac105ddf8e9cfab1088fbee55c76502f027e60da7fe49343ae3d37adf4a",
+    "combine_digest_reduce2": "870f995fff51c9a9d7ec0924d7803f2e1330ea288e53638de34e2ce4ede77b5f",
+    "lr_outer": 0.7,
+    "mode": "diloco",
+    "momentum_digest_reduce1": "a4d2bb06d4e0ddb0d15b0667ca418af80530413a2a761a1454ede9c88a9f18c7",
+    "momentum_digest_reduce2": "0244fc96be4588050c44cc44cfd99511553b3caccc9da7c12dcc366c450f96fe"
+  },
+  "fixture_5": {
+    "key_mismatch": {
+      "accepted": false,
+      "adapter_returned": false,
+      "detail": "missing: untouched; extra: surprise",
+      "reason": "key_mismatch"
+    },
+    "no_steps": {
+      "accepted": false,
+      "adapter_returned": false,
+      "detail": "steps_completed=0",
+      "reason": "no_steps"
+    },
+    "non_finite": {
+      "accepted": false,
+      "adapter_returned": false,
+      "detail": "l1.v.B has NaN/Inf",
+      "reason": "non_finite"
+    },
+    "not_safetensors": {
+      "accepted": false,
+      "adapter_returned": false,
+      "detail": "Error while deserializing: header too large",
+      "reason": "not_safetensors"
+    },
+    "shape_mismatch": {
+      "accepted": false,
+      "adapter_returned": false,
+      "detail": "l0.q.A: expected (8, 32), got (8, 33)",
+      "reason": "shape_mismatch"
+    },
+    "steps_inconsistent": {
+      "accepted": false,
+      "adapter_returned": false,
+      "detail": "steps_completed=10 < heartbeat_steps=400",
+      "reason": "steps_inconsistent"
+    },
+    "truncated": {
+      "accepted": false,
+      "adapter_returned": false,
+      "detail": "Error while deserializing: incomplete metadata, file not fully covered",
+      "reason": "not_safetensors"
+    },
+    "valid": {
+      "accepted": true,
+      "adapter_returned": true,
+      "detail": null,
+      "reason": null
+    }
+  },
+  "fixture_6": {
+    "should_close": [
+      {
+        "close": false,
+        "elapsed_sec": 120,
+        "note": "before min",
+        "reason": "in progress"
+      },
+      {
+        "close": false,
+        "elapsed_sec": 301,
+        "note": "past min, under target steps",
+        "reason": "in progress"
+      },
+      {
+        "close": true,
+        "elapsed_sec": 901,
+        "note": "past backstop",
+        "reason": "max_round_sec"
+      },
+      {
+        "close": false,
+        "elapsed_sec": 250,
+        "note": "steps>=target but under min",
+        "reason": "in progress"
+      },
+      {
+        "close": true,
+        "elapsed_sec": 350,
+        "note": "steps>=target and past min",
+        "reason": "target_steps"
+      }
+    ]
+  },
+  "meta": {
+    "captured_against": "a1b4e36",
+    "checklist": "docs/10-jobtype-sdk.md inertness checklist, fixtures 2-5",
+    "exact_equality_required": [
+      "fixture_2.combine_adapter_digest",
+      "fixture_2.dense_weights",
+      "fixture_2.adapter_divergence",
+      "fixture_3.check_norms",
+      "fixture_3.dense_weights_capped",
+      "fixture_3.combine_zero_guard_digest",
+      "fixture_4.momentum_digest_reduce1",
+      "fixture_4.momentum_digest_reduce2",
+      "fixture_4.combine_digest_reduce2",
+      "fixture_5.*.reason",
+      "fixture_5.*.detail",
+      "fixture_6.should_close"
+    ],
+    "purpose": "Phase A numerical-inertness golden fixtures (aggregate + gates + should_close)",
+    "reproduce": "re-run tests/golden/capture_aggregate.py after the Phase A move; diff this file",
+    "seed": 20260827,
+    "tolerance": "none \u2014 CPU fp32, reduction order preserved by a verbatim move",
+    "torch": "2.13.0+cu130"
+  }
+}
