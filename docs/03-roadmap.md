@@ -1169,8 +1169,63 @@ scripts/status.py                    is it training, and who is contributing
 | Alerted about a stalled run without having to look | **met.** `--alert` is silent on success and exits 1, so cron is the whole scheduler |
 | A worker that is never leased can be told *why* | **met.** `GET /v1/workers/{id}/eligibility`, and `--fleet` for the operator's side |
 | Distinct contributors per round is visible (§3.2) | **met.** Reported per round, with a median and a flag when most rounds close with one machine |
-| A full restore performed at least once | **not started.** `scripts/backup.py` has never been restored from |
+| A full restore performed at least once | **met.** Performed against real MinIO with the database and the primary bucket both destroyed — see below |
 | Artifact volume has headroom, GC demonstrably keeping it | **not started** |
+
+### The restore drill, performed
+
+§6.4 names the shared VM as the system's single point of failure and §6.6
+accepts that risk on one sentence: "the database plus the newest adapter is
+enough to resume the run rather than restart it". That sentence had never been
+tested, and `backup.py` had never been restored from — which is why the
+criterion is worded as *performed at least once, not merely configured*.
+
+`scripts/restore.py` is the missing half. The drill, run against a real MinIO:
+seed a run at round 2 with two closed rounds and a worker mid-round holding a
+lease and a submission; back up off-box; **delete the database and destroy the
+primary bucket**; restore; start a coordinator on the result; register a real
+worker and claim.
+
+```
+restored from   backups/20260827T011617Z/coordinator.db
+adapters        1 copied, 0 already in the primary store
+rewound         drill-run#2 (2 lease(s) released, 1 partial submission(s) dropped)
+
+claim -> HTTP 200
+  CLAIMED ecb715df... | round 2 | buckets [4, 5, 6, 7, 0, 1, 2, 3] | steps 100
+  base adapter downloaded from the restored store: 240 bytes
+```
+
+Bucket ordering is the detail worth noticing: least-trained first, so §4.7's
+coverage state came through the restore intact. `invariants.check` is clean on
+the rebuilt database, and coverage still reads 8/8 with a spread of one.
+
+**A restore is not a resurrection, and the difference is the whole design.**
+Individual worker submissions are deliberately not backed up — they are already
+folded into the round result that *is* backed up, and they are the bulk of the
+bytes. So a restored database necessarily references artifacts that exist
+nowhere, and holds leases for workers talking to a machine that no longer
+exists. Left alone the round can neither close (its submissions cannot be read)
+nor progress (its shards look spoken for until every lease expires). The
+reconcile step rewinds exactly the in-flight round: one round of work re-done,
+which is precisely the work whose artifacts went down with the disk.
+
+A round caught mid-`closing` is the dangerous case, since `closing` is held by
+one caller and released only when it finishes — a restore that left it there
+would wedge the run permanently, in the same `stuck_close` state M4a's sixth
+bug produced.
+
+### And one bug in the backup, found by needing it
+
+`backup.py` never called `ensure_bucket` on the destination, so **the first
+backup to a fresh off-box bucket died with a boto stack trace**. This is
+verbatim the bug already recorded against `newrun` in M2 status — "wrote to a
+bucket it never ensured, so a first deployment depended on the coordinator
+having been started at least once beforehand" — in a second script, found only
+because someone finally ran the thing end to end.
+
+A backup that fails the first time it is genuinely needed is a worse class of
+bug than most, because nobody finds out until the disaster.
 
 ### The alert had to be defined against idleness, not around it
 

@@ -123,6 +123,14 @@ def main(
         )
     )
 
+    # The destination bucket may not exist yet, and the first backup is exactly
+    # when it will not. `newrun` shipped with this same omission (roadmap M2
+    # status): a script that writes to a bucket it never ensured turns a first
+    # deployment into an unwritten prerequisite whose symptom is a boto stack
+    # trace. A backup that fails the first time it is genuinely needed is worse
+    # than most bugs, because nobody finds out until the disaster.
+    dest_store.ensure_bucket()
+
     conn = connect(settings.db_path)
     try:
         now = datetime.now(timezone.utc)

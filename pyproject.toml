@@ -43,6 +43,8 @@ ganymede-worker = "ganymede.worker.loop:main"
 ganymede-host = "ganymede.host.agent:main"
 ganymede-cache = "ganymede.host.cache:main"
 ganymede-status = "scripts.status:main"
+ganymede-backup = "scripts.backup:main"
+ganymede-restore = "scripts.restore:main"
 ganymede-eligibility = "ganymede.coordinator.eligibility:main"
 
 [tool.setuptools.packages.find]

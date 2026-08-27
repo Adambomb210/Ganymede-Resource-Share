@@ -30,7 +30,7 @@ and disappear when it isn't.
 | `ganymede/host/` | The host agent (§7): decides whether and what to run. Standard library only |
 | `docker/` | The three-layer worker image stack (§4.1) |
 | `configs/` | Run configs — one file feeds calibrate, baseline and `newrun` alike |
-| `scripts/` | Admin CLI — create a run, issue a key, evaluate rounds, GC, backup |
+| `scripts/` | Admin CLI — create a run, issue a key, evaluate rounds, GC, back up and restore |
 | `deploy/` | Container image, compose file, env template |
 | `packaging/` | systemd, launchd and Task Scheduler units, and the three installers |
 | `tests/` | Unit tests per module, plus a fake-worker integration suite |

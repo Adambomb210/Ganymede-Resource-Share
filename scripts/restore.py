@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import sqlite3
 import sys
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -188,22 +189,25 @@ def restore(
         return report
 
     if dry_run:
-        # Still report what *would* happen, which means opening the snapshot --
-        # in memory, so a dry run cannot touch the destination at all.
-        scratch = sqlite3.connect(":memory:")
-        scratch.row_factory = sqlite3.Row
-        tmp = sqlite3.connect(":memory:")
-        tmp.deserialize(db_bytes) if hasattr(tmp, "deserialize") else None
-        conn = tmp if hasattr(tmp, "deserialize") else None
-        if conn is None:
-            report.problems.append(
-                "this Python's sqlite3 cannot deserialize in memory; run without --dry-run"
-            )
-            return report
-        conn.row_factory = sqlite3.Row
-        _plan_adapters(conn, backup_store, primary_store, report, copy=False)
-        scratch.close()
-        conn.close()
+        # Restore into a scratch file rather than the destination. Half-doing
+        # it in memory would exercise a different code path from the real
+        # thing, and a rehearsal that does not rehearse the actual steps is
+        # the same failure as a backup nobody has restored from.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            scratch = str(Path(tmp) / DB_BASENAME)
+            with open(scratch, "wb") as fh:
+                fh.write(db_bytes)
+            conn = connect(scratch)
+            try:
+                init_schema(conn)
+                _plan_adapters(conn, backup_store, primary_store, report, copy=False)
+                reconcile(conn, report)
+                _verify(conn, primary_store, report)
+            finally:
+                conn.close()
+        report.db_path = f"{db_path} (dry run: nothing written)"
         return report
 
     with open(db_path, "wb") as fh:
