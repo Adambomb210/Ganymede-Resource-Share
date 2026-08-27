@@ -13,6 +13,7 @@ import uuid
 from datetime import timedelta
 
 from ganymede.coordinator import invariants, rounds
+from ganymede.jobtypes.collab_lora_finetune import plan
 
 
 def _worker(conn, contributor_id, worker_id="w1"):
@@ -307,8 +308,8 @@ def test_coverage_distinguishes_advancing_from_retraining(conn, seeded_run):
 
 def test_the_loss_curve_skips_unevaluated_rounds_rather_than_zeroing_them(conn, seeded_run):
     run_id = seeded_run()
-    rounds.open_round(conn, run_id, 1, "b", 100, 0, 3600)
-    rounds.open_round(conn, run_id, 2, "c", 100, 0, 3600)
+    plan.open_round(conn, run_id, 1, "b", 100, 0, 3600)
+    plan.open_round(conn, run_id, 2, "c", 100, 0, 3600)
     conn.execute("UPDATE rounds SET eval_loss = 2.5 WHERE run_id = ? AND idx = 0", (run_id,))
     conn.execute("UPDATE rounds SET eval_loss = 2.1 WHERE run_id = ? AND idx = 2", (run_id,))
 

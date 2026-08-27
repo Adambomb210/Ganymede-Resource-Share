@@ -256,7 +256,7 @@ def run_task(
     ``rows`` is an injection point for tests and for a worker that has already
     materialized the dataset; left as ``None`` it resolves ``task.dataset_ref``.
     """
-    from ganymede.coordinator.aggregate import load_adapter, save_adapter
+    from ganymede.jobtypes.collab_lora_finetune.aggregate import load_adapter, save_adapter
 
     started = time.monotonic()
     hp = task.hp()

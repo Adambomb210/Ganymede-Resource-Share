@@ -124,7 +124,7 @@ class Evaluator:
         self._rows, self._partition, self._hp, self._device = rows, partition, hp, device
 
     def evaluate(self, conn: sqlite3.Connection, rnd: sqlite3.Row) -> float:
-        from ganymede.coordinator import aggregate
+        from ganymede.jobtypes.collab_lora_finetune import aggregate
         from ganymede.trainer import evaluate as eval_mod
         from ganymede.trainer import model as model_mod
 

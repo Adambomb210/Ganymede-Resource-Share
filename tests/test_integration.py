@@ -38,8 +38,9 @@ import pytest
 import torch
 from fastapi.testclient import TestClient
 
-from ganymede.coordinator import closer, rounds
-from ganymede.coordinator.aggregate import (
+from ganymede.coordinator import close, rounds
+from ganymede.jobtypes.collab_lora_finetune import plan, validate
+from ganymede.jobtypes.collab_lora_finetune.aggregate import (
     REJECT_DTYPE_MISMATCH,
     REJECT_KEY_MISMATCH,
     REJECT_NON_FINITE,
@@ -204,7 +205,7 @@ def test_zero_submission_round_reopens_quietly_at_backstop(conn, store, seeded_r
     ).fetchone()["opened_at"]
 
     future = rounds.utcnow() + timedelta(seconds=700)
-    result = closer.maybe_close(conn, store, run_id, now=future)
+    result = close.advance_job(conn, store, run_id, now=future)
     assert result is None
 
     row = conn.execute(
@@ -229,7 +230,7 @@ def test_one_submission_round_closes_at_backstop(client, store, conn, make_contr
     assert r["round_closed"] is False  # target unreachable; real elapsed time is ~0
 
     future = rounds.utcnow() + timedelta(seconds=700)
-    result = closer.maybe_close(conn, store, run_id, now=future)
+    result = close.advance_job(conn, store, run_id, now=future)
     assert result is not None
     assert result.reason == "max_round_sec"
     assert result.accepted == 1
@@ -337,7 +338,7 @@ def test_concurrent_submits_all_land_round_closes_once(client, store, conn, make
     still_open = conn.execute("SELECT status FROM rounds WHERE run_id=? AND idx=0", (run_id,)).fetchone()
     assert still_open["status"] == "open"  # n*50 << target_steps: confirms no racy premature close
 
-    result = closer.close_round(conn, store, run_id, 0, "test_forced")
+    result = close.close_round(conn, store, run_id, 0, "test_forced")
     assert result is not None
     assert result.accepted == n
     assert result.total_steps == n * 50
@@ -892,10 +893,10 @@ def test_task_seed_is_stable_across_processes_and_distinct_per_task():
     """A retried task must reproduce its data ordering; two concurrent tasks
     must not walk their shards in a correlated one. Python salts str hashing
     per process, so this cannot be built on hash()."""
-    a = rounds.task_seed("run1", 0, "task-aaa")
-    assert a == rounds.task_seed("run1", 0, "task-aaa")
-    assert a != rounds.task_seed("run1", 0, "task-bbb")
-    assert a != rounds.task_seed("run1", 1, "task-aaa")
+    a = plan.task_seed("run1", 0, "task-aaa")
+    assert a == plan.task_seed("run1", 0, "task-aaa")
+    assert a != plan.task_seed("run1", 0, "task-bbb")
+    assert a != plan.task_seed("run1", 1, "task-aaa")
 
 
 # ==========================================================================
@@ -910,7 +911,7 @@ def test_concurrent_round_close_race_crashes_the_loser(client, store, conn, sett
     assert r.status_code == 200 and r["accepted"] is True
 
     barrier = threading.Barrier(2)
-    real_immediate = closer.immediate
+    real_immediate = close.immediate
     tl = threading.local()
 
     @contextmanager
@@ -927,7 +928,7 @@ def test_concurrent_round_close_race_crashes_the_loser(client, store, conn, sett
         with real_immediate(c) as cc:
             yield cc
 
-    monkeypatch.setattr(closer, "immediate", synced_immediate)
+    monkeypatch.setattr(close, "immediate", synced_immediate)
 
     outcomes: dict[str, tuple[str, object]] = {}
 
@@ -937,7 +938,7 @@ def test_concurrent_round_close_race_crashes_the_loser(client, store, conn, sett
         # honours that by handing every request its own (app.get_conn).
         c = connect(settings.db_path)
         try:
-            outcomes[name] = ("ok", closer.close_round(c, store, run_id, 0, "race"))
+            outcomes[name] = ("ok", close.close_round(c, store, run_id, 0, "race"))
         except Exception as exc:
             outcomes[name] = ("err", exc)
         finally:
@@ -997,7 +998,7 @@ def test_expected_manifest_cache_ignores_store_identity():
     store_a = FakeStore()
     adapter_a = build_adapter(scale=0.01, seed=0)
     store_a.put_bytes(key, save_adapter(adapter_a))
-    manifest_a = closer.expected_manifest(store_a, key)
+    manifest_a = validate.expected_manifest(store_a, key)
     assert set(manifest_a) == set(adapter_a)
 
     store_b = FakeStore()
@@ -1005,7 +1006,7 @@ def test_expected_manifest_cache_ignores_store_identity():
     adapter_b["extra.lora_A.weight"] = torch.zeros(4, 8)  # a genuinely different manifest
     store_b.put_bytes(key, save_adapter(adapter_b))
 
-    manifest_b = closer.expected_manifest(store_b, key)
+    manifest_b = validate.expected_manifest(store_b, key)
     # Desired: reflects store_b's actual bytes, not store_a's stale cache entry.
     assert set(manifest_b) == set(adapter_b)
 
@@ -1164,7 +1165,7 @@ def test_a_close_that_dies_partway_gives_the_round_back(
 
     monkeypatch.setattr(store, "put_bytes", flaky_put)
     with pytest.raises(RuntimeError, match="storage went away"):
-        closer.close_round(conn, store, run_id, 0, "forced")
+        close.close_round(conn, store, run_id, 0, "forced")
 
     rnd = conn.execute(
         "SELECT status FROM rounds WHERE run_id = ? AND idx = 0", (run_id,)
@@ -1174,7 +1175,7 @@ def test_a_close_that_dies_partway_gives_the_round_back(
     # And the retry succeeds, aggregating the same submission -- the work was
     # never lost, only deferred.
     monkeypatch.undo()
-    result = closer.close_round(conn, store, run_id, 0, "retry")
+    result = close.close_round(conn, store, run_id, 0, "retry")
     assert result is not None
     assert result.accepted == 1
     assert result.result_adapter_ref

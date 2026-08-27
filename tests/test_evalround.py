@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 
 from ganymede.coordinator import rounds
+from ganymede.jobtypes.collab_lora_finetune import plan
 from scripts import evalround
 
 
@@ -20,7 +21,7 @@ def closed_rounds(conn, seeded_run):
     """A run with three closed rounds, each having published an adapter."""
     run_id = seeded_run()
     for idx in (1, 2):
-        rounds.open_round(conn, run_id, idx, f"base-{idx}", 100, 0, 3600)
+        plan.open_round(conn, run_id, idx, f"base-{idx}", 100, 0, 3600)
     for idx in (0, 1, 2):
         conn.execute(
             """UPDATE rounds SET status = 'closed', result_adapter_ref = ?
@@ -52,7 +53,7 @@ def test_only_closed_rounds_that_published_an_adapter_are_pending(conn, seeded_r
     """An open round has nothing to evaluate yet, and a round that closed with
     no accepted work published nothing -- neither is a backlog item."""
     run_id = seeded_run()
-    rounds.open_round(conn, run_id, 1, "base-1", 100, 0, 3600)
+    plan.open_round(conn, run_id, 1, "base-1", 100, 0, 3600)
     conn.execute(
         "UPDATE rounds SET status = 'closed', result_adapter_ref = NULL WHERE idx = 0"
     )

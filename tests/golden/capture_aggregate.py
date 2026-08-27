@@ -21,8 +21,8 @@ import sys
 
 import torch
 
-from ganymede.coordinator import aggregate as A
-from ganymede.coordinator import rounds as R
+from ganymede.jobtypes.collab_lora_finetune import aggregate as A
+from ganymede.jobtypes.collab_lora_finetune import plan as R
 from ganymede.coordinator.db import connect, init_schema, immediate
 
 OUT = pathlib.Path("tests/golden/phase_a_aggregate.json")

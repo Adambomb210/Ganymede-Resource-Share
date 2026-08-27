@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from ganymede.coordinator.aggregate import manifest_of
+from ganymede.jobtypes.collab_lora_finetune.aggregate import manifest_of
 from ganymede.trainer import model as M
 from scripts.newrun import build_seed_adapter
 

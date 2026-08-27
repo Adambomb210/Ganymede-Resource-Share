@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from ganymede.coordinator import rounds
+from ganymede.jobtypes.collab_lora_finetune import plan
 from ganymede.trainer import baseline as B
 from ganymede.trainer import calibrate as C
 
@@ -195,7 +196,7 @@ def test_submitted_metrics_carry_the_key_the_coordinator_folds_throughput_by(
     updates -- so budgets stay at the cold-start guess for the life of the run
     and nothing anywhere reports a problem.
     """
-    from ganymede.coordinator import aggregate
+    from ganymede.jobtypes.collab_lora_finetune import aggregate
     from ganymede.trainer import model as M
     from ganymede.trainer import train as T
     from scripts.newrun import build_seed_adapter
@@ -216,7 +217,7 @@ def test_submitted_metrics_carry_the_key_the_coordinator_folds_throughput_by(
     assert metrics["steps_per_min"] > 0
 
     # Exactly what close_round does with them.
-    rounds.update_throughput(conn, run_id, metrics["gpu_model"], float(metrics["steps_per_min"]))
+    plan.update_throughput(conn, run_id, metrics["gpu_model"], float(metrics["steps_per_min"]))
     stored = conn.execute(
         "SELECT gpu_model, steps_per_min FROM throughput WHERE run_id = 'fb'"
     ).fetchone()

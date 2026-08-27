@@ -19,11 +19,13 @@ from pydantic import BaseModel, Field
 
 from ganymede.coordinator import budget as budget_mod
 from ganymede.coordinator import eligibility
-from ganymede.coordinator import closer, rounds
+from ganymede.coordinator import close, rounds
 from ganymede.coordinator.auth import AuthError, Contributor, authenticate
 from ganymede.coordinator.config import Settings
 from ganymede.coordinator.db import connect, immediate, init_schema
 from ganymede.coordinator.store import Store, adapter_key
+from ganymede.jobtypes import resolve
+from ganymede.jobtypes.base import TaskSpec
 
 API_VERSION = "v1"
 
@@ -230,9 +232,9 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             # makes any worker that is still awake enough to move the run on,
             # and hands this one the freshly opened round instead of another
             # empty 204.
-            closer.maybe_close(conn, store, run_id, settings=settings)
+            close.advance_job(conn, store, run_id, settings=settings)
             try:
-                spec = rounds.claim_task(
+                spec = resolve("collab_lora_finetune").shape_claim(
                     conn, run_id, body.worker_id, contributor.clearance,
                     profile, settings, worker_image_tag=worker["image_tag"],
                 )
@@ -343,10 +345,11 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             "SELECT base_adapter_ref FROM rounds WHERE run_id = ? AND idx = ?",
             (task["run_id"], task["round_idx"]),
         ).fetchone()
-        expected = closer.expected_manifest(store, rnd["base_adapter_ref"])
-        accepted, reason = closer.gate_submission(conn, store, task_id, expected)
+        jt = resolve("collab_lora_finetune")
+        expected = jt.expected_manifest(store, rnd["base_adapter_ref"])
+        accepted, reason = jt.gate_submission(conn, store, task_id, expected)
 
-        result = closer.maybe_close(conn, store, task["run_id"], settings=settings)
+        result = close.advance_job(conn, store, task["run_id"], settings=settings)
         return {
             "accepted": accepted,
             "reject_reason": reason,
@@ -364,10 +367,14 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
 
     @app.get(f"/{API_VERSION}/runs/{{run_id}}/rounds/current")
     def current(run_id: str, conn: ConnDep, contributor: ContribDep) -> dict:
-        rnd = rounds.current_round(conn, run_id)
+        # A "round" is collab_lora_finetune-specific (docs/10 §5): this endpoint
+        # reads that type's `rounds` row via the type. A non-training job has no
+        # such row -> 404, indistinguishable from a missing run.
+        jt = resolve("collab_lora_finetune")
+        rnd = jt.current_round(conn, run_id)
         if rnd is None:
             raise HTTPException(status_code=404, detail="no current round")
-        prog = rounds.round_progress(conn, run_id, rnd["idx"])
+        prog = jt.round_progress(conn, run_id, rnd["idx"])
         return {
             "run_id": run_id, "round_idx": rnd["idx"], "status": rnd["status"],
             "opened_at": rnd["opened_at"], "target_steps": rnd["target_steps"],
@@ -457,7 +464,7 @@ def _selectable_runs(conn: sqlite3.Connection, pinned: str | None,
     return [r["id"] for r in sorted(rows, key=lambda r: r["base_model"] not in cached)]
 
 
-def _task_payload(spec: rounds.TaskSpec, store: Store, settings: Settings) -> dict:
+def _task_payload(spec: TaskSpec, store: Store, settings: Settings) -> dict:
     url, expires = store.presign_get(spec.base_adapter_ref)
     return {
         "task_id": spec.id,
@@ -465,7 +472,7 @@ def _task_payload(spec: rounds.TaskSpec, store: Store, settings: Settings) -> di
         "round_idx": spec.round_idx,
         "buckets": spec.buckets,
         "num_buckets": spec.num_buckets,
-        "seed": rounds.task_seed(spec.run_id, spec.round_idx, spec.id),
+        "seed": resolve("collab_lora_finetune").task_seed(spec.run_id, spec.round_idx, spec.id),
         "local_steps": spec.local_steps,
         "max_runtime_sec": spec.max_runtime_sec,
         "lease_expires_at": spec.lease_expires_at.isoformat(),

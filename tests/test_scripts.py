@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from ganymede.coordinator import rounds
-from ganymede.coordinator.aggregate import load_adapter, save_adapter
+from ganymede.jobtypes.collab_lora_finetune.aggregate import load_adapter, save_adapter
 from ganymede.coordinator.auth import hash_key
 from ganymede.coordinator.store import adapter_key, base_adapter_key, momentum_key
 from scripts import backup, gc, issue_key, newrun

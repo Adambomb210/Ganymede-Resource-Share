@@ -22,7 +22,7 @@ from typing import Any
 import torch
 from safetensors.torch import save as _st_save
 
-from ganymede.coordinator.aggregate import save_adapter
+from ganymede.jobtypes.collab_lora_finetune.aggregate import save_adapter
 
 # --------------------------------------------------------------------------
 # Adapter construction

@@ -14,7 +14,7 @@ import time
 import pytest
 import torch
 
-from ganymede.coordinator import aggregate
+from ganymede.jobtypes.collab_lora_finetune import aggregate
 from ganymede.trainer import data as D
 from ganymede.trainer import evaluate as E
 from ganymede.trainer import model as M

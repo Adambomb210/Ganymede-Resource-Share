@@ -24,7 +24,7 @@ import time
 
 import torch
 
-from ganymede.coordinator import aggregate as A
+from ganymede.jobtypes.collab_lora_finetune import aggregate as A
 from ganymede.trainer import data as D
 from ganymede.trainer import train as T
 from scripts.newrun import build_seed_adapter

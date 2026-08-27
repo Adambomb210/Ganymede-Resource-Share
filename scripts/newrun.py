@@ -28,7 +28,8 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 from ganymede.coordinator import config as config_mod
 from ganymede.coordinator import rounds
-from ganymede.coordinator.aggregate import save_adapter
+from ganymede.jobtypes.collab_lora_finetune import plan
+from ganymede.jobtypes.collab_lora_finetune.aggregate import save_adapter
 from ganymede.coordinator.config import Settings
 from ganymede.coordinator.db import connect, immediate, init_schema
 from ganymede.coordinator.store import Store, base_adapter_key
@@ -431,7 +432,7 @@ def main(
         # safe to have committed on their own: an active run with no open round
         # is a recoverable inconsistency an operator can repair, which a run
         # whose open round points at a missing object is not.
-        rounds.open_round(
+        plan.open_round(
             conn, args.run_id, 0, round0_key,
             args.target_steps, args.min_round_sec, args.max_round_sec,
         )

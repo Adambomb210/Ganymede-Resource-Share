@@ -1,4 +1,4 @@
-"""Tests for ganymede.coordinator.aggregate (docs/02-architecture-v2.md section 5)."""
+"""Tests for ganymede.jobtypes.collab_lora_finetune.aggregate (docs/02-architecture-v2.md section 5)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import pytest
 import torch
 from safetensors.torch import save as st_save
 
-from ganymede.coordinator.aggregate import (
+from ganymede.jobtypes.collab_lora_finetune.aggregate import (
     REJECT_DTYPE_MISMATCH,
     REJECT_KEY_MISMATCH,
     REJECT_NO_STEPS,

@@ -20,7 +20,8 @@ import torch
 from fastapi.testclient import TestClient
 
 from ganymede.coordinator import rounds
-from ganymede.coordinator.aggregate import save_adapter
+from ganymede.jobtypes.collab_lora_finetune import plan
+from ganymede.jobtypes.collab_lora_finetune.aggregate import save_adapter
 from ganymede.coordinator.app import create_app
 from ganymede.coordinator.auth import generate_key, hash_key
 from ganymede.coordinator.config import Settings, StorageConfig
@@ -192,7 +193,7 @@ def seeded_run(conn, store):
             )
         base_ref = base_adapter_key(run_id, 0)
         store.put_bytes(base_ref, save_adapter(make_adapter(scale=0.01, seed=0)))
-        rounds.open_round(conn, run_id, 0, base_ref, target_steps,
+        plan.open_round(conn, run_id, 0, base_ref, target_steps,
                           min_round_sec, max_round_sec)
         return run_id
     return _seed
