@@ -15,6 +15,7 @@ real machine can make. See packaging/README.md for the per-platform commands.
 from __future__ import annotations
 
 import configparser
+import os
 import plistlib
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -159,6 +160,15 @@ def test_the_three_platforms_agree_on_a_cadence():
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason=(
+        "`bash` on a Windows runner is System32\\bash.exe, the WSL launcher, and with "
+        "no distro installed it fails with its own message in UTF-16 rather than "
+        "parsing anything. These installers target Linux and macOS; Windows has "
+        "install-windows.ps1, which the CI job parses with PowerShell itself."
+    ),
+)
 @pytest.mark.parametrize("script", ["install-linux.sh", "install-macos.sh"])
 def test_the_shell_installers_are_syntactically_valid(script):
     import subprocess
