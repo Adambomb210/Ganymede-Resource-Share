@@ -122,29 +122,44 @@ the coordinator wants — without starting anything.
 
 ## What CI can and cannot check
 
-`tests/test_packaging.py` parses all four scheduler files and asserts the
+`tests_host/test_packaging.py` parses all four scheduler files and asserts the
 things that fail *silently*: a doubled hyphen inside an XML comment (which
 makes a plist launchd will not load), a Task Scheduler document whose elements
-are in the wrong order (rejected at import), a declared encoding that does not
-match the bytes on disk, a cadence that has drifted apart between platforms.
+are in the wrong order (rejected at import), an encoding claim of any kind in
+the task XML, a cadence that has drifted apart between platforms.
 
-Both of the XML files shipped broken on their first draft, in exactly those
-ways, which is why the tests exist.
+The `host` job in `.github/workflows/ci.yml` goes further, on real operating
+systems: Task Scheduler *imports* the task on windows-latest, `plutil` lints
+the plist on macos-latest, PowerShell parses the installer, `systemd-analyze`
+verifies the unit and then systemd *runs* it, and each platform's real idle
+probe is executed rather than faked.
 
-What CI cannot check is that any of them *fires*. There is no systemd, launchd
-or Task Scheduler on a Linux CI container. That claim comes from a real install
-on a real machine, using the commands above.
+That distinction earned its keep immediately. **A parser is not an importer**:
+the task XML parsed cleanly in Python for two commits while Task Scheduler
+refused it outright, and only the Windows runner could say so. Every one of
+these files shipped broken in some way on its first draft.
+
+What still cannot be checked here is whether a timer *fires on a contributor's
+machine over hours*, and whether the idle probes agree with a real desktop.
+Those come from a real install, using the commands above.
 
 ## Editing notes
 
 - **XML comments cannot contain `--`.** This bites immediately, because the flag
   being documented is `--once`. Keep prose in this file.
-- **`ganymede-host-task.xml` is UTF-8 on disk** and declares UTF-8. The
-  installer reads it with `Get-Content -Raw` and hands the string to
-  `Register-ScheduledTask -Xml`, which takes a string. If you ever switch to
-  `schtasks /create /xml`, that reads a *file* and historically wants UTF-16 —
-  convert at that point, and change the declaration to match, or it will fail
-  the same way it did before.
+- **`ganymede-host-task.xml` carries no XML declaration, deliberately**, and
+  it took two failures to land there. It first declared UTF-16 while being
+  ASCII on disk, which every parser rejects. Declaring UTF-8 instead fixed the
+  parsers and broke the real consumer: the installer reads the file into a
+  .NET string, which is already UTF-16 in memory, and Task Scheduler's importer
+  refuses a contrary encoding claim inside one — `unable to switch the
+  encoding`, at column 40. With no declaration both are satisfied, since XML
+  defaults to UTF-8 absent a declaration and a BOM. Only the Windows CI job
+  could have caught the second one; a parser is not an importer.
+
+  If you ever switch to `schtasks /create /xml`, that reads a *file* rather
+  than a string and historically wants UTF-16 — convert at that point and add
+  a matching declaration then.
 - The two `__GANYMEDE_*__` placeholders in the task XML are substituted on a
   copy. The template on disk never changes, which is what makes re-running the
   installer a repair rather than a rewrite.

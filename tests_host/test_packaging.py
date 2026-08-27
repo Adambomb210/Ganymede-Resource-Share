@@ -61,10 +61,27 @@ def test_the_plist_carries_no_key():
 # --------------------------------------------------------------------------
 
 
-def test_the_task_xml_is_well_formed_and_its_declared_encoding_is_true():
-    """It previously declared UTF-16 while being UTF-8 on disk, which every
-    parser rejects before reading a single element."""
+def test_the_task_xml_is_well_formed():
     ET.parse(PACKAGING / "ganymede-host-task.xml")
+
+
+def test_the_task_xml_declares_no_encoding_at_all():
+    """Both of this file's encoding bugs, as one assertion.
+
+    It first shipped declaring UTF-16 while being ASCII on disk, which every
+    parser rejects. Declaring UTF-8 instead fixed the parsers and broke the
+    only consumer that matters: install-windows.ps1 reads it into a .NET
+    string, which is already UTF-16 in memory, and Task Scheduler's importer
+    refuses a contrary encoding claim inside one -- "unable to switch the
+    encoding", at column 40, which is the declaration.
+
+    No declaration satisfies both. XML defaults to UTF-8 when there is neither
+    a declaration nor a BOM, and the file is ASCII, so nothing is ambiguous.
+    """
+    raw = (PACKAGING / "ganymede-host-task.xml").read_bytes()
+    assert not raw.lstrip().startswith(b"<?xml")
+    assert not raw.startswith(b"\xef\xbb\xbf")   # a BOM is an encoding claim too
+    assert all(b < 128 for b in raw), "non-ASCII byte with no declaration to interpret it"
 
 
 def test_the_task_elements_are_in_the_order_the_importer_demands():

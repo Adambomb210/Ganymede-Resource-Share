@@ -1,4 +1,23 @@
-<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  NO XML DECLARATION, DELIBERATELY, and it is the third thing this file got
+  wrong. It shipped declaring UTF-16 while being ASCII on disk, which every
+  parser rejects. Declaring UTF-8 instead fixed the parsers and broke the only
+  consumer that matters: install-windows.ps1 reads this file into a .NET string
+  and hands it to `Register-ScheduledTask -Xml`, and a .NET string is already
+  UTF-16 in memory, so the COM importer refuses an explicit contrary encoding
+  claim inside it:
+
+      The task XML is malformed.  (1,40)::ERROR: unable to switch the encoding
+
+  Column 40 is the declaration. With no declaration at all both consumers are
+  happy: XML defaults to UTF-8 for a file with no declaration and no BOM, which
+  this ASCII file trivially is, and Task Scheduler gets a string making no
+  encoding claim it can disagree with.
+
+  If you ever switch the installer to `schtasks /create /xml`, that reads a
+  *file* rather than a string and historically wants UTF-16. Convert at that
+  point, and add a matching declaration then.
+-->
 <!--
   Ganymede host agent tick (docs/02-architecture-v2.md section 7, section 4.1).
   Windows is the pip + Scheduled Task path by default (Docker Desktop/WSL2 is
