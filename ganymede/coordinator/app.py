@@ -9,18 +9,28 @@ here.
 
 from __future__ import annotations
 
+import hmac
 import json
 import sqlite3
 import uuid
+from datetime import timedelta
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from ganymede.coordinator import budget as budget_mod
-from ganymede.coordinator import eligibility
+from ganymede.coordinator import eligibility, identity
 from ganymede.coordinator import close, rounds
-from ganymede.coordinator.auth import AuthError, Contributor, authenticate
+from ganymede.coordinator.auth import (
+    AuthError,
+    Contributor,
+    Machine,
+    Principal,
+    authenticate,
+    hash_key,
+    parse_bearer,
+)
 from ganymede.coordinator.config import Settings
 from ganymede.coordinator.db import connect, immediate, init_schema
 from ganymede.coordinator.store import Store, adapter_key
@@ -71,6 +81,20 @@ class SubmitRequest(BaseModel):
     metrics: dict[str, Any] = Field(default_factory=dict)
 
 
+class SessionRequest(BaseModel):
+    username: str
+    secret: str
+
+
+class EnrollRequest(BaseModel):
+    display_name: str | None = None
+
+
+class ClaimEnrollmentRequest(BaseModel):
+    enroll_token: str
+    compute_profile: ComputeProfile
+
+
 # --------------------------------------------------------------------------
 # App
 # --------------------------------------------------------------------------
@@ -102,25 +126,126 @@ def get_conn(request: Request):
 ConnDep = Annotated[sqlite3.Connection, Depends(get_conn)]
 
 
-def require_contributor(
+_SESSION_COOKIE = "ganymede_session"
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def _principal(
+    request: Request, conn: sqlite3.Connection, authorization: str | None
+) -> tuple[Principal, bool]:
+    """Shared front half of every auth dependency: TLS gate, then resolve the
+    bearer header or the session cookie to a ``Principal``. Returns
+    ``(principal, via_cookie)``.
+
+    CSRF (docs/06 "CSRF", docs/08): a bearer caller is immune. A cookie caller
+    on a state-changing method must additionally carry ``X-Ganymede-UI: 1`` --
+    a static header htmx sets globally and a cross-origin form cannot forge.
+    ``SameSite=Lax`` on the cookie already blocks the cross-site form post; this
+    is the second lock, and there is no token store.
+    """
+    if request.app.state.settings.require_tls:
+        # A bearer token over plain HTTP is a token in the clear on every hop.
+        # X-Forwarded-Proto covers the reverse-proxy deployment (6.5).
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+        if proto != "https":
+            raise HTTPException(status_code=403, detail="TLS required")
+
+    cookie = request.cookies.get(_SESSION_COOKIE)
+    try:
+        principal = authenticate(conn, authorization, cookie=cookie)
+    except AuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+    via_cookie = parse_bearer(authorization) is None and cookie is not None
+    if via_cookie and request.method not in _SAFE_METHODS:
+        if request.headers.get("x-ganymede-ui") != "1":
+            raise HTTPException(status_code=403, detail="missing X-Ganymede-UI header")
+    return principal, via_cookie
+
+
+def require_user(
     request: Request,
     conn: ConnDep,
     authorization: Annotated[str | None, Header()] = None,
 ) -> Contributor:
-    # TLS is mandatory: a bearer token over plain HTTP is a token in the clear
-    # on every hop between a volunteer's home network and here.
-    # X-Forwarded-Proto covers the reverse-proxy deployment (6.5).
-    if request.app.state.settings.require_tls:
-        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
-        if proto != "https":
-            raise HTTPException(status_code=403, detail="TLS required")
-    try:
-        return authenticate(conn, authorization)
-    except AuthError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    """Any authenticated contributor -- a contributor key or a web session
+    (docs/08 auth-class table). A ``Machine`` principal is rejected here."""
+    principal, _ = _principal(request, conn, authorization)
+    if not isinstance(principal, Contributor):
+        raise HTTPException(status_code=401, detail="user credential required")
+    return principal
+
+
+# The pre-08 name. Every existing endpoint depends on it; it is exactly
+# ``require_user`` (docs/08: "today's require_contributor").
+require_contributor = require_user
+
+
+def require_machine(
+    request: Request,
+    conn: ConnDep,
+    authorization: Annotated[str | None, Header()] = None,
+) -> Machine:
+    """A worker process, by its machine key (docs/08). Transitional rule (Spine
+    deviation 4): a pre-004 ``workers`` row with no ``machine_keys`` still
+    authenticates with its owner's contributor key until it re-enrolls, logged
+    ``audit(event='legacy_worker_auth')``. Anyone else resolving to a
+    ``Contributor`` gets 404 -- existence is not confirmed."""
+    principal, _ = _principal(request, conn, authorization)
+    if isinstance(principal, Machine):
+        return principal
+    legacy = conn.execute(
+        """SELECT w.id, w.contributor_id, w.standing
+             FROM workers w
+            WHERE w.contributor_id = ?
+              AND NOT EXISTS (SELECT 1 FROM machine_keys k WHERE k.machine_id = w.id)
+            ORDER BY w.first_seen LIMIT 1""",
+        (principal.id,),
+    ).fetchone()
+    if legacy is None:
+        raise HTTPException(status_code=404, detail="unknown machine")
+    with immediate(conn):
+        conn.execute(
+            "INSERT INTO audit (at, contributor_id, worker_id, event, detail_json) "
+            "VALUES (?, ?, ?, 'legacy_worker_auth', '{}')",
+            (rounds._iso(rounds.utcnow()), principal.id, legacy["id"]),
+        )
+    return Machine(legacy["id"], legacy["contributor_id"], legacy["standing"])
+
+
+def require_submitter(
+    request: Request,
+    conn: ConnDep,
+    authorization: Annotated[str | None, Header()] = None,
+) -> Contributor:
+    """A ``Contributor`` on the vetted allowlist (docs/08). A non-approved
+    caller gets 404 -- the submitter surface is not confirmed to exist for
+    them."""
+    user = require_user(request, conn, authorization)
+    row = conn.execute(
+        "SELECT status FROM submitters WHERE user_id = ?", (user.id,)
+    ).fetchone()
+    if row is None or row["status"] != "approved":
+        raise HTTPException(status_code=404, detail="not found")
+    return user
+
+
+def require_admin(
+    request: Request,
+    conn: ConnDep,
+    authorization: Annotated[str | None, Header()] = None,
+) -> Contributor:
+    """``Contributor.is_admin`` (docs/08). An authenticated non-admin gets 404
+    on the whole ``/v1/admin/*`` tree -- the admin API is not confirmed to
+    exist; the unauthenticated get 401 from ``_principal`` first."""
+    user = require_user(request, conn, authorization)
+    if not user.is_admin:
+        raise HTTPException(status_code=404, detail="not found")
+    return user
 
 
 ContribDep = Annotated[Contributor, Depends(require_contributor)]
+UserDep = Annotated[Contributor, Depends(require_user)]
 
 
 def create_app(settings: Settings, store: Store) -> FastAPI:
@@ -414,6 +539,216 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             ],
         }
 
+    # ---------------- identity / enrollment (docs/08) ----------------
+
+    @app.post(f"/{API_VERSION}/auth/session")
+    def auth_session_create(body: SessionRequest, conn: ConnDep) -> Any:
+        """Placeholder provider login (Decision 5). Verifies the credential
+        through the configured ``IdentityProvider``, resolves the ``contributors``
+        row, mints a session, and returns it both as a ``Set-Cookie`` (for
+        ``/ui/*``) and in the body (for non-browser callers). Real OAuth/OIDC
+        later swaps the body and the verification, not this endpoint."""
+        from fastapi.responses import JSONResponse
+
+        provider = identity.PROVIDERS.get(settings.auth_provider)
+        if provider is None:
+            raise HTTPException(status_code=500, detail="no such auth provider")
+        try:
+            ident = provider.verify(body.model_dump(), conn)
+        except AuthError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+        row = conn.execute(
+            """SELECT id, enabled, is_admin FROM contributors
+                WHERE auth_provider = ?
+                  AND (auth_subject = ? OR (? IS NULL AND name = ?))""",
+            (ident.auth_provider, ident.auth_subject, ident.auth_subject, ident.name),
+        ).fetchone()
+        # External providers JIT-provision on first login; ``local`` never does
+        # -- local rows come from the bootstrap var or an admin.
+        if row is None or not row["enabled"]:
+            raise HTTPException(status_code=401, detail="unknown credential")
+
+        with immediate(conn):
+            minted = identity.mint_session(conn, row["id"], settings.session_ttl_sec)
+
+        resp = JSONResponse(
+            {"session_token": minted.token, "expires_at": minted.expires_at}
+        )
+        resp.set_cookie(
+            _SESSION_COOKIE, minted.token, httponly=True, secure=True,
+            samesite="lax", path="/",
+        )
+        return resp
+
+    @app.delete(f"/{API_VERSION}/auth/session")
+    def auth_session_delete(request: Request, conn: ConnDep,
+                            user: UserDep) -> Any:
+        """Logout / revoke the calling session (docs/08 Spine deviation 1).
+        Deletes the row for the cookie this request carried; a bearer caller has
+        no session row and simply gets the clear-cookie response."""
+        from fastapi.responses import JSONResponse
+
+        cookie = request.cookies.get(_SESSION_COOKIE)
+        if cookie:
+            with immediate(conn):
+                conn.execute(
+                    "DELETE FROM sessions WHERE token_hash = ?", (hash_key(cookie),)
+                )
+        resp = JSONResponse({"ok": True})
+        resp.delete_cookie(_SESSION_COOKIE, path="/")
+        return resp
+
+    @app.post(f"/{API_VERSION}/machines/enroll")
+    def machine_enroll(body: EnrollRequest, conn: ConnDep, user: UserDep) -> dict:
+        """Mint a one-time enrollment token bound to the calling user. The
+        operator pastes it into the host config; the host then calls
+        ``claim-enrollment`` with the token alone."""
+        token = identity.new_enroll_token()
+        enroll_id = uuid.uuid4().hex
+        now = rounds._iso(rounds.utcnow())
+        with immediate(conn):
+            conn.execute(
+                """INSERT INTO enrollments
+                     (id, user_id, token_hash, display_name, created_at,
+                      consumed_at, machine_id)
+                   VALUES (?, ?, ?, ?, ?, NULL, NULL)""",
+                (enroll_id, user.id, hash_key(token), body.display_name, now),
+            )
+        expires_at = rounds._iso(
+            rounds.utcnow() + timedelta(seconds=settings.enroll_ttl_sec)
+        )
+        # ``enroll_token`` is shown once -- only its sha256 is stored.
+        return {"enroll_token": token, "enroll_id": enroll_id, "expires_at": expires_at}
+
+    @app.post(f"/{API_VERSION}/machines/claim-enrollment")
+    def machine_claim_enrollment(body: ClaimEnrollmentRequest, conn: ConnDep) -> dict:
+        """Redeem an enrollment token (no auth -- the token is the credential).
+        Mints the durable ``machine_id``, the first machine key, and consumes the
+        token. Unknown / consumed / expired all return the same 404 so a probe
+        cannot learn a token was ever valid (docs/08 404-not-403)."""
+        profile = body.compute_profile.model_dump()
+        digest = hash_key(body.enroll_token)
+        now = rounds._iso(rounds.utcnow())
+        with immediate(conn):
+            row = conn.execute(
+                "SELECT * FROM enrollments WHERE token_hash = ?", (digest,)
+            ).fetchone()
+            if (
+                row is None
+                or not hmac.compare_digest(row["token_hash"], digest)
+                or row["consumed_at"] is not None
+                or identity.enroll_is_expired(row["created_at"], settings.enroll_ttl_sec)
+            ):
+                raise HTTPException(status_code=404, detail="unknown enrollment")
+
+            machine_id = uuid.uuid4().hex
+            conn.execute(
+                """INSERT INTO workers
+                     (id, contributor_id, compute_profile_json, display_name,
+                      enrolled_at, first_seen, last_seen,
+                      hardware_fingerprint_json, standing)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'good')""",
+                (machine_id, row["user_id"], json.dumps(profile),
+                 row["display_name"], now, now, now,
+                 identity.fingerprint_from_profile(profile)),
+            )
+            machine_key = identity.new_machine_key()
+            conn.execute(
+                """INSERT INTO machine_keys (machine_id, key_hash, enabled, created_at)
+                   VALUES (?, ?, 1, ?)""",
+                (machine_id, hash_key(machine_key), now),
+            )
+            consumed = conn.execute(
+                """UPDATE enrollments SET consumed_at = ?, machine_id = ?
+                    WHERE id = ? AND consumed_at IS NULL""",
+                (now, machine_id, row["id"]),
+            )
+            if consumed.rowcount == 0:
+                # Lost the one-time race -- roll the whole block back.
+                raise HTTPException(status_code=404, detail="unknown enrollment")
+        # ``machine_key`` shown once. Weight recompute (Decision 12) is the
+        # ledger workstream's hook and not wired here.
+        return {"machine_id": machine_id, "machine_key": machine_key}
+
+    @app.get(f"/{API_VERSION}/machines")
+    def machines_list(conn: ConnDep, user: UserDep) -> dict:
+        """The caller's machines, their standing, and accrued Weighted System
+        Hours (``SUM(weighted_hours) WHERE kind='provisioned'`` -- zero until the
+        ledger workstream writes accrual rows)."""
+        rows = conn.execute(
+            """SELECT w.id, w.display_name, w.standing, w.reputation,
+                      w.enrolled_at, w.last_seen,
+                      COALESCE((SELECT SUM(weighted_hours) FROM credit_events c
+                                 WHERE c.machine_id = w.id AND c.kind = 'provisioned'),
+                               0.0) AS weighted_hours_total
+                 FROM workers w
+                WHERE w.contributor_id = ?
+                ORDER BY w.enrolled_at, w.first_seen""",
+            (user.id,),
+        ).fetchall()
+        return {"machines": [
+            {"machine_id": r["id"], "display_name": r["display_name"],
+             "standing": r["standing"], "reputation": r["reputation"],
+             "enrolled_at": r["enrolled_at"], "last_seen": r["last_seen"],
+             "weighted_hours_total": r["weighted_hours_total"]}
+            for r in rows
+        ]}
+
+    def _owned_machine(conn: sqlite3.Connection, machine_id: str, user: Contributor):
+        row = conn.execute(
+            "SELECT id, contributor_id, standing FROM workers WHERE id = ?",
+            (machine_id,),
+        ).fetchone()
+        if row is None or (row["contributor_id"] != user.id and not user.is_admin):
+            # 404 not 403: a machine the caller may not see is indistinguishable
+            # from one that does not exist (docs/08 404-not-403).
+            raise HTTPException(status_code=404, detail="unknown machine")
+        return row
+
+    @app.post(f"/{API_VERSION}/machines/{{machine_id}}/retire")
+    def machine_retire(machine_id: str, conn: ConnDep, user: UserDep) -> dict:
+        """Owner removes a machine: ``standing = 'revoked'`` and every key
+        disabled. ``credit_events`` rows stay (append-only). ``audit.event``
+        separates ``owner_retire`` from a fraud ``revoke`` (Spine deviation 3)."""
+        _owned_machine(conn, machine_id, user)
+        now = rounds._iso(rounds.utcnow())
+        with immediate(conn):
+            conn.execute(
+                "UPDATE workers SET standing = 'revoked' WHERE id = ?", (machine_id,)
+            )
+            conn.execute(
+                "UPDATE machine_keys SET enabled = 0 WHERE machine_id = ?", (machine_id,)
+            )
+            conn.execute(
+                "INSERT INTO audit (at, contributor_id, worker_id, event, detail_json) "
+                "VALUES (?, ?, ?, 'owner_retire', '{}')",
+                (now, user.id, machine_id),
+            )
+        return {"machine_id": machine_id, "standing": "revoked"}
+
+    @app.post(f"/{API_VERSION}/machines/{{machine_id}}/rotate-key")
+    def machine_rotate_key(machine_id: str, conn: ConnDep, user: UserDep) -> dict:
+        """Issue a new machine key and disable the old ones -- for a leaked key
+        with a live machine still behind it (Spine deviation 2). Standing is
+        untouched; key-enabled and standing are separate axes (docs/08)."""
+        _owned_machine(conn, machine_id, user)
+        new_key = identity.new_machine_key()
+        new_hash = hash_key(new_key)
+        now = rounds._iso(rounds.utcnow())
+        with immediate(conn):
+            conn.execute(
+                """INSERT INTO machine_keys (machine_id, key_hash, enabled, created_at)
+                   VALUES (?, ?, 1, ?)""",
+                (machine_id, new_hash, now),
+            )
+            conn.execute(
+                """UPDATE machine_keys SET enabled = 0
+                    WHERE machine_id = ? AND key_hash != ?""",
+                (machine_id, new_hash),
+            )
+        return {"machine_id": machine_id, "machine_key": new_key}
+
     @app.get("/status")
     def status(conn: ConnDep) -> dict:
         runs = conn.execute(
@@ -501,6 +836,9 @@ def bootstrap() -> FastAPI:
     settings = Settings.from_env()
     conn = connect(settings.db_path)
     init_schema(conn)
+    # Decision 14: the first admin is named by env, after the schema and every
+    # migration are in place. Idempotent -- safe on every boot.
+    identity.ensure_bootstrap_admin(conn, settings.bootstrap_admin)
     conn.close()
     store = Store(settings.storage)
     store.ensure_bucket()

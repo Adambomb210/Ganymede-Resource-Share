@@ -123,6 +123,15 @@ class Settings:
     # re-converge into a synchronized poll.
     poll_interval_sec: int
     gc_keep_rounds: int
+    # --- Identity, enrollment, admin (docs/08 "Frozen for downstream"). ---
+    # Defaulted so the existing 16-kwarg ``Settings(...)`` in tests/conftest.py
+    # and every ``dataclasses.replace`` call keeps constructing.
+    auth_provider: str = "local"
+    session_ttl_sec: int = 43200          # 12 h, absolute; no sliding renewal
+    enroll_ttl_sec: int = 3600            # 1 h -- a token goes into a config within the minute
+    # First admin, named by env (Decision 14): comma-separated ``name`` or
+    # ``name:secret``. Unset -> no bootstrap admin.
+    bootstrap_admin: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -143,4 +152,8 @@ class Settings:
             throughput_floor_frac=_env_float("GANYMEDE_THROUGHPUT_FLOOR", 0.10),
             poll_interval_sec=_env_int("GANYMEDE_POLL_SEC", 60),
             gc_keep_rounds=_env_int("GANYMEDE_GC_KEEP_ROUNDS", 3),
+            auth_provider=_env("GANYMEDE_AUTH_PROVIDER", "local"),
+            session_ttl_sec=_env_int("GANYMEDE_SESSION_TTL_SEC", 43200),
+            enroll_ttl_sec=_env_int("GANYMEDE_ENROLL_TTL_SEC", 3600),
+            bootstrap_admin=os.environ.get("GANYMEDE_BOOTSTRAP_ADMIN"),
         )
