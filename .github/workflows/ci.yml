@@ -41,6 +41,194 @@ jobs:
         # covered by the nightly job below rather than on every push.
         run: python -m pytest tests/ -q -m "not slow"
 
+  host:
+    # The host agent is the one component that runs on somebody else's machine,
+    # on an OS nobody here has, started by a scheduler a Linux container does
+    # not have. Everything M3 could not prove locally is proved here instead:
+    # that Task Scheduler really imports the task, that launchd really loads the
+    # plist, that PowerShell really parses the installer, and that the three
+    # platform idle probes really run.
+    #
+    # Cheap enough for every push because `tests_host/` needs nothing but
+    # pytest -- see tests_host/README.md. No torch on any of these runners.
+    name: Host agent (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform's scheduler failing should not hide the other two.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install the way a contributor on the container path does
+        # --no-deps is the assertion, not an optimization: `ganymede/host`
+        # imports nothing outside the standard library, and this step fails
+        # loudly the day that stops being true.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --no-deps .
+          python -m pip install pytest
+
+      - name: The host package imports with nothing else installed
+        run: python -c "from ganymede.host import agent, cache, config, idle, manifest, runtime; print('six modules, stdlib only')"
+
+      - name: Host suite
+        run: python -m pytest tests_host/ -q
+
+      - name: The real idle probe for this platform
+        # xprintidle, ioreg and GetLastInputInfo are all faked in the unit
+        # tests, which is right for a hermetic suite and means the actual
+        # platform calls have never been executed anywhere. `idle_seconds`
+        # never raises by contract; None means "cannot tell", which on Linux is
+        # the expected answer on a headless box.
+        run: python -c "from ganymede.host import idle; s = idle.idle_seconds(); print('idle_seconds ->', s); assert s is None or s >= 0"
+
+      # ---------------------------------------------------------------- Linux
+      - name: systemd accepts and runs the unit
+        if: runner.os == 'Linux'
+        # The GitHub Linux runner is a VM with real systemd, unlike the
+        # container this was developed in. This is the only place the unit's
+        # sandbox is actually exercised: ProtectSystem=strict makes the whole
+        # filesystem read-only except ReadWritePaths, so a missing entry there
+        # turns the contributor's `--pause` into a permission error that no
+        # amount of local testing would show.
+        run: |
+          set -euxo pipefail
+          AGENT="$(command -v ganymede-host)"
+          sudo install -d -m 0755 /etc/ganymede /var/lib/ganymede /var/log/ganymede /var/cache/ganymede/hf
+          sudo sed "s|^ExecStart=.*|ExecStart=$AGENT --once|" packaging/ganymede-host.service \
+            | sudo tee /etc/systemd/system/ganymede-host.service >/dev/null
+          sudo cp packaging/ganymede-host.timer /etc/systemd/system/
+          sudo systemd-analyze verify /etc/systemd/system/ganymede-host.service
+          sudo systemctl daemon-reload
+
+      - name: An unconfigured unit fails loudly rather than silently
+        if: runner.os == 'Linux'
+        # EnvironmentFile=- must tolerate the file being absent, and the agent
+        # must exit non-zero so the failure lands in `systemctl status` -- which
+        # is the first place a contributor looks.
+        run: |
+          set -ux
+          if sudo systemctl start ganymede-host.service; then
+            echo "an unconfigured agent should have failed the unit"
+            exit 1
+          fi
+          systemctl is-failed ganymede-host.service
+          journalctl -u ganymede-host.service -n 5 --no-pager | grep -q "not configured"
+
+      - name: A configured unit ticks, and can write its state directory
+        if: runner.os == 'Linux'
+        # The coordinator is deliberately unreachable, so a correct tick is a
+        # quiet exit 0. Reaching that at all proves the sandbox lets the unit
+        # read /etc/ganymede and write /var/lib/ganymede.
+        run: |
+          set -euxo pipefail
+          printf 'GANYMEDE_KEY=ci-test-key\n' | sudo tee /etc/ganymede/host.env >/dev/null
+          sudo chmod 0600 /etc/ganymede/host.env
+          printf '%s\n' '{"coordinator_url": "https://coordinator.invalid", "state_dir": "/var/lib/ganymede", "cache_dir": "/var/cache/ganymede/hf", "cache_cap_gb": 40}' \
+            | sudo tee /etc/ganymede/host.json >/dev/null
+          sudo systemctl start ganymede-host.service
+          journalctl -u ganymede-host.service -n 10 --no-pager
+          sudo test -d /var/lib/ganymede
+
+      - name: The timer schedules
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          sudo systemctl enable --now ganymede-host.timer
+          systemctl list-timers ganymede-host.timer --no-pager | tee /dev/stderr | grep -q ganymede-host
+          sudo systemctl disable --now ganymede-host.timer
+
+      # ---------------------------------------------------------------- macOS
+      - name: launchd accepts the plist
+        if: runner.os == 'macOS'
+        # `plutil -lint` is launchd's own parser, and it is what catches the
+        # failure this file already had once: a doubled hyphen inside an XML
+        # comment, which makes the plist unparseable and which launchd responds
+        # to by declining to load it and saying nothing.
+        run: |
+          set -euxo pipefail
+          plutil -lint packaging/com.ganymede.host.plist
+          AGENT="$(command -v ganymede-host)"
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /var/log/ganymede
+          mkdir -p "$HOME/Library/LaunchAgents"
+          sed "s|<string>/usr/local/bin/ganymede-host</string>|<string>$AGENT</string>|" \
+            packaging/com.ganymede.host.plist > "$HOME/Library/LaunchAgents/com.ganymede.host.plist"
+          plutil -lint "$HOME/Library/LaunchAgents/com.ganymede.host.plist"
+
+      - name: launchd loads it
+        if: runner.os == 'macOS'
+        # Informational for now. A CI runner's session is not a logged-in
+        # desktop, and this plist is a LaunchAgent precisely because Metal needs
+        # one (packaging/README.md), so a bootstrap failure here would say
+        # something about the runner rather than about the file. The lint above
+        # is the assertion; this is here to find out whether the load can be one
+        # too.
+        continue-on-error: true
+        run: |
+          set -x
+          launchctl load "$HOME/Library/LaunchAgents/com.ganymede.host.plist"
+          launchctl list | grep ganymede
+          launchctl unload "$HOME/Library/LaunchAgents/com.ganymede.host.plist"
+
+      # -------------------------------------------------------------- Windows
+      - name: PowerShell parses the installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        # install-windows.ps1 has never been executed anywhere. Parsing it is
+        # not running it, but it is the difference between a script with a
+        # syntax error and one without, and there is no other machine here that
+        # can tell.
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path packaging/install-windows.ps1), [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | ForEach-Object { Write-Host $_ }; throw "install-windows.ps1 does not parse" }
+          "install-windows.ps1 parses"
+
+      - name: Task Scheduler imports the task
+        if: runner.os == 'Windows'
+        shell: pwsh
+        # The real check. Task Scheduler's importer is stricter than any XML
+        # parser -- element order, namespace, and the principal all have to be
+        # right -- and this file already shipped once declaring an encoding it
+        # did not have. A task that fails to import means a contributor whose
+        # install "succeeds" and never ticks.
+        run: |
+          $agent = (Get-Command ganymede-host).Source
+          $xml = (Get-Content packaging/ganymede-host-task.xml -Raw).
+              Replace('__GANYMEDE_HOST_EXE__', $agent).
+              Replace('__GANYMEDE_USER__', "$env:USERDOMAIN\$env:USERNAME")
+          Register-ScheduledTask -Xml $xml -TaskName ganymede-host -TaskPath '\Ganymede\' | Out-Null
+          Get-ScheduledTask -TaskPath '\Ganymede\' | Format-List TaskName, State
+          $action = (Get-ScheduledTask -TaskPath '\Ganymede\' -TaskName ganymede-host).Actions[0]
+          if ($action.Execute -ne $agent) { throw "task points at $($action.Execute), not $agent" }
+          if ($action.Arguments -ne '--once') { throw "task arguments are $($action.Arguments)" }
+          Unregister-ScheduledTask -TaskPath '\Ganymede\' -TaskName ganymede-host -Confirm:$false
+          "task imported, verified and removed"
+
+      # ------------------------------------------------------- all platforms
+      - name: The CLI a contributor runs after installing
+        shell: bash
+        # `--check` is the last step of every installer, so it is the command a
+        # contributor sees first. Exit 1 here is correct: everything resolves,
+        # and the deliberately-invalid coordinator is unreachable.
+        run: |
+          set -ux
+          printf '%s\n' '{"coordinator_url": "https://coordinator.invalid", "key": "ci-test-key", "cache_cap_gb": 40}' > host.json
+          # `if !` rather than a bare call: the runner's bash has -e on, and this
+          # command is *expected* to exit 1.
+          if ganymede-host --config host.json --check; then
+            echo "expected exit 1 from an unreachable coordinator, got 0"
+            exit 1
+          fi
+          echo "--check reported correctly"
+
   container:
     name: Worker container
     runs-on: ubuntu-latest

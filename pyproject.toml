@@ -47,7 +47,11 @@ ganymede-cache = "ganymede.host.cache:main"
 include = ["ganymede*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# Two roots. `tests_host` is deliberately not under `tests/`, because
+# tests/conftest.py imports torch for the coordinator fixtures and the host
+# agent's whole delivery story is that it needs nothing outside the standard
+# library -- see tests_host/README.md.
+testpaths = ["tests", "tests_host"]
 filterwarnings = ["ignore::DeprecationWarning"]
 markers = [
     "slow: needs the network (a HuggingFace config fetch) or is otherwise not fast",
