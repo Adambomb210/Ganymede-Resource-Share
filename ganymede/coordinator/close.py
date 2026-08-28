@@ -14,6 +14,7 @@ type module directly.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from datetime import datetime
@@ -25,10 +26,19 @@ from ganymede.jobtypes import resolve
 
 log = logging.getLogger("ganymede.coordinator.close")
 
-# Phase A: every ``runs`` row is a ``collab_lora_finetune`` job (no ``job_type``
-# column until Phase B's migration 003), so the type is resolved by name here.
-# This becomes a lookup keyed off the job row once ``jobs`` exists.
+# The type behind a ``runs`` row. Every ``runs`` row is a
+# ``collab_lora_finetune`` job; a ``batch_inference`` job has no ``runs`` child
+# and reaches ``advance_job`` by ``job_id`` instead.
 _JOB_TYPE = "collab_lora_finetune"
+
+
+def _job_type_of(conn: sqlite3.Connection, job_id: str | None) -> str:
+    if job_id is None:
+        return _JOB_TYPE
+    row = conn.execute(
+        "SELECT job_type FROM jobs WHERE id = ?", (job_id,)
+    ).fetchone()
+    return row["job_type"] if row is not None else _JOB_TYPE
 
 
 def close_round(
@@ -96,18 +106,32 @@ def close_round(
 def advance_job(
     conn: sqlite3.Connection,
     store,
-    run_id: str,
+    run_id: str | None = None,
     now: datetime | None = None,
     settings=None,
+    *,
+    job_id: str | None = None,
 ):
-    """Evaluate the close rule for a run's current round and act on it.
+    """Evaluate the completion rule for a job and act on it.
 
-    Called opportunistically from the request path (after a submit) rather than
-    from a background scheduler: with rounds measured in tens of minutes, a
-    close that lands a few seconds late costs nothing, and one fewer moving
-    part is worth more than the precision.
+    Called opportunistically from the request path (after a submit, and on the
+    claim poll) rather than from a background scheduler: with rounds measured in
+    tens of minutes, a close that lands a few seconds late costs nothing, and
+    one fewer moving part is worth more than the precision.
+
+    A type that returns a ``ReduceState`` (``collab_lora_finetune``) is driven
+    by ``run_id`` through the round machinery below. A ``reduce -> None`` type
+    (``batch_inference``) has no ``runs`` child and is passed by ``job_id``: the
+    dispatcher's own rule -- every ``plan`` task accepted and every
+    ``attempt_group`` agreed -- decides completion (docs/10 §5).
     """
     now = now or rounds.utcnow()
+
+    if run_id is None:
+        if job_id is None:
+            return None
+        return _advance_parallel_job(conn, store, job_id, now)
+
     run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
     if run is None:
         return None
@@ -154,4 +178,105 @@ def _mirror_job_status(conn: sqlite3.Connection, run) -> None:
             "UPDATE jobs SET status = ? "
             "WHERE id = ? AND status NOT IN ('done', 'failed', 'cancelled')",
             (target, run["job_id"]),
+        )
+
+
+# --------------------------------------------------------------------------
+# Embarrassingly-parallel completion (docs/10 §5) -- the dispatcher's rule for
+# a ``reduce -> None`` type. Owned here, not by the type: ``is_complete`` has
+# neither ``conn`` nor a ``ReduceState`` to count from.
+# --------------------------------------------------------------------------
+
+
+def _advance_parallel_job(
+    conn: sqlite3.Connection, store, job_id: str, now: datetime
+):
+    """A job whose ``plan`` fixed a finite task set is ``done`` once every task
+    has an accepted verdict and every ``attempt_group`` has agreed.
+
+    Disagreement in a group re-dispatches its members (back to ``planned``,
+    worker cleared) and leaves the offending submissions uncredited -- a basic
+    gate; probation / per-machine sampling scoring is Phase D (docs/10 §4).
+    """
+    job = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if job is None or job["status"] in ("done", "failed", "cancelled"):
+        return None
+
+    jt = resolve(job["job_type"])
+    # This path is for a ``reduce -> None`` type only -- one with a real reduce
+    # is driven by ``run_id`` through the round machinery instead.
+    if hasattr(jt, "shape_claim"):  # pragma: no cover - defensive
+        return None
+
+    tasks = conn.execute(
+        "SELECT * FROM tasks WHERE job_id = ?", (job_id,)
+    ).fetchall()
+    if not tasks:
+        return None
+
+    def _accepted(task_id: str) -> bool:
+        row = conn.execute(
+            "SELECT accepted FROM submissions WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        return row is not None and row["accepted"] == 1
+
+    if not all(_accepted(t["id"]) for t in tasks):
+        return None
+
+    spec = json.loads(job["spec_json"] or "{}")
+    redundancy = spec.get("redundancy") or {}
+    agree_on = redundancy.get("agree_on", "output")
+    sample_rows = int(redundancy.get("sample_rows", 8))
+
+    groups: dict[str, list[sqlite3.Row]] = {}
+    for t in tasks:
+        if t["attempt_group"]:
+            groups.setdefault(t["attempt_group"], []).append(t)
+
+    from ganymede.jobtypes.batch_inference import run as bi_run
+    from ganymede.jobtypes.batch_inference import validate as bi_validate
+
+    for group, members in groups.items():
+        outputs = []
+        ok = True
+        for m in members:
+            sub = conn.execute(
+                "SELECT artifact_ref FROM submissions WHERE task_id = ?", (m["id"],)
+            ).fetchone()
+            try:
+                outputs.append(bi_run.parse_jsonl(store.get_bytes(sub["artifact_ref"])))
+            except Exception:
+                ok = False
+                break
+        if not ok:
+            return None
+        if not bi_validate.sample_agreement(outputs, sample_rows, agree_on):
+            _redispatch_group(conn, members, group, now)
+            return None
+
+    with immediate(conn):
+        conn.execute(
+            "UPDATE jobs SET status = 'done' "
+            "WHERE id = ? AND status NOT IN ('done', 'failed', 'cancelled')",
+            (job_id,),
+        )
+    return None
+
+
+def _redispatch_group(
+    conn: sqlite3.Connection, members: list[sqlite3.Row], group: str, now: datetime
+) -> None:
+    with immediate(conn):
+        for m in members:
+            conn.execute(
+                "UPDATE tasks SET status = 'planned', worker_id = NULL, "
+                "lease_expires_at = NULL WHERE id = ?",
+                (m["id"],),
+            )
+            conn.execute("DELETE FROM submissions WHERE task_id = ?", (m["id"],))
+        conn.execute(
+            "INSERT INTO audit (at, event, detail_json) VALUES (?, ?, ?)",
+            (rounds._iso(now), "attempt_group_disagreement",
+             json.dumps({"attempt_group": group,
+                         "tasks": [m["id"] for m in members]})),
         )

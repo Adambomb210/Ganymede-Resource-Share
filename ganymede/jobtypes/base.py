@@ -13,7 +13,7 @@ current call site passes the same fields it always did.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 
@@ -23,42 +23,49 @@ class TaskSpec:
     """The coordinator -> worker task descriptor.
 
     Widened from the LoRA-only shape that lived in ``coordinator/rounds.py``:
-    ``job_id`` / ``input_ref`` are the generic handles, the LoRA fields below
-    them now default to ``None`` so a non-training type can build one without
-    naming an adapter. No wire or column change -- this mirrors the ``tasks``
-    table's generic ``input_ref_json`` beside type-specific ``buckets_json``.
+    ``job_id`` / ``input_ref`` are the generic handles, and every LoRA-specific
+    field now defaults so a non-training type can build one without naming an
+    adapter, a run or a round (docs/10 "Spine deviations" #1). No wire or column
+    change -- this mirrors the ``tasks`` table's generic ``input_ref_json``
+    beside type-specific ``buckets_json`` and its nullable ``run_id`` /
+    ``round_idx``. Every current ``collab_lora_finetune`` call site passes the
+    same fields by keyword, so the added defaults are inert for it.
     """
 
     id: str
-    run_id: str
-    round_idx: int
-    buckets: list[int]
+    # Generic fields (docs/10 "Spine deviations" #1). ``input_ref`` is the
+    # type-agnostic input handle -- a shard ref for ``batch_inference``.
+    # ``attempt_group`` ties the ``n`` redundant copies of one logical unit
+    # together (docs/05 ``tasks.attempt_group``); ``None`` = singleton.
+    job_id: str | None = None
+    input_ref: str | None = None
+    attempt_group: str | None = None
+    # LoRA / round fields -- ``None`` for a type that has no run or round.
+    run_id: str | None = None
+    round_idx: int | None = None
+    buckets: list[int] = field(default_factory=list)
     # Total bucket count for the run. The worker receives bucket *indices* and
     # has to turn them into rows itself -- the coordinator never sees the data --
     # which it cannot do without knowing how many buckets the dataset was cut
     # into. Sending the indices alone is not a shard assignment.
-    num_buckets: int
-    local_steps: int
+    num_buckets: int | None = None
+    local_steps: int | None = None
     # Wall-clock safety net (8). The worker stops at whichever comes first, this
     # or lease_expires_at -- they answer different questions: this one is "how
     # long was this work budgeted", the lease is "when does the coordinator stop
     # believing you".
-    max_runtime_sec: int
-    lease_expires_at: datetime
-    base_adapter_ref: str
-    base_model: str
-    base_precision: str
-    lora_cfg: dict
-    hyperparams: dict
-    dataset_ref: str
+    max_runtime_sec: int | None = None
+    lease_expires_at: datetime | None = None
+    base_adapter_ref: str | None = None
+    base_model: str | None = None
+    base_precision: str | None = None
+    lora_cfg: dict | None = None
+    hyperparams: dict | None = None
+    dataset_ref: str | None = None
     # Image tag the worker must be running, or None for no requirement (4.2
     # step 5). A worker that cannot honour it abandons before downloading
     # anything rather than submitting an artifact from the wrong stack.
-    required_image: str | None
-    # Generic fields (docs/10 "Spine deviations" #1). Additive; the training
-    # type leaves them None and passes the LoRA fields exactly as before.
-    job_id: str | None = None
-    input_ref: str | None = None
+    required_image: str | None = None
 
 
 @dataclass(frozen=True)

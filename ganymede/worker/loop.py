@@ -73,6 +73,7 @@ MIN_HEARTBEAT_INTERVAL_SEC = 5
 DECLINE_PRECISION = "precision_unsupported"
 DECLINE_IMAGE = "image_mismatch"
 DECLINE_MEMORY = "insufficient_memory"
+DECLINE_JOBTYPE_VERSION = "job_type_version_unsupported"
 
 
 @dataclass
@@ -241,6 +242,26 @@ class Worker:
                 f"{DECLINE_IMAGE}: run needs {required_image!r}, "
                 f"this worker is {self.config.image_tag!r}"
             )
+
+        # Job-type version binding (docs/10 §2): a spec that pins a newer SDK
+        # version than this build's REGISTRY carries is abandoned before any
+        # download -- exactly as the required_image mismatch is. In-tree types
+        # deploy from one release so the coordinator has already refused this
+        # at claim time; this is the belt to that braces.
+        sdk = task.get("sdk")
+        if isinstance(sdk, dict) and sdk.get("version") is not None:
+            try:
+                from ganymede.jobtypes import REGISTRY
+
+                local = REGISTRY.get(sdk.get("job_type"))
+                if local is not None and int(sdk["version"]) > local.version:
+                    return False, (
+                        f"{DECLINE_JOBTYPE_VERSION}: spec pins "
+                        f"{sdk.get('job_type')!r} v{sdk['version']}, this worker "
+                        f"has v{local.version}"
+                    )
+            except Exception:  # noqa: BLE001 - never let the check itself abort a claim
+                pass
 
         precision = task.get("base_precision")
         if precision and precision not in self.profile.get("supports", []):

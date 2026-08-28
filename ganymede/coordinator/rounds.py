@@ -46,18 +46,32 @@ class NotEligible(Exception):
     """Worker or contributor may not work this run. Carries a reason for the log."""
 
 
-def _round_still_accepting(conn: sqlite3.Connection, run_id: str, round_idx: int):
+def _round_still_accepting(conn: sqlite3.Connection, task: sqlite3.Row):
     """The 409 seam (docs/10 §3).
 
-    Whether the run's job type still accepts work for the round a held lease
-    belongs to. ``collab_lora_finetune`` checks its ``rounds`` row; a type
-    without a reduce step always accepts. Returns ``None`` to continue, or a
-    ``RoundClosed`` for the caller to raise. Imported lazily so this generic
-    module has no import-time dependency on the job-type package.
+    Whether the task's job type still accepts work for the unit a held lease
+    belongs to. ``collab_lora_finetune`` checks its ``rounds`` row via
+    ``still_accepting``; a type with no round (``batch_inference``) has no
+    ``run_id`` / ``round_idx`` and always accepts. Returns ``None`` to continue,
+    or a ``RoundClosed`` for the caller to raise. Imported lazily so this
+    generic module has no import-time dependency on the job-type package.
     """
+    if task["run_id"] is None:
+        return None
     from ganymede.jobtypes import resolve
 
-    return resolve("collab_lora_finetune").still_accepting(conn, run_id, round_idx)
+    job_type = "collab_lora_finetune"
+    if task["job_id"] is not None:
+        row = conn.execute(
+            "SELECT job_type FROM jobs WHERE id = ?", (task["job_id"],)
+        ).fetchone()
+        if row is not None:
+            job_type = row["job_type"]
+    jt = resolve(job_type)
+    still = getattr(jt, "still_accepting", None)
+    if still is None:
+        return None
+    return still(conn, task["run_id"], task["round_idx"])
 
 
 # --------------------------------------------------------------------------
@@ -99,7 +113,7 @@ def heartbeat(
         if task["status"] != "leased":
             raise LeaseLost(f"task is {task['status']}")
 
-        closed = _round_still_accepting(conn, task["run_id"], task["round_idx"])
+        closed = _round_still_accepting(conn, task)
         if closed is not None:
             raise closed
 
@@ -166,7 +180,7 @@ def record_submission(
         if task["status"] != "leased":
             raise LeaseLost(f"task is {task['status']}")
 
-        closed = _round_still_accepting(conn, task["run_id"], task["round_idx"])
+        closed = _round_still_accepting(conn, task)
         if closed is not None:
             raise closed
 

@@ -370,24 +370,41 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         # re-served that task -- resumed through its owning job type for a fresh
         # presign, never a replay of the expired URLs, and never a second task.
         held = conn.execute(
-            "SELECT id, run_id, job_id FROM tasks "
-            "WHERE worker_id = ? AND status = 'leased' LIMIT 1",
+            "SELECT * FROM tasks WHERE worker_id = ? AND status = 'leased' LIMIT 1",
             (body.worker_id,),
         ).fetchone()
         if held is not None:
-            spec = _resume_held(conn, held, worker, contributor, profile, settings)
-            if spec is not None:
-                # ``tasks.job_id`` is not backfilled by migration 005 (docs/05
-                # pins pre-005 task rows' job_id to NULL), so fall back to the
-                # spec's job_id -- which the type reads off ``runs.job_id``,
-                # always set post-005 -- rather than write a NULL into
-                # worker_eligibility and have record() swallow the FK error.
-                job_id = held["job_id"] or spec.job_id
-                eligibility.record(
-                    conn, body.worker_id,
-                    [eligibility.Verdict(job_id, eligibility.LEASED)],
-                )
-                return JSONResponse(_task_payload(spec, store, settings))
+            if held["run_id"] is not None:
+                spec = _resume_held(conn, held, worker, contributor, profile, settings)
+                if spec is not None:
+                    # ``tasks.job_id`` is not backfilled by migration 005 (docs/05
+                    # pins pre-005 task rows' job_id to NULL), so fall back to the
+                    # spec's job_id -- which the type reads off ``runs.job_id``,
+                    # always set post-005 -- rather than write a NULL into
+                    # worker_eligibility and have record() swallow the FK error.
+                    job_id = held["job_id"] or spec.job_id
+                    eligibility.record(
+                        conn, body.worker_id,
+                        [eligibility.Verdict(job_id, eligibility.LEASED)],
+                    )
+                    return JSONResponse(_task_payload(spec, store, settings))
+            else:
+                # A held task from a static (no-``shape_claim``) type: rebuild
+                # the payload from the ``tasks`` row and a fresh ``inputs_for``
+                # presign. Returning here keeps the one-lease-per-machine
+                # invariant -- a machine holding a batch task never reaches the
+                # walk to lease a second.
+                resumed = _resume_held_static(conn, store, held, settings)
+                if resumed is not None:
+                    spec, task_inputs, jt = resumed
+                    eligibility.record(
+                        conn, body.worker_id,
+                        [eligibility.Verdict(held["job_id"], eligibility.LEASED)],
+                    )
+                    return JSONResponse(_task_payload(
+                        spec, store, settings, jt=jt, task_inputs=task_inputs,
+                        sdk={"job_type": jt.name, "version": jt.version},
+                    ))
 
         # Map a v1 worker's run_id pin to its parent job (docs/07 §1); job_id is
         # the new pin. A pin still passes through the constraint gate below.
@@ -407,29 +424,41 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         # in a machine that is fine.
         verdicts: list[eligibility.Verdict] = []
         for job in jobs:
-            if job["job_type"] != "collab_lora_finetune":
-                # Phase A ships one type; anything else is not walkable yet.
-                continue
-            run_id = job["run_id"]
-            if run_id is None:
-                # A bare POST /v1/jobs collab job with no runs child: nothing to
-                # hand out until newrun wires one up.
+            try:
+                jt = resolve(job["job_type"])
+            except KeyError:
+                # Not a registered type on this build -- nothing to hand out.
                 verdicts.append(eligibility.Verdict(job["id"], eligibility.IDLE))
                 continue
 
-            # Evaluate the close here too, not only after a submit. A round can
-            # become closeable through the passage of time alone -- its backstop
-            # arrives with work already in hand -- and on the submit path alone
-            # nothing would ever notice: every worker has already submitted, and
-            # none can claim. Closing on the poll moves the run on and hands
-            # this one the freshly opened round instead of another empty 204.
-            close.advance_job(conn, store, run_id, settings=settings)
+            # Version binding (docs/10 §2). ``spec_json.sdk.version`` was frozen
+            # at POST /v1/jobs; a pinned version this build's REGISTRY is older
+            # than is a refusal recorded verbatim in worker_eligibility --
+            # exactly as the required_image mismatch is (claim.py).
+            pinned = _pinned_sdk_version(job)
+            if pinned is not None:
+                try:
+                    resolve(job["job_type"], pinned)
+                except AssertionError:
+                    verdicts.append(eligibility.Verdict(
+                        job["id"], eligibility.REFUSED, "job_type_version_unsupported"
+                    ))
+                    continue
+
+            # Evaluate completion here too, not only after a submit. A collab
+            # round can become closeable through the passage of time alone, and
+            # a parallel job's last accepted verdict may have landed on a submit
+            # that could not see the whole task set yet. Advancing on the poll
+            # moves the job on rather than handing out another empty 204.
+            if job["run_id"] is not None:
+                close.advance_job(conn, store, job["run_id"], settings=settings)
+            else:
+                close.advance_job(conn, store, job_id=job["id"], settings=settings)
 
             # The constraint gate (Decision 15, docs/07 §2). Pure -- reads only
-            # (machine_id, profile), no DB, no write lock -- which is why it
-            # sits here and not inside claim_task. A refusal is a `continue`,
-            # never a `break`: the walk reaching the first lower-rank job this
-            # machine fits *is* the capability backfill (Decision 10).
+            # (machine_id, profile), no DB, no write lock. A refusal is a
+            # `continue`, never a `break`: the walk reaching the first lower-rank
+            # job this machine fits *is* the capability backfill (Decision 10).
             ok, why = constraints_mod.check_constraints(
                 job["constraints_json"], body.worker_id, profile
             )
@@ -439,22 +468,41 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                 )
                 continue
 
-            try:
-                spec = resolve("collab_lora_finetune").shape_claim(
-                    conn, run_id, body.worker_id, contributor.clearance,
-                    profile, settings, worker_image_tag=worker["image_tag"],
+            if hasattr(jt, "shape_claim"):
+                # Dynamic type: per-machine task sizing at claim time
+                # (docs/10 §3). ``collab_lora_finetune``.
+                run_id = job["run_id"]
+                if run_id is None:
+                    verdicts.append(eligibility.Verdict(job["id"], eligibility.IDLE))
+                    continue
+                try:
+                    spec = jt.shape_claim(
+                        conn, run_id, body.worker_id, contributor.clearance,
+                        profile, settings, worker_image_tag=worker["image_tag"],
+                    )
+                except rounds.NotEligible as exc:
+                    verdicts.append(
+                        eligibility.Verdict(job["id"], eligibility.REFUSED, str(exc))
+                    )
+                    continue
+                task_inputs = None
+                # Carry the frozen pin only when the job actually has one
+                # (docs/10 §2). A run seeded by scripts/newrun has spec '{}' --
+                # no sdk block -- and the collab payload stays byte-for-byte.
+                sdk = ({"job_type": jt.name, "version": jt.version}
+                       if pinned is not None else None)
+            else:
+                # Static type: ``plan`` output claimed as-is -- take one unleased
+                # ``tasks`` row for this job (docs/10 §3, §4).
+                spec, task_inputs = _claim_static_task(
+                    conn, jt, store, job, body.worker_id, settings
                 )
-            except rounds.NotEligible as exc:
-                verdicts.append(
-                    eligibility.Verdict(job["id"], eligibility.REFUSED, str(exc))
-                )
-                continue
+                sdk = {"job_type": jt.name, "version": jt.version}
 
             if spec is not None:
                 # First lease flips the job queued -> running (docs/07 §1). Its
-                # own transaction, after claim_task's commit; eligibility.record
-                # comes after this one, never between (docs/07 §1 freezes that
-                # ordering).
+                # own transaction; eligibility.record comes after, never between
+                # (docs/07 §1 freezes that ordering).
                 with immediate(conn):
                     conn.execute(
                         "UPDATE jobs SET status = 'running' "
@@ -463,12 +511,14 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                     )
                 verdicts.append(eligibility.Verdict(job["id"], eligibility.LEASED))
                 eligibility.record(conn, body.worker_id, verdicts)
-                return JSONResponse(_task_payload(spec, store, settings))
+                return JSONResponse(_task_payload(
+                    spec, store, settings, jt=jt, task_inputs=task_inputs, sdk=sdk
+                ))
 
-            # Eligible, but this job had nothing to hand out: no open round, or
-            # too little of it left to be worth a budget. Recorded separately
-            # from a refusal because a uniformly-idle fleet is a different
-            # operator problem from a uniformly-refused one.
+            # Eligible, but nothing to hand out: no open round / no unleased
+            # task left. Recorded separately from a refusal because a
+            # uniformly-idle fleet is a different operator problem from a
+            # uniformly-refused one.
             verdicts.append(eligibility.Verdict(job["id"], eligibility.IDLE))
 
         eligibility.record(conn, body.worker_id, verdicts)
@@ -533,7 +583,10 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         if task is None:
             raise HTTPException(status_code=404, detail="unknown task")
         _worker_for_task(conn, task_id, contributor)
-        key = adapter_key(task["run_id"], task["round_idx"], task_id)
+        # The key is derived from the task, never taken from the request. For a
+        # collab round it is the per-round submission key; for a static type it
+        # is the output key ``plan`` fixed in the task descriptor.
+        key = _task_artifact_key(conn, task)
         url, expires = store.presign_put(key)
         return {"url": url, "key": key, "expires_at": expires.isoformat()}
 
@@ -542,11 +595,12 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                contributor: ContribDep) -> dict:
         worker_id = _worker_for_task(conn, task_id, contributor)
         task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        jt = _resolve_for_task(conn, task)
 
         # The key is derived, never taken from the request. Trusting a
         # worker-supplied key would let one contributor point a submission at
         # another's artifact -- or at the round's base adapter.
-        expected_key = adapter_key(task["run_id"], task["round_idx"], task_id)
+        expected_key = _task_artifact_key(conn, task)
         if body.artifact_key != expected_key:
             raise HTTPException(status_code=422, detail="artifact_key does not match task")
 
@@ -560,20 +614,33 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         except rounds.LeaseLost as exc:
             raise HTTPException(status_code=410, detail=str(exc)) from exc
 
-        rnd = conn.execute(
-            "SELECT base_adapter_ref FROM rounds WHERE run_id = ? AND idx = ?",
-            (task["run_id"], task["round_idx"]),
-        ).fetchone()
-        jt = resolve("collab_lora_finetune")
-        expected = jt.expected_manifest(store, rnd["base_adapter_ref"])
-        accepted, reason = jt.gate_submission(conn, store, task_id, expected)
+        if hasattr(jt, "shape_claim"):
+            # collab_lora_finetune: the ex-closer structural gates, unchanged.
+            rnd = conn.execute(
+                "SELECT base_adapter_ref FROM rounds WHERE run_id = ? AND idx = ?",
+                (task["run_id"], task["round_idx"]),
+            ).fetchone()
+            expected = jt.expected_manifest(store, rnd["base_adapter_ref"])
+            accepted, reason = jt.gate_submission(conn, store, task_id, expected)
+            result = close.advance_job(conn, store, task["run_id"], settings=settings)
+            round_closed = result is not None
+        else:
+            # A type with no reduce: run its per-submission validate(), record
+            # the Verdict (compare_digest folded into metrics_json), then let
+            # the dispatcher re-check completion. ``round_closed`` is not
+            # meaningful for a type with no reduce (docs/06).
+            result_obj = _infer_result_for(task, body, expected_key)
+            verdict = jt.validate(task, result_obj, conn, store)
+            _record_generic_verdict(conn, task_id, verdict, worker_id)
+            accepted, reason = verdict.accepted, verdict.reason
+            close.advance_job(conn, store, job_id=task["job_id"], settings=settings)
+            round_closed = False
 
-        result = close.advance_job(conn, store, task["run_id"], settings=settings)
         return {
             "accepted": accepted,
             "reject_reason": reason,
             "next_action": "claim" if accepted else "reclaim",
-            "round_closed": result is not None,
+            "round_closed": round_closed,
         }
 
     @app.post(f"/{API_VERSION}/tasks/{{task_id}}/abandon")
@@ -873,7 +940,20 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         (docs/07 §5): priority is admin-write-only."""
         if body.job_type not in REGISTRY:
             raise HTTPException(status_code=422, detail=f"unknown job type: {body.job_type}")
-        jt = resolve(body.job_type)
+        # Resolve at the version the body pins, if any -- a spec that names a
+        # newer version than this build ships is a 422 here, not a silent
+        # never-place (docs/10 §2).
+        pinned = None
+        sdk_in = body.spec.get("sdk") if isinstance(body.spec, dict) else None
+        if isinstance(sdk_in, dict) and sdk_in.get("version") is not None:
+            try:
+                pinned = int(sdk_in["version"])
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=422, detail="spec.sdk.version must be an integer")
+        try:
+            jt = resolve(body.job_type, pinned)
+        except AssertionError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         validate_spec = getattr(jt, "validate_spec", None)
         if validate_spec is not None:
             try:
@@ -885,6 +965,12 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         except constraints_mod.ConstraintError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+        # Freeze the resolved pair into the spec and never mutate it again
+        # (docs/10 §2). ``jobs`` gets no version column -- this is where the
+        # binding lives.
+        spec = dict(body.spec) if isinstance(body.spec, dict) else {}
+        spec["sdk"] = {"job_type": jt.name, "version": jt.version}
+
         job_id = uuid.uuid4().hex
         now = rounds._iso(rounds.utcnow())
         with immediate(conn):
@@ -893,7 +979,7 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                      (id, owner_id, job_type, spec_json, image_id, status,
                       priority_rank, constraints_json, cancel_mode, created_at)
                    VALUES (?, ?, ?, ?, ?, 'draft', 0, ?, NULL, ?)""",
-                (job_id, user.id, body.job_type, json.dumps(body.spec),
+                (job_id, user.id, body.job_type, json.dumps(spec),
                  body.image_id, json.dumps(body.constraints), now),
             )
         return {"job_id": job_id, "status": "draft"}
@@ -915,6 +1001,27 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                 "UPDATE jobs SET status = 'queued', priority_rank = ? WHERE id = ?",
                 (tail, job_id),
             )
+        # A static (no ``shape_claim``) type fans its task set out once, now
+        # (docs/10 §3, §4). A dynamic type -- ``collab_lora_finetune`` -- is
+        # sized per machine at claim time and seeds its own round elsewhere.
+        jt = resolve(row["job_type"])
+        if not hasattr(jt, "shape_claim"):
+            job_row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            specs = jt.plan(job_row, conn)
+            now = rounds._iso(rounds.utcnow())
+            with immediate(conn):
+                for s in specs:
+                    conn.execute(
+                        """INSERT INTO tasks
+                             (id, run_id, round_idx, job_id, buckets_json,
+                              input_ref_json, attempt_group, local_steps, status,
+                              worker_id, lease_expires_at, attempts,
+                              max_runtime_sec, created_at)
+                           VALUES (?, NULL, NULL, ?, '[]', ?, ?, 0, 'planned',
+                                   NULL, NULL, 0, ?, ?)""",
+                        (s.id, s.job_id, s.input_ref, s.attempt_group,
+                         s.max_runtime_sec, now),
+                    )
         return {"job_id": job_id, "status": "queued", "priority_rank": tail}
 
     @app.get(f"/{API_VERSION}/jobs")
@@ -1067,7 +1174,7 @@ def _selectable_jobs(conn: sqlite3.Connection, pinned_job_id: str | None,
     """
     rows = conn.execute(
         """SELECT j.id, j.job_type, j.priority_rank, j.created_at,
-                  j.constraints_json, j.image_id,
+                  j.constraints_json, j.image_id, j.spec_json,
                   r.id AS run_id, r.base_model
            FROM jobs j
            LEFT JOIN runs r ON r.job_id = j.id
@@ -1091,10 +1198,10 @@ def _selectable_jobs(conn: sqlite3.Connection, pinned_job_id: str | None,
 
 def _resume_held(conn: sqlite3.Connection, held: sqlite3.Row, worker: sqlite3.Row,
                  contributor: Contributor, profile: dict, settings: Settings):
-    """Re-serve a task the machine already holds (docs/07 §1, "Re-serving is
-    per-type"). The ``tasks`` row alone cannot rebuild the payload, so dispatch
-    to the owning job type -- which returns a fresh spec, and ``_task_payload``
-    a fresh presign, never a replay of the expired URLs."""
+    """Re-serve a collab task the machine already holds (docs/07 §1, "Re-serving
+    is per-type"). The ``tasks`` row alone cannot rebuild the payload, so
+    dispatch to the owning job type -- which returns a fresh spec, and
+    ``_task_payload`` a fresh presign, never a replay of the expired URLs."""
     if held["run_id"] is None:
         return None
     try:
@@ -1106,39 +1213,222 @@ def _resume_held(conn: sqlite3.Connection, held: sqlite3.Row, worker: sqlite3.Ro
         return None
 
 
-def _task_payload(spec: TaskSpec, store: Store, settings: Settings) -> dict:
-    url, expires = store.presign_get(spec.base_adapter_ref)
+def _resume_held_static(conn: sqlite3.Connection, store: Store,
+                        held: sqlite3.Row, settings: Settings):
+    """Re-serve a held task from a static (no-``shape_claim``) type: rebuild the
+    ``TaskSpec`` from the row and mint a fresh ``inputs_for`` presign. Returns
+    ``(spec, inputs, jt)`` or ``None`` if the owning job is gone / not running."""
+    jt = _resolve_for_task(conn, held)
+    if jt is None or hasattr(jt, "shape_claim"):
+        return None
+    job = conn.execute(
+        "SELECT status FROM jobs WHERE id = ?", (held["job_id"],)
+    ).fetchone()
+    if job is None or job["status"] not in ("queued", "running"):
+        return None
+    spec = _static_task_spec(held, settings)
+    return spec, jt.inputs_for(held, store), jt
+
+
+def _static_task_spec(row: sqlite3.Row, settings: Settings) -> TaskSpec:
+    lease = row["lease_expires_at"]
+    return TaskSpec(
+        id=row["id"],
+        job_id=row["job_id"],
+        input_ref=row["input_ref_json"],
+        attempt_group=row["attempt_group"],
+        max_runtime_sec=int(row["max_runtime_sec"] or settings.lease_duration_sec),
+        lease_expires_at=rounds._parse(lease) if lease else None,
+    )
+
+
+def _claim_static_task(conn: sqlite3.Connection, jt, store: Store,
+                       job: sqlite3.Row, worker_id: str, settings: Settings):
+    """Atomically take one unleased (``status='planned'``) task for this job and
+    lease it to the machine. Returns ``(spec, inputs)`` or ``(None, None)``."""
+    now = rounds.utcnow()
+    with immediate(conn):
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE job_id = ? AND status = 'planned' "
+            "ORDER BY created_at, id LIMIT 1",
+            (job["id"],),
+        ).fetchone()
+        if row is None:
+            return None, None
+        expires = now + timedelta(seconds=settings.lease_duration_sec)
+        changed = conn.execute(
+            "UPDATE tasks SET status = 'leased', worker_id = ?, "
+            "lease_expires_at = ?, attempts = attempts + 1 "
+            "WHERE id = ? AND status = 'planned'",
+            (worker_id, rounds._iso(expires), row["id"]),
+        ).rowcount
+        if not changed:
+            return None, None
+        conn.execute(
+            "UPDATE workers SET last_seen = ? WHERE id = ?",
+            (rounds._iso(now), worker_id),
+        )
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (row["id"],)).fetchone()
+    return _static_task_spec(row, settings), jt.inputs_for(row, store)
+
+
+def _pinned_sdk_version(job: sqlite3.Row) -> int | None:
+    """``spec_json.sdk.version`` if the job froze one (docs/10 §2)."""
+    try:
+        sdk = (json.loads(job["spec_json"] or "{}") or {}).get("sdk") or {}
+        v = sdk.get("version")
+        return int(v) if v is not None else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _resolve_for_task(conn: sqlite3.Connection, task: sqlite3.Row):
+    """The job type behind a task. Falls back to ``collab_lora_finetune`` for a
+    pre-005 task row with no ``job_id`` (docs/05)."""
+    job_type = "collab_lora_finetune"
+    if task is not None and task["job_id"] is not None:
+        row = conn.execute(
+            "SELECT job_type FROM jobs WHERE id = ?", (task["job_id"],)
+        ).fetchone()
+        if row is not None:
+            job_type = row["job_type"]
+    try:
+        return resolve(job_type)
+    except KeyError:
+        return None
+
+
+def _task_artifact_key(conn: sqlite3.Connection, task: sqlite3.Row) -> str:
+    """The one key a submission for this task may land at -- derived, never
+    taken from the request (the cross-tenant / base-adapter guard)."""
+    if task["run_id"] is not None:
+        return adapter_key(task["run_id"], task["round_idx"], task["id"])
+    desc = json.loads(task["input_ref_json"] or "{}")
+    key = desc.get("output_key")
+    if not key:
+        raise HTTPException(status_code=422, detail="task has no derivable artifact key")
+    return key
+
+
+def _infer_result_for(task: sqlite3.Row, body: "SubmitRequest", key: str):
+    """Rebuild the type's ``Result`` for ``validate()`` from what ``submit``
+    carries. The coordinator sets ``output_ref`` to the *derived* key, never
+    the worker's."""
+    from ganymede.jobtypes.batch_inference.run import InferResult
+
+    metrics = body.metrics or {}
+    return InferResult(
+        rows=int(body.steps_completed or metrics.get("rows", 0)),
+        output_ref=key,
+        digest=str(metrics.get("digest") or ""),
+        seconds=float(metrics.get("seconds", 0.0) or 0.0),
+    )
+
+
+def _record_generic_verdict(conn: sqlite3.Connection, task_id: str, verdict,
+                            worker_id: str) -> None:
+    """Persist a non-collab ``Verdict`` on the submission row: ``accepted`` /
+    ``reject_reason`` as columns, ``compare_digest`` folded into
+    ``metrics_json`` (``submissions`` has no such column, and docs/10 prefers no
+    migration for it)."""
+    sub = conn.execute(
+        "SELECT metrics_json FROM submissions WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    metrics = {}
+    if sub is not None and sub["metrics_json"]:
+        try:
+            metrics = json.loads(sub["metrics_json"])
+        except ValueError:
+            metrics = {}
+    if verdict.compare_digest is not None:
+        metrics["compare_digest"] = verdict.compare_digest
+    with immediate(conn):
+        conn.execute(
+            "UPDATE submissions SET accepted = ?, reject_reason = ?, metrics_json = ? "
+            "WHERE task_id = ?",
+            (1 if verdict.accepted else 0, verdict.reason,
+             json.dumps(metrics), task_id),
+        )
+        if not verdict.accepted:
+            row = conn.execute(
+                "SELECT contributor_id FROM workers WHERE id = ?", (worker_id,)
+            ).fetchone()
+            conn.execute(
+                "INSERT INTO audit (at, contributor_id, worker_id, event, detail_json) "
+                "VALUES (?, ?, ?, 'submission_rejected', ?)",
+                (rounds._iso(rounds.utcnow()),
+                 row["contributor_id"] if row else None, worker_id,
+                 json.dumps({"task": task_id, "reason": verdict.reason,
+                             "detail": verdict.detail})),
+            )
+
+
+def _task_payload(spec: TaskSpec, store: Store, settings: Settings, *,
+                  jt=None, task_inputs=None, sdk: dict | None = None) -> dict:
+    if task_inputs is None:
+        # collab_lora_finetune -- the payload assembled here since Phase A,
+        # kept byte-for-byte (plus an optional additive ``sdk`` block, docs/06).
+        url, expires = store.presign_get(spec.base_adapter_ref)
+        payload = {
+            "task_id": spec.id,
+            "run_id": spec.run_id,
+            "round_idx": spec.round_idx,
+            # Generic handles (docs/06 "Claim path"). image_* is null for
+            # first-party built-ins; input_ref is the type-agnostic input
+            # handle, with buckets still present for collab_lora_finetune.
+            "job_id": spec.job_id,
+            "job_type": "collab_lora_finetune",
+            "image_ref": None,
+            "image_digest": None,
+            "image_pull_url": None,
+            "input_ref": spec.input_ref,
+            "buckets": spec.buckets,
+            "num_buckets": spec.num_buckets,
+            "seed": resolve("collab_lora_finetune").task_seed(
+                spec.run_id, spec.round_idx, spec.id
+            ),
+            "local_steps": spec.local_steps,
+            "max_runtime_sec": spec.max_runtime_sec,
+            "lease_expires_at": spec.lease_expires_at.isoformat(),
+            "heartbeat_interval_sec": settings.heartbeat_interval_sec,
+            # None when the run has no image requirement (the native-install
+            # case). A worker running a different tag abandons here rather than
+            # after downloading a base model (4.2 step 5).
+            "required_image": spec.required_image,
+            "base_model": spec.base_model,
+            "base_precision": spec.base_precision,
+            "lora_cfg": spec.lora_cfg,
+            "hyperparams": spec.hyperparams,
+            "dataset_ref": spec.dataset_ref,
+            "base_adapter_url": url,
+            "base_adapter_expires_at": expires.isoformat(),
+        }
+        if sdk is not None:
+            payload["sdk"] = sdk
+        return payload
+
+    # A static type (batch_inference): the payload is what ``inputs_for``
+    # named -- ``artifacts`` (a model GET) and ``params`` (the shard ref, an
+    # output PUT, the decode settings). No base adapter, no round, no buckets.
     return {
         "task_id": spec.id,
-        "run_id": spec.run_id,
-        "round_idx": spec.round_idx,
-        # Generic handles (docs/06 "Claim path"). image_* is null for
-        # first-party built-ins; input_ref is the type-agnostic input handle,
-        # with buckets still present for collab_lora_finetune.
         "job_id": spec.job_id,
-        "job_type": "collab_lora_finetune",
+        "job_type": jt.name,
+        "run_id": None,
+        "round_idx": None,
         "image_ref": None,
         "image_digest": None,
         "image_pull_url": None,
         "input_ref": spec.input_ref,
-        "buckets": spec.buckets,
-        "num_buckets": spec.num_buckets,
-        "seed": resolve("collab_lora_finetune").task_seed(spec.run_id, spec.round_idx, spec.id),
-        "local_steps": spec.local_steps,
-        "max_runtime_sec": spec.max_runtime_sec,
-        "lease_expires_at": spec.lease_expires_at.isoformat(),
+        "attempt_group": spec.attempt_group,
+        "artifacts": task_inputs.artifacts,
+        "params": task_inputs.params,
+        "sdk": sdk,
+        "max_runtime_sec": spec.max_runtime_sec or settings.lease_duration_sec,
+        "lease_expires_at": spec.lease_expires_at.isoformat()
+        if spec.lease_expires_at else None,
         "heartbeat_interval_sec": settings.heartbeat_interval_sec,
-        # None when the run has no image requirement (the native-install case).
-        # A worker running a different tag abandons here rather than after
-        # downloading a base model (4.2 step 5).
-        "required_image": spec.required_image,
-        "base_model": spec.base_model,
-        "base_precision": spec.base_precision,
-        "lora_cfg": spec.lora_cfg,
-        "hyperparams": spec.hyperparams,
-        "dataset_ref": spec.dataset_ref,
-        "base_adapter_url": url,
-        "base_adapter_expires_at": expires.isoformat(),
+        "required_image": None,
     }
 
 
