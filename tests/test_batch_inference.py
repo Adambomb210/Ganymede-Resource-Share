@@ -548,13 +548,94 @@ def test_agreement_gate_redispatches_a_disagreeing_group_and_holds_the_job(conn,
         "SELECT COUNT(*) AS n FROM tasks WHERE job_id = ? AND status = 'planned'", (jid,)
     ).fetchone()["n"]
     assert planned == 2  # both members re-dispatched
+    # Submissions are kept (durability-before-validation) but marked uncredited.
+    subs = conn.execute(
+        "SELECT s.accepted, s.reject_reason FROM submissions s "
+        "JOIN tasks t ON t.id = s.task_id WHERE t.job_id = ?", (jid,)
+    ).fetchall()
+    assert len(subs) == 2
+    assert all(s["accepted"] == 0 for s in subs)
+    assert all(s["reject_reason"] == "attempt_group_disagreement" for s in subs)
+    audit = conn.execute(
+        "SELECT detail_json FROM audit WHERE event = 'attempt_group_disagreement'"
+    ).fetchall()
+    assert len(audit) == 1
+    # The offending machines are recoverable from the audit event (Phase D input).
+    members = json.loads(audit[0]["detail_json"])["members"]
+    assert len(members) == 2 and all("worker_id" in m for m in members)
+
+
+def test_an_expired_batch_lease_is_re_served_and_the_job_can_still_finish(
+    client, store, conn, make_contributor, make_submitter, tiny_lm
+):
+    from datetime import timedelta
+
+    _, skey = make_submitter()
+    _, wkey = make_contributor(name="w-exp")
+    jid = _enqueue_batch(client, skey, _spec([{"ref": "shard/0", "rows": 4}]))
+
+    fw = FakeWorker(client, store, wkey)
+    first = fw.claim()
+    assert first is not None
+    tid = first["task_id"]
+
+    # The machine vanishes; its lease expires.
+    rounds.expire_leases(conn, now=rounds.utcnow() + timedelta(hours=2))
     assert conn.execute(
-        "SELECT COUNT(*) AS n FROM submissions s JOIN tasks t ON t.id = s.task_id "
-        "WHERE t.job_id = ?", (jid,)
-    ).fetchone()["n"] == 0  # their submissions cleared (uncredited)
+        "SELECT status FROM tasks WHERE id = ?", (tid,)
+    ).fetchone()["status"] == "expired"
+    fw.task = None  # the FakeWorker no longer holds it
+
+    # A fresh poll re-serves the same shard, and the job completes on it.
+    again = fw.claim()
+    assert again is not None and again["task_id"] == tid
+    rows = [{"id": f"r{i}", "input": f"w{i}"} for i in range(4)]
+    r = _run_and_submit(client, store, wkey, again, rows, tiny_lm)
+    assert r.status_code == 200 and r.json()["accepted"] is True
     assert conn.execute(
-        "SELECT COUNT(*) AS n FROM audit WHERE event = 'attempt_group_disagreement'"
-    ).fetchone()["n"] == 1
+        "SELECT status FROM jobs WHERE id = ?", (jid,)
+    ).fetchone()["status"] == "done"
+
+
+def test_an_abandoned_batch_task_is_re_served(
+    client, store, conn, make_contributor, make_submitter
+):
+    _, skey = make_submitter()
+    _, wkey = make_contributor(name="w-ab")
+    jid = _enqueue_batch(client, skey, _spec([{"ref": "shard/0", "rows": 4}]))
+    fw = FakeWorker(client, store, wkey)
+    first = fw.claim()
+    client.post(f"/v1/tasks/{first['task_id']}/abandon", headers=_hdr(wkey))
+    fw.task = None
+    again = fw.claim()
+    assert again is not None and again["task_id"] == first["task_id"]
+
+
+def test_a_rejected_batch_submission_is_recycled_for_another_attempt(
+    client, store, conn, make_contributor, make_submitter
+):
+    _, skey = make_submitter()
+    _, wkey = make_contributor(name="w-rej")
+    jid = _enqueue_batch(client, skey, _spec([{"ref": "shard/0", "rows": 3}]))
+    fw = FakeWorker(client, store, wkey)
+    task = fw.claim()
+    key = task["params"]["output_key"]
+    # Upload a wrong-row-count output -> validate() rejects it.
+    _put_output(store, key, [{"id": "r0", "output": "a"}])
+    r = client.post(
+        f"/v1/tasks/{task['task_id']}/submit", headers=_hdr(wkey),
+        json={"artifact_key": key, "steps_completed": 1, "metrics": {"digest": "d"}},
+    )
+    assert r.status_code == 200 and r.json()["accepted"] is False
+    assert r.json()["reject_reason"] == "row_count_mismatch"
+
+    # The shard is not orphaned: the next poll hands it back.
+    fw.task = None
+    again = fw.claim()
+    assert again is not None and again["task_id"] == task["task_id"]
+    assert conn.execute(
+        "SELECT attempts FROM tasks WHERE id = ?", (task["task_id"],)
+    ).fetchone()["attempts"] == 2
 
 
 def test_parallel_job_not_done_until_every_task_has_an_accepted_verdict(conn, store):

@@ -26,6 +26,12 @@ from ganymede.jobtypes import resolve
 
 log = logging.getLogger("ganymede.coordinator.close")
 
+# How many times a static-type task may be leased before the dispatcher stops
+# re-serving it. Bounds the retry of an expired / abandoned / rejected shard and
+# the re-dispatch of a deterministically-disagreeing ``attempt_group`` -- a hard
+# per-shard failure path (dead-letter, job-fail) is Phase D.
+MAX_TASK_ATTEMPTS = 5
+
 # The type behind a ``runs`` row. Every ``runs`` row is a
 # ``collab_lora_finetune`` job; a ``batch_inference`` job has no ``runs`` child
 # and reaches ``advance_job`` by ``job_id`` instead.
@@ -195,8 +201,12 @@ def _advance_parallel_job(
     has an accepted verdict and every ``attempt_group`` has agreed.
 
     Disagreement in a group re-dispatches its members (back to ``planned``,
-    worker cleared) and leaves the offending submissions uncredited -- a basic
-    gate; probation / per-machine sampling scoring is Phase D (docs/10 §4).
+    worker cleared) and marks the offending submissions ``accepted = 0`` --
+    uncredited, but kept, with each member's ``worker_id`` recorded in the audit
+    event so a Phase-D scorer can still find the offending machine. Probation /
+    per-machine sampling scoring is Phase D (docs/10 §4); a group that never
+    agrees within ``MAX_TASK_ATTEMPTS`` leaves the job ``running`` rather than
+    spinning (a job-fail path is also Phase D).
     """
     job = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
     if job is None or job["status"] in ("done", "failed", "cancelled"):
@@ -236,7 +246,12 @@ def _advance_parallel_job(
     from ganymede.jobtypes.batch_inference import run as bi_run
     from ganymede.jobtypes.batch_inference import validate as bi_validate
 
+    unresolved = False
     for group, members in groups.items():
+        if all(m["attempts"] >= MAX_TASK_ATTEMPTS for m in members):
+            _record_unresolved_once(conn, group, members, now)
+            unresolved = True
+            continue
         outputs = []
         ok = True
         for m in members:
@@ -253,6 +268,8 @@ def _advance_parallel_job(
         if not bi_validate.sample_agreement(outputs, sample_rows, agree_on):
             _redispatch_group(conn, members, group, now)
             return None
+    if unresolved:
+        return None
 
     with immediate(conn):
         conn.execute(
@@ -261,6 +278,15 @@ def _advance_parallel_job(
             (job_id,),
         )
     return None
+
+
+def _group_detail(group: str, members: list[sqlite3.Row]) -> str:
+    return json.dumps({
+        "attempt_group": group,
+        # worker_id captured BEFORE re-dispatch nulls it -- the only record of
+        # which machine produced each side of the disagreement (Phase D input).
+        "members": [{"task": m["id"], "worker_id": m["worker_id"]} for m in members],
+    })
 
 
 def _redispatch_group(
@@ -273,10 +299,32 @@ def _redispatch_group(
                 "lease_expires_at = NULL WHERE id = ?",
                 (m["id"],),
             )
-            conn.execute("DELETE FROM submissions WHERE task_id = ?", (m["id"],))
+            # Kept, not deleted (record_submission's durability-before-validation
+            # rule) -- just marked uncredited so completion cannot count it.
+            conn.execute(
+                "UPDATE submissions SET accepted = 0, "
+                "reject_reason = 'attempt_group_disagreement' WHERE task_id = ?",
+                (m["id"],),
+            )
         conn.execute(
             "INSERT INTO audit (at, event, detail_json) VALUES (?, ?, ?)",
             (rounds._iso(now), "attempt_group_disagreement",
-             json.dumps({"attempt_group": group,
-                         "tasks": [m["id"] for m in members]})),
+             _group_detail(group, members)),
         )
+
+
+def _record_unresolved_once(
+    conn: sqlite3.Connection, group: str, members: list[sqlite3.Row], now: datetime
+) -> None:
+    seen = conn.execute(
+        "SELECT 1 FROM audit WHERE event = 'attempt_group_unresolved' "
+        "AND detail_json LIKE ?",
+        (f'%"attempt_group": "{group}"%',),
+    ).fetchone()
+    if seen is None:
+        with immediate(conn):
+            conn.execute(
+                "INSERT INTO audit (at, event, detail_json) VALUES (?, ?, ?)",
+                (rounds._iso(now), "attempt_group_unresolved",
+                 _group_detail(group, members)),
+            )

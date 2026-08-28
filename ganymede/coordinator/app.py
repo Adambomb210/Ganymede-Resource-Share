@@ -1244,14 +1244,26 @@ def _static_task_spec(row: sqlite3.Row, settings: Settings) -> TaskSpec:
 
 def _claim_static_task(conn: sqlite3.Connection, jt, store: Store,
                        job: sqlite3.Row, worker_id: str, settings: Settings):
-    """Atomically take one unleased (``status='planned'``) task for this job and
-    lease it to the machine. Returns ``(spec, inputs)`` or ``(None, None)``."""
+    """Atomically take one unleased task for this job and lease it to the
+    machine. Returns ``(spec, inputs)`` or ``(None, None)``.
+
+    "Unleased" is ``planned`` (never claimed) plus ``expired`` / ``abandoned``
+    (a machine went away) plus a ``submitted`` row whose verdict was a
+    rejection -- a static type mints no fresh row per claim the way collab does,
+    so without recycling these the shard would orphan and the job would never
+    complete. Bounded by ``close.MAX_TASK_ATTEMPTS`` (a hard per-shard failure
+    path is Phase D)."""
     now = rounds.utcnow()
     with immediate(conn):
         row = conn.execute(
-            "SELECT * FROM tasks WHERE job_id = ? AND status = 'planned' "
-            "ORDER BY created_at, id LIMIT 1",
-            (job["id"],),
+            """SELECT * FROM tasks
+                WHERE job_id = ? AND attempts < ?
+                  AND ( status IN ('planned', 'expired', 'abandoned')
+                        OR (status = 'submitted' AND EXISTS (
+                              SELECT 1 FROM submissions s
+                               WHERE s.task_id = tasks.id AND s.accepted = 0)) )
+                ORDER BY created_at, id LIMIT 1""",
+            (job["id"], close.MAX_TASK_ATTEMPTS),
         ).fetchone()
         if row is None:
             return None, None
@@ -1259,8 +1271,8 @@ def _claim_static_task(conn: sqlite3.Connection, jt, store: Store,
         changed = conn.execute(
             "UPDATE tasks SET status = 'leased', worker_id = ?, "
             "lease_expires_at = ?, attempts = attempts + 1 "
-            "WHERE id = ? AND status = 'planned'",
-            (worker_id, rounds._iso(expires), row["id"]),
+            "WHERE id = ? AND status = ?",
+            (worker_id, rounds._iso(expires), row["id"], row["status"]),
         ).rowcount
         if not changed:
             return None, None
