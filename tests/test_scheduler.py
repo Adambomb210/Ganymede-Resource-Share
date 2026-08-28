@@ -177,6 +177,29 @@ def test_one_lease_per_machine_across_two_jobs(client, store, conn, make_contrib
     assert leased == 1
 
 
+def test_resume_survives_a_task_row_with_no_job_id(client, store, conn, make_contributor, seeded_run):
+    """Migration 005 leaves pre-scheduler ``tasks.job_id`` NULL. The first poll
+    after an upgrade re-serves such a lease -- the LEASED verdict must still be
+    recorded (falling back to the spec's job_id), not silently dropped on a
+    NOT NULL / FK violation."""
+    run_id = seeded_run()
+    _, key = make_contributor()
+    fw = FakeWorker(client, store, key)
+    first = fw.claim()
+    conn.execute("UPDATE tasks SET job_id = NULL WHERE id = ?", (first["task_id"],))
+    conn.commit()
+
+    again = fw.claim()
+    assert again["task_id"] == first["task_id"]
+    row = conn.execute(
+        "SELECT job_id, outcome FROM worker_eligibility WHERE worker_id = ?",
+        (fw.worker_id,),
+    ).fetchone()
+    assert row is not None
+    assert row["job_id"] == _job_id(conn, run_id)
+    assert row["outcome"] == eligibility.LEASED
+
+
 def test_resumed_lease_gets_a_fresh_presign_same_task(client, store, conn, make_contributor, seeded_run):
     seeded_run(run_id="r")
     _, key = make_contributor()

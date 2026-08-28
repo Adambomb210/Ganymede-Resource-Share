@@ -70,6 +70,13 @@ def old_db(tmp_path):
         "VALUES ('t1', 'r1', 0, '[1,2,3]', 42, 'leased', ?, 1, 'now')",
         (wid,),
     )
+    # A recorded refusal, keyed by run_id in the a1b4e36 shape -- migration 005
+    # has to carry it forward keyed by the run's new parent job.
+    conn.execute(
+        "INSERT INTO worker_eligibility (worker_id, run_id, outcome, reason, checked_at) "
+        "VALUES (?, 'r1', 'refused', 'vram_mb 4096 < 8000', '2024-02-03T00:00:00+00:00')",
+        (wid,),
+    )
     conn.commit()
     conn.close()
     conn = connect(path)
@@ -179,6 +186,26 @@ def test_old_rows_survive_with_ids_and_values_intact(old_db):
     t = conn.execute("SELECT * FROM tasks WHERE id='t1'").fetchone()
     assert t["run_id"] == "r1" and t["round_idx"] == 0 and t["worker_id"] == wid
     assert t["local_steps"] == 42 and t["job_id"] is None
+
+
+def test_old_db_rewires_worker_eligibility_from_run_id_to_job_id(old_db):
+    """Migration 005 carries every recorded refusal forward keyed by the run's
+    new parent job, and drops ``run_id`` from the table (docs/07 §3)."""
+    conn, _cid, wid = old_db
+    init_schema(conn)
+
+    assert "run_id" not in _cols(conn, "worker_eligibility")
+    assert "job_id" in _cols(conn, "worker_eligibility")
+
+    job_id = conn.execute("SELECT job_id FROM runs WHERE id = 'r1'").fetchone()["job_id"]
+    assert job_id is not None
+    row = conn.execute(
+        "SELECT job_id, outcome, reason FROM worker_eligibility WHERE worker_id = ?",
+        (wid,),
+    ).fetchone()
+    assert row["job_id"] == job_id
+    assert row["outcome"] == "refused"
+    assert row["reason"] == "vram_mb 4096 < 8000"
 
 
 def test_old_db_gets_one_synthesized_consumed_enrollment_per_machine(old_db):

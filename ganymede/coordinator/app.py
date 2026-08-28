@@ -377,9 +377,15 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         if held is not None:
             spec = _resume_held(conn, held, worker, contributor, profile, settings)
             if spec is not None:
+                # ``tasks.job_id`` is not backfilled by migration 005 (docs/05
+                # pins pre-005 task rows' job_id to NULL), so fall back to the
+                # spec's job_id -- which the type reads off ``runs.job_id``,
+                # always set post-005 -- rather than write a NULL into
+                # worker_eligibility and have record() swallow the FK error.
+                job_id = held["job_id"] or spec.job_id
                 eligibility.record(
                     conn, body.worker_id,
-                    [eligibility.Verdict(held["job_id"], eligibility.LEASED)],
+                    [eligibility.Verdict(job_id, eligibility.LEASED)],
                 )
                 return JSONResponse(_task_payload(spec, store, settings))
 
