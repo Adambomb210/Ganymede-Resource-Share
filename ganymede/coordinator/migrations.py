@@ -30,12 +30,17 @@ The split (docs/05):
   004  the ``workers.id`` rework: ``sessions``, the backfill, and one synthesized
        consumed ``enrollments`` row per pre-existing machine (docs/08,
        "Migration 004").
+  005  the scheduler workstream (docs/07): adopt every pre-scheduler ``runs`` row
+       under a generic ``jobs`` row and set ``runs.job_id``; rebuild
+       ``worker_eligibility`` keyed by ``job_id`` instead of ``run_id``; index
+       the queue walk.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
 
@@ -403,6 +408,119 @@ def _m004_identity(conn: sqlite3.Connection) -> None:
 
 
 # --------------------------------------------------------------------------
+# 005 -- the scheduler workstream (docs/07)
+# --------------------------------------------------------------------------
+
+# Adopted / system-seeded jobs need an owner, and pre-scheduler ``runs`` have no
+# owner concept. This synthetic ``contributors`` row is that owner; its
+# ``key_hash`` carries a ':' which no real ``hash_key`` output (64 hex chars) can
+# contain, so it can never authenticate (the same trick migration 004 uses for
+# synthesized enrollment rows). ``coordinator.app`` and ``scripts.newrun`` reuse
+# the id for the jobs they create around existing runs.
+SYSTEM_OWNER_ID = "system"
+
+_M005_WE_NEW_DDL = """
+CREATE TABLE worker_eligibility_new (
+    worker_id  TEXT NOT NULL REFERENCES workers(id),
+    job_id     TEXT NOT NULL REFERENCES jobs(id),
+    outcome    TEXT NOT NULL,
+    reason     TEXT,
+    checked_at TEXT NOT NULL,
+    PRIMARY KEY (worker_id, job_id)
+)
+"""
+
+# ``runs.status`` -> ``jobs.status``. A pre-scheduler ``active`` run is a job
+# that has already fanned out at least one round, so it maps to ``running``, not
+# ``queued`` -- the single-active-run case must walk identically to today.
+_M005_STATUS_MAP = {
+    "active": "running", "paused": "paused",
+    "done": "done", "failed": "failed", "draft": "draft",
+}
+
+
+def _m005_scheduler(conn: sqlite3.Connection) -> None:
+    # The ``worker_eligibility`` rebuild drops and recreates the table. Nothing
+    # references it, but mirror 003's belt-and-braces: FKs off for the swap, a
+    # ``foreign_key_check`` after the commit as the assertion the copy kept every
+    # reference intact.
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with immediate(conn):
+            now = _now()
+            conn.execute(
+                """INSERT OR IGNORE INTO contributors
+                     (id, name, key_hash, enabled, clearance, created_at)
+                   VALUES (?, 'system', 'system:owner', 1, 'open', ?)""",
+                (SYSTEM_OWNER_ID, now),
+            )
+
+            # Adopt every run that predates the scheduler under a generic jobs
+            # row, oldest first, and point the run back at it. Sparse ranks
+            # (10, 20, ...) leave room for ``reorder``'s before/after to insert
+            # without a renumber.
+            base_rank = conn.execute(
+                "SELECT COALESCE(MAX(priority_rank), 0) AS m FROM jobs"
+            ).fetchone()["m"]
+            runs = conn.execute(
+                "SELECT id, status, created_at FROM runs WHERE job_id IS NULL "
+                "ORDER BY created_at, id"
+            ).fetchall()
+            for i, r in enumerate(runs, start=1):
+                job_id = uuid.uuid4().hex
+                conn.execute(
+                    """INSERT INTO jobs
+                         (id, owner_id, job_type, spec_json, image_id, status,
+                          priority_rank, constraints_json, cancel_mode, created_at)
+                       VALUES (?, ?, 'collab_lora_finetune', '{}', NULL, ?, ?,
+                               '{}', NULL, ?)""",
+                    (job_id, SYSTEM_OWNER_ID,
+                     _M005_STATUS_MAP.get(r["status"], "running"),
+                     base_rank + i * 10, r["created_at"] or now),
+                )
+                conn.execute(
+                    "UPDATE runs SET job_id = ? WHERE id = ?", (job_id, r["id"])
+                )
+
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_queue "
+                "ON jobs(status, priority_rank)"
+            )
+
+            # ``worker_eligibility``: run_id -> job_id (docs/05, docs/07 §3).
+            # Table rebuild following 003's ``tasks`` pattern -- ``eligibility.
+            # SCHEMA`` stays frozen at the historical (run_id) shape so
+            # ``test_migrations``'s old-db fixture is still an honest a1b4e36
+            # reproduction. A row whose ``run_id`` no longer maps to a job is
+            # dropped: it is a stale diagnostic, GC-eligible like ``audit``.
+            if "run_id" in _columns(conn, "worker_eligibility"):
+                conn.execute(_M005_WE_NEW_DDL)
+                conn.execute(
+                    """INSERT OR IGNORE INTO worker_eligibility_new
+                         (worker_id, job_id, outcome, reason, checked_at)
+                       SELECT we.worker_id, r.job_id, we.outcome, we.reason,
+                              we.checked_at
+                         FROM worker_eligibility we
+                         JOIN runs r ON r.id = we.run_id
+                        WHERE r.job_id IS NOT NULL"""
+                )
+                conn.execute("DROP TABLE worker_eligibility")
+                conn.execute(
+                    "ALTER TABLE worker_eligibility_new RENAME TO worker_eligibility"
+                )
+
+            _record(conn, 5)
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise sqlite3.IntegrityError(
+                f"migration 005 left dangling references: "
+                f"{[tuple(v) for v in violations]}"
+            )
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
+# --------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------
 
@@ -411,6 +529,7 @@ MIGRATIONS: list[tuple[int, str, Migration]] = [
     (2, "new_tables", _m002_new_tables),
     (3, "additive_delta", _m003_additive_delta),
     (4, "identity_machine_id", _m004_identity),
+    (5, "scheduler", _m005_scheduler),
 ]
 
 

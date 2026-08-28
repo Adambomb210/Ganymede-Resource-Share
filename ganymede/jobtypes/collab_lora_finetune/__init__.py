@@ -33,6 +33,24 @@ class CollabLoraFinetune:
     name = "collab_lora_finetune"
     version = 1
 
+    # -- spec validation (docs/06 "POST /v1/jobs": the job type validates spec) --
+    def validate_spec(self, spec) -> None:
+        """Shape-check a ``POST /v1/jobs`` body's ``spec``. Raises ``ValueError``.
+
+        A ``collab_lora_finetune`` run is created end to end by ``scripts/newrun``
+        (it mints round 0's seed adapter, which the API path has no way to do),
+        so this only guards the generic jobs-row lifecycle: the spec must be an
+        object, and any ``sdk`` pin present must name this type at a version this
+        build ships."""
+        if not isinstance(spec, dict):
+            raise ValueError("spec must be a JSON object")
+        sdk = spec.get("sdk")
+        if isinstance(sdk, dict):
+            if sdk.get("job_type", self.name) != self.name:
+                raise ValueError(f"spec.sdk.job_type must be {self.name!r}")
+            if int(sdk.get("version", self.version)) > self.version:
+                raise ValueError(f"spec pins a newer {self.name} than this build ships")
+
     # -- round lifecycle (ex-coordinator/rounds.py) ------------------------
     def open_round(self, conn, run_id, idx, base_adapter_ref, target_steps,
                    min_round_sec, max_round_sec):

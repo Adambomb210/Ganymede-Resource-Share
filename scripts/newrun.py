@@ -20,6 +20,7 @@ import argparse
 import json
 import math
 import sys
+import uuid
 from typing import Any
 
 import torch
@@ -27,6 +28,7 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from ganymede.coordinator import config as config_mod
+from ganymede.coordinator import migrations
 from ganymede.coordinator import rounds
 from ganymede.jobtypes.collab_lora_finetune import plan
 from ganymede.jobtypes.collab_lora_finetune.aggregate import save_adapter
@@ -419,6 +421,29 @@ def main(
                  args.dataset_ref, json.dumps(hyperparams), args.target_rounds,
                  args.combine_mode, args.lr_outer, outer_beta, json.dumps(requires),
                  args.data_classification, args.num_buckets, args.required_image, now),
+            )
+            # Post-scheduler (docs/07): the claim path walks `jobs`, not `runs`,
+            # so every run needs a parent jobs row. Created `queued` -- the
+            # first lease flips it to `running`, so the single-active-run case
+            # walks identically to before. Owner is the synthetic `system`
+            # contributor migration 005 upserts; priority_rank is a sparse tail
+            # the admin adjusts with `reorder`.
+            job_id = uuid.uuid4().hex
+            rank = conn.execute(
+                "SELECT COALESCE(MAX(priority_rank), 0) + 10 AS r FROM jobs"
+            ).fetchone()["r"]
+            conn.execute(
+                """INSERT INTO jobs
+                     (id, owner_id, job_type, spec_json, image_id, status,
+                      priority_rank, constraints_json, cancel_mode, created_at)
+                   VALUES (?, ?, 'collab_lora_finetune', ?, NULL, 'queued', ?,
+                           '{}', NULL, ?)""",
+                (job_id, migrations.SYSTEM_OWNER_ID,
+                 json.dumps({"sdk": {"job_type": "collab_lora_finetune", "version": 1}}),
+                 rank, now),
+            )
+            conn.execute(
+                "UPDATE runs SET job_id = ? WHERE id = ?", (job_id, args.run_id)
             )
             for b in range(args.num_buckets):
                 conn.execute(

@@ -52,6 +52,17 @@ def claim_task(
     now = now or utcnow()
 
     with immediate(conn):
+        # One lease per machine, global (docs/07 §1, Decision 4). Authoritative
+        # re-check as the first statement under the write lock, so two
+        # concurrent polls from one machine cannot both lease. This replaces the
+        # old round-scoped held-lease check (`... AND run_id=? AND round_idx=?`)
+        # with a global one; a lease this machine holds on any *other* job is
+        # re-served by app.py's pre-check, not here.
+        held = conn.execute(
+            "SELECT * FROM tasks WHERE worker_id = ? AND status = 'leased' LIMIT 1",
+            (worker_id,),
+        ).fetchone()
+
         run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
         if run is None or run["status"] != "active":
             return None
@@ -87,16 +98,15 @@ def claim_task(
         if rnd is None:
             return None
 
-        # One lease per worker. A second claim returns the lease it already
-        # holds rather than a new one -- a worker that retries after a network
-        # blip should resume, not fork its own work into two shards.
-        held = conn.execute(
-            """SELECT * FROM tasks
-               WHERE worker_id = ? AND status = 'leased' AND run_id = ? AND round_idx = ?""",
-            (worker_id, run_id, rnd["idx"]),
-        ).fetchone()
+        # A lease this machine already holds resumes rather than forking -- a
+        # worker retrying after a network blip should get the same shard back.
         if held is not None:
-            return _task_spec(held, run, rnd)
+            if held["run_id"] == run_id and held["round_idx"] == rnd["idx"]:
+                return _task_spec(held, run, rnd)
+            # Holds a lease on another job/round. app.py's pre-check owns that
+            # resume; reaching here is a concurrent-poll race and the invariant
+            # is one lease per machine, so do not open a second.
+            return None
 
         remaining = rnd["max_round_sec"] - (now - _parse(rnd["opened_at"])).total_seconds()
         hp = json.loads(run["hyperparams_json"])
@@ -191,12 +201,17 @@ def claim_task(
         task_id = uuid.uuid4().hex
         expires = now + timedelta(seconds=settings.lease_duration_sec)
 
+        # ``job_id`` is stamped on the task so ``GET /v1/admin/queue`` can count
+        # leased tasks per job (docs/07 §4) and ``worker_eligibility`` stays
+        # keyed by job. ``run`` is ``SELECT *`` so it carries the column added
+        # in migration 003.
+        job_id = run["job_id"] if "job_id" in run.keys() else None
         conn.execute(
             """INSERT INTO tasks
-                 (id, run_id, round_idx, buckets_json, local_steps, status,
+                 (id, run_id, round_idx, job_id, buckets_json, local_steps, status,
                   worker_id, lease_expires_at, attempts, max_runtime_sec, created_at)
-               VALUES (?, ?, ?, ?, ?, 'leased', ?, ?, 1, ?, ?)""",
-            (task_id, run_id, rnd["idx"], json.dumps(buckets), plan.local_steps,
+               VALUES (?, ?, ?, ?, ?, ?, 'leased', ?, ?, 1, ?, ?)""",
+            (task_id, run_id, rnd["idx"], job_id, json.dumps(buckets), plan.local_steps,
              worker_id, _iso(expires), plan.usable_sec, _iso(now)),
         )
         # Mark the shard as spoken for now, not at submit. If this worker
@@ -223,6 +238,7 @@ def _task_spec(task: sqlite3.Row, run: sqlite3.Row, rnd: sqlite3.Row) -> TaskSpe
         id=task["id"],
         run_id=task["run_id"],
         round_idx=task["round_idx"],
+        job_id=run["job_id"] if "job_id" in run.keys() else None,
         buckets=json.loads(task["buckets_json"]),
         num_buckets=int(run["num_buckets"]),
         local_steps=task["local_steps"],

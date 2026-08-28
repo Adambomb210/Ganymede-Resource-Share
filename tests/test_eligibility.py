@@ -23,6 +23,14 @@ def _claim(client, key, worker_id, **body):
                        headers={"Authorization": f"Bearer {key}"})
 
 
+def _job(conn, run_id):
+    """The parent job id of a run -- ``worker_eligibility`` is keyed by it now
+    (docs/07 §3, migration 005)."""
+    return conn.execute(
+        "SELECT job_id FROM runs WHERE id = ?", (run_id,)
+    ).fetchone()["job_id"]
+
+
 # --------------------------------------------------------------------------
 # The property the whole feature rests on
 # --------------------------------------------------------------------------
@@ -43,7 +51,7 @@ def test_the_recorded_reason_is_the_one_the_claim_path_actually_produced(
     assert _claim(client, key, worker_id).status_code == 204
 
     answer = eligibility.explain(conn, worker_id)
-    verdict = next(v for v in answer.verdicts if v.run_id == run_id)
+    verdict = next(v for v in answer.verdicts if v.job_id == _job(conn, run_id))
     assert verdict.outcome == eligibility.REFUSED
     # The exact text budget.is_eligible produced, numbers and all.
     assert "vram_mb" in verdict.reason
@@ -68,7 +76,7 @@ def test_a_successful_claim_clears_a_previous_refusal(
     assert _claim(client, key, worker_id).status_code == 200
 
     answer = eligibility.explain(conn, worker_id)
-    verdict = next(v for v in answer.verdicts if v.run_id == run_id)
+    verdict = next(v for v in answer.verdicts if v.job_id == _job(conn, run_id))
     assert verdict.outcome == eligibility.LEASED
     assert verdict.reason is None
 
@@ -120,7 +128,7 @@ def test_an_image_mismatch_is_reported_as_such(
     _claim(client, key, worker_id)
 
     verdict = next(v for v in eligibility.explain(conn, worker_id).verdicts
-                   if v.run_id == run_id)
+                   if v.job_id == _job(conn, run_id))
     assert verdict.outcome == eligibility.REFUSED
     assert "image" in verdict.reason
 
@@ -134,7 +142,7 @@ def test_clearance_refusal_is_recorded(
     _claim(client, key, worker_id)
 
     verdict = next(v for v in eligibility.explain(conn, worker_id).verdicts
-                   if v.run_id == run_id)
+                   if v.job_id == _job(conn, run_id))
     assert verdict.outcome == eligibility.REFUSED
     assert verdict.reason == "clearance 'open' < classification 'restricted'"
 

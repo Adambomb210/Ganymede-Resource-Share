@@ -20,8 +20,10 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from ganymede.coordinator import budget as budget_mod
+from ganymede.coordinator import constraints as constraints_mod
 from ganymede.coordinator import eligibility, identity
 from ganymede.coordinator import close, rounds
+from ganymede.coordinator.migrations import SYSTEM_OWNER_ID
 from ganymede.coordinator.auth import (
     AuthError,
     Contributor,
@@ -34,7 +36,7 @@ from ganymede.coordinator.auth import (
 from ganymede.coordinator.config import Settings
 from ganymede.coordinator.db import connect, immediate, init_schema
 from ganymede.coordinator.store import Store, adapter_key
-from ganymede.jobtypes import resolve
+from ganymede.jobtypes import REGISTRY, resolve
 from ganymede.jobtypes.base import TaskSpec
 
 API_VERSION = "v1"
@@ -63,10 +65,32 @@ class RegisterRequest(BaseModel):
 
 
 class ClaimRequest(BaseModel):
-    worker_id: str
+    # ``worker_id`` is the machine resolver (docs/07 §1 defers the machine-key
+    # auth class to identity/sandbox). ``run_id`` is kept for a v1 worker and
+    # mapped to its parent job; ``job_id`` is the new pin.
+    worker_id: str | None = None
     capabilities: ComputeProfile | None = None
     cached_base_models: list[str] = Field(default_factory=list)
     run_id: str | None = None
+    job_id: str | None = None
+
+
+class JobCreateRequest(BaseModel):
+    job_type: str
+    spec: dict[str, Any] = Field(default_factory=dict)
+    image_id: str | None = None
+    constraints: dict[str, Any] = Field(default_factory=dict)
+
+
+class CancelRequest(BaseModel):
+    mode: str = "soft"
+
+
+class ReorderRequest(BaseModel):
+    job_id: str
+    before: str | None = None
+    after: str | None = None
+    rank: int | None = None
 
 
 class HeartbeatRequest(BaseModel):
@@ -329,6 +353,8 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
     def claim(body: ClaimRequest, conn: ConnDep, contributor: ContribDep):
         from fastapi.responses import JSONResponse, Response
 
+        if not body.worker_id:
+            raise HTTPException(status_code=422, detail="worker_id required")
         worker = conn.execute(
             "SELECT * FROM workers WHERE id = ?", (body.worker_id,)
         ).fetchone()
@@ -339,43 +365,105 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         profile = (body.capabilities.model_dump() if body.capabilities
                    else json.loads(worker["compute_profile_json"]))
 
-        candidates = _selectable_runs(conn, body.run_id, body.cached_base_models)
+        # One lease per machine, global (docs/07 §1, Decision 4). Cheap
+        # pre-check before the walk: a machine already holding a leased task is
+        # re-served that task -- resumed through its owning job type for a fresh
+        # presign, never a replay of the expired URLs, and never a second task.
+        held = conn.execute(
+            "SELECT id, run_id, job_id FROM tasks "
+            "WHERE worker_id = ? AND status = 'leased' LIMIT 1",
+            (body.worker_id,),
+        ).fetchone()
+        if held is not None:
+            spec = _resume_held(conn, held, worker, contributor, profile, settings)
+            if spec is not None:
+                eligibility.record(
+                    conn, body.worker_id,
+                    [eligibility.Verdict(held["job_id"], eligibility.LEASED)],
+                )
+                return JSONResponse(_task_payload(spec, store, settings))
+
+        # Map a v1 worker's run_id pin to its parent job (docs/07 §1); job_id is
+        # the new pin. A pin still passes through the constraint gate below.
+        pinned_job_id = body.job_id
+        if pinned_job_id is None and body.run_id is not None:
+            row = conn.execute(
+                "SELECT job_id FROM runs WHERE id = ?", (body.run_id,)
+            ).fetchone()
+            if row is not None:
+                pinned_job_id = row["job_id"]
+
+        jobs = _selectable_jobs(conn, pinned_job_id, body.cached_base_models)
         # Every branch below records a verdict, including the ones that succeed.
         # A stale "refused" left behind by a worker that has since started
         # working would be worse than no record at all -- it is the answer a
         # contributor would act on, and it would send them looking for a fault
         # in a machine that is fine.
         verdicts: list[eligibility.Verdict] = []
-        for run_id in candidates:
+        for job in jobs:
+            if job["job_type"] != "collab_lora_finetune":
+                # Phase A ships one type; anything else is not walkable yet.
+                continue
+            run_id = job["run_id"]
+            if run_id is None:
+                # A bare POST /v1/jobs collab job with no runs child: nothing to
+                # hand out until newrun wires one up.
+                verdicts.append(eligibility.Verdict(job["id"], eligibility.IDLE))
+                continue
+
             # Evaluate the close here too, not only after a submit. A round can
             # become closeable through the passage of time alone -- its backstop
             # arrives with work already in hand -- and on the submit path alone
             # nothing would ever notice: every worker has already submitted, and
-            # none can claim, because there is too little of the round left to
-            # be worth a budget. The round stays open, the run stops advancing,
-            # and no request anywhere returns an error. Closing on the poll
-            # makes any worker that is still awake enough to move the run on,
-            # and hands this one the freshly opened round instead of another
-            # empty 204.
+            # none can claim. Closing on the poll moves the run on and hands
+            # this one the freshly opened round instead of another empty 204.
             close.advance_job(conn, store, run_id, settings=settings)
+
+            # The constraint gate (Decision 15, docs/07 §2). Pure -- reads only
+            # (machine_id, profile), no DB, no write lock -- which is why it
+            # sits here and not inside claim_task. A refusal is a `continue`,
+            # never a `break`: the walk reaching the first lower-rank job this
+            # machine fits *is* the capability backfill (Decision 10).
+            ok, why = constraints_mod.check_constraints(
+                job["constraints_json"], body.worker_id, profile
+            )
+            if not ok:
+                verdicts.append(
+                    eligibility.Verdict(job["id"], eligibility.REFUSED, why)
+                )
+                continue
+
             try:
                 spec = resolve("collab_lora_finetune").shape_claim(
                     conn, run_id, body.worker_id, contributor.clearance,
                     profile, settings, worker_image_tag=worker["image_tag"],
                 )
             except rounds.NotEligible as exc:
-                verdicts.append(eligibility.Verdict(run_id, eligibility.REFUSED, str(exc)))
+                verdicts.append(
+                    eligibility.Verdict(job["id"], eligibility.REFUSED, str(exc))
+                )
                 continue
+
             if spec is not None:
-                verdicts.append(eligibility.Verdict(run_id, eligibility.LEASED))
+                # First lease flips the job queued -> running (docs/07 §1). Its
+                # own transaction, after claim_task's commit; eligibility.record
+                # comes after this one, never between (docs/07 §1 freezes that
+                # ordering).
+                with immediate(conn):
+                    conn.execute(
+                        "UPDATE jobs SET status = 'running' "
+                        "WHERE id = ? AND status = 'queued'",
+                        (job["id"],),
+                    )
+                verdicts.append(eligibility.Verdict(job["id"], eligibility.LEASED))
                 eligibility.record(conn, body.worker_id, verdicts)
                 return JSONResponse(_task_payload(spec, store, settings))
-            # Eligible, but this run had nothing to hand out: no open round, or
-            # too little of it left to be worth a budget. Not the worker's
-            # problem, and recorded separately from a refusal because a fleet
-            # that is uniformly idle is a different operator problem from a
-            # fleet that is uniformly refused.
-            verdicts.append(eligibility.Verdict(run_id, eligibility.IDLE))
+
+            # Eligible, but this job had nothing to hand out: no open round, or
+            # too little of it left to be worth a budget. Recorded separately
+            # from a refusal because a uniformly-idle fleet is a different
+            # operator problem from a uniformly-refused one.
+            verdicts.append(eligibility.Verdict(job["id"], eligibility.IDLE))
 
         eligibility.record(conn, body.worker_id, verdicts)
 
@@ -409,7 +497,7 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             "last_polled": answer.checked_at,
             "eligible_for_something": answer.any_eligible,
             "runs": [
-                {"run_id": v.run_id, "outcome": v.outcome, "reason": v.reason}
+                {"job_id": v.job_id, "outcome": v.outcome, "reason": v.reason}
                 for v in answer.verdicts
             ],
             # Echoed back because half of every refusal reason is a fact about
@@ -754,7 +842,163 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         runs = conn.execute(
             "SELECT id, status, current_round, target_rounds FROM runs"
         ).fetchall()
-        return {"runs": [dict(r) for r in runs]}
+        jobs = conn.execute(
+            "SELECT id, job_type, status, priority_rank FROM jobs "
+            "ORDER BY priority_rank, created_at"
+        ).fetchall()
+        return {"runs": [dict(r) for r in runs], "jobs": [dict(j) for j in jobs]}
+
+    # ---------------- job submission & management (docs/06) ----------------
+
+    def _job_for_caller(conn: sqlite3.Connection, job_id: str, user: Contributor):
+        """A job the caller may act on, else 404 (not 403 -- docs/06)."""
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None or (row["owner_id"] != user.id and not user.is_admin):
+            raise HTTPException(status_code=404, detail="not found")
+        return row
+
+    @app.post(f"/{API_VERSION}/jobs")
+    def jobs_create(body: JobCreateRequest, conn: ConnDep,
+                    user: Annotated[Contributor, Depends(require_submitter)]) -> dict:
+        """Create a job in ``draft`` (docs/06). The job type validates its own
+        ``spec`` shape; the constraint grammar is validated here (Decision 15 --
+        an unknown field or operator is a submit-time 422, not a silent
+        never-place). ``priority_rank`` in the body is ignored, not a 422
+        (docs/07 §5): priority is admin-write-only."""
+        if body.job_type not in REGISTRY:
+            raise HTTPException(status_code=422, detail=f"unknown job type: {body.job_type}")
+        jt = resolve(body.job_type)
+        validate_spec = getattr(jt, "validate_spec", None)
+        if validate_spec is not None:
+            try:
+                validate_spec(body.spec)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=f"invalid spec: {exc}") from exc
+        try:
+            constraints_mod.validate(body.constraints)
+        except constraints_mod.ConstraintError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        job_id = uuid.uuid4().hex
+        now = rounds._iso(rounds.utcnow())
+        with immediate(conn):
+            conn.execute(
+                """INSERT INTO jobs
+                     (id, owner_id, job_type, spec_json, image_id, status,
+                      priority_rank, constraints_json, cancel_mode, created_at)
+                   VALUES (?, ?, ?, ?, ?, 'draft', 0, ?, NULL, ?)""",
+                (job_id, user.id, body.job_type, json.dumps(body.spec),
+                 body.image_id, json.dumps(body.constraints), now),
+            )
+        return {"job_id": job_id, "status": "draft"}
+
+    @app.post(f"/{API_VERSION}/jobs/{{job_id}}/enqueue")
+    def jobs_enqueue(job_id: str, conn: ConnDep,
+                     user: Annotated[Contributor, Depends(require_submitter)]) -> dict:
+        """``draft -> queued`` (docs/07 §5). ``priority_rank`` defaults to the
+        tail (``MAX(priority_rank)+1``); only then is the job visible to
+        ``_selectable_jobs``. The admin adjusts with ``reorder`` after."""
+        row = _job_for_caller(conn, job_id, user)
+        if row["status"] != "draft":
+            raise HTTPException(status_code=409, detail=f"job is {row['status']}, not draft")
+        with immediate(conn):
+            tail = conn.execute(
+                "SELECT COALESCE(MAX(priority_rank), 0) + 1 AS r FROM jobs"
+            ).fetchone()["r"]
+            conn.execute(
+                "UPDATE jobs SET status = 'queued', priority_rank = ? WHERE id = ?",
+                (tail, job_id),
+            )
+        return {"job_id": job_id, "status": "queued", "priority_rank": tail}
+
+    @app.get(f"/{API_VERSION}/jobs")
+    def jobs_list(conn: ConnDep, user: UserDep) -> dict:
+        if user.is_admin:
+            rows = conn.execute(
+                "SELECT * FROM jobs ORDER BY priority_rank, created_at"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE owner_id = ? ORDER BY priority_rank, created_at",
+                (user.id,),
+            ).fetchall()
+        return {"jobs": [_job_view(r) for r in rows]}
+
+    @app.get(f"/{API_VERSION}/jobs/{{job_id}}")
+    def jobs_get(job_id: str, conn: ConnDep, user: UserDep) -> dict:
+        return _job_view(_job_for_caller(conn, job_id, user))
+
+    @app.post(f"/{API_VERSION}/jobs/{{job_id}}/cancel")
+    def jobs_cancel(job_id: str, body: CancelRequest, conn: ConnDep,
+                    user: UserDep) -> dict:
+        """Owner or admin (docs/06). Sets ``jobs.cancel_mode`` and moves the job
+        to ``cancelled``; propagation to leased tasks travels on the next
+        heartbeat, which is the sandbox workstream's -- this only sets the
+        state."""
+        if body.mode not in ("soft", "hard"):
+            raise HTTPException(status_code=422, detail="mode must be 'soft' or 'hard'")
+        _job_for_caller(conn, job_id, user)
+        with immediate(conn):
+            conn.execute(
+                "UPDATE jobs SET status = 'cancelled', cancel_mode = ? WHERE id = ?",
+                (body.mode, job_id),
+            )
+        return {"job_id": job_id, "status": "cancelled", "cancel_mode": body.mode}
+
+    # ---------------- admin queue surface (docs/06, auth: admin) ----------
+
+    @app.get(f"/{API_VERSION}/admin/queue")
+    def admin_queue(conn: ConnDep,
+                    admin: Annotated[Contributor, Depends(require_admin)]) -> dict:
+        """The admin-ordered queue with leased-task counts (docs/06, docs/07
+        §4). A job stuck at zero leased tasks is the signal to ``reorder``."""
+        rows = conn.execute(
+            """SELECT j.id, j.job_type, j.status, j.priority_rank, j.owner_id,
+                      j.created_at, j.constraints_json,
+                      (SELECT COUNT(*) FROM tasks t
+                        WHERE t.job_id = j.id AND t.status = 'leased') AS leased_tasks
+               FROM jobs j
+               WHERE j.status IN ('queued', 'running')
+               ORDER BY j.priority_rank ASC, j.created_at ASC"""
+        ).fetchall()
+        return {"queue": [dict(r) for r in rows]}
+
+    @app.post(f"/{API_VERSION}/admin/queue/reorder")
+    def admin_queue_reorder(body: ReorderRequest, conn: ConnDep,
+                            admin: Annotated[Contributor, Depends(require_admin)]) -> dict:
+        """The only writer of ``jobs.priority_rank`` (docs/07 §5, Decision 13).
+        ``{job_id, before | after | rank}``: ``rank`` sets it outright;
+        ``before`` / ``after`` place it just outside the referenced job's rank.
+        Ranks are integers, gaps allowed, no uniqueness constraint -- ties break
+        on the walk's secondary sort."""
+        given = [x for x in (body.before, body.after, body.rank) if x is not None]
+        if len(given) != 1:
+            raise HTTPException(
+                status_code=422, detail="exactly one of before / after / rank"
+            )
+        target = conn.execute(
+            "SELECT id FROM jobs WHERE id = ?", (body.job_id,)
+        ).fetchone()
+        if target is None:
+            raise HTTPException(status_code=404, detail="not found")
+
+        if body.rank is not None:
+            new_rank = int(body.rank)
+        else:
+            ref_id = body.before or body.after
+            ref = conn.execute(
+                "SELECT priority_rank FROM jobs WHERE id = ?", (ref_id,)
+            ).fetchone()
+            if ref is None:
+                raise HTTPException(status_code=404, detail="reference job not found")
+            new_rank = ref["priority_rank"] + (-1 if body.before else 1)
+
+        with immediate(conn):
+            conn.execute(
+                "UPDATE jobs SET priority_rank = ? WHERE id = ?",
+                (new_rank, body.job_id),
+            )
+        return {"job_id": body.job_id, "priority_rank": new_rank}
 
     return app
 
@@ -781,22 +1025,79 @@ def _worker_for_task(conn: sqlite3.Connection, task_id: str,
     return row["worker_id"]
 
 
-def _selectable_runs(conn: sqlite3.Connection, pinned: str | None,
-                     cached_models: list[str]) -> list[str]:
-    """Order active runs by cache affinity.
+def _job_view(row: sqlite3.Row) -> dict:
+    """The public shape of a ``jobs`` row (docs/06 "Job submission & management")."""
+    return {
+        "job_id": row["id"],
+        "owner_id": row["owner_id"],
+        "job_type": row["job_type"],
+        "status": row["status"],
+        "priority_rank": row["priority_rank"],
+        "image_id": row["image_id"],
+        "constraints": json.loads(row["constraints_json"] or "{}"),
+        "cancel_mode": row["cancel_mode"],
+        "spec": json.loads(row["spec_json"] or "{}"),
+        "created_at": row["created_at"],
+    }
 
-    v1 runs sequentially, so this is usually a list of one. The ordering is
-    here because it costs nothing now and is the seam concurrent runs will
-    need: pulling a 16 GB base model a volunteer already has on disk is the
-    single most expensive thing a worker can be asked to do.
+
+def _selectable_jobs(conn: sqlite3.Connection, pinned_job_id: str | None,
+                     cached_models: list[str]) -> list[sqlite3.Row]:
+    """Walk the admin-ordered queue (docs/07 §1).
+
+    Rows: jobs in status ``queued`` or ``running`` -- **both**, because a
+    ``collab_lora_finetune`` job flips to ``running`` on its first lease but
+    fans out tasks every round after; walking only ``queued`` would hand it one
+    task ever. ``draft`` / ``paused`` / terminal states are skipped.
+
+    Order: ``priority_rank`` ASC primary (lower = sooner), then the
+    cache-affinity tiebreak **within a rank**, then ``created_at`` ASC. That
+    sort key -- ``(priority_rank, affinity_miss, created_at)`` -- is the single
+    seam a future weighted fair-share slots into (docs/07 §4); the walk itself
+    stays head-first, backfilling, one task per machine.
+
+    ``pinned_job_id`` short-circuits to that one row if it is selectable, else
+    the caller 204s.
     """
-    if pinned:
-        return [pinned]
     rows = conn.execute(
-        "SELECT id, base_model FROM runs WHERE status = 'active' ORDER BY created_at"
+        """SELECT j.id, j.job_type, j.priority_rank, j.created_at,
+                  j.constraints_json, j.image_id,
+                  r.id AS run_id, r.base_model
+           FROM jobs j
+           LEFT JOIN runs r ON r.job_id = j.id
+           WHERE j.status IN ('queued', 'running')"""
     ).fetchall()
-    cached = set(cached_models)
-    return [r["id"] for r in sorted(rows, key=lambda r: r["base_model"] not in cached)]
+    cached = set(cached_models or [])
+
+    def key(row: sqlite3.Row):
+        # Affinity is advisory and never crosses a rank boundary. Two axes,
+        # both advisory: base-model-on-disk (today) and image-digest-pulled
+        # (Decision 18 -- stubbed while every first-party job's image_id is
+        # NULL). The affinity function can be refined without touching the walk.
+        base_warm = bool(row["base_model"]) and row["base_model"] in cached
+        return (row["priority_rank"], 0 if base_warm else 1, row["created_at"] or "")
+
+    ordered = sorted(rows, key=key)
+    if pinned_job_id is not None:
+        ordered = [r for r in ordered if r["id"] == pinned_job_id]
+    return ordered
+
+
+def _resume_held(conn: sqlite3.Connection, held: sqlite3.Row, worker: sqlite3.Row,
+                 contributor: Contributor, profile: dict, settings: Settings):
+    """Re-serve a task the machine already holds (docs/07 §1, "Re-serving is
+    per-type"). The ``tasks`` row alone cannot rebuild the payload, so dispatch
+    to the owning job type -- which returns a fresh spec, and ``_task_payload``
+    a fresh presign, never a replay of the expired URLs."""
+    if held["run_id"] is None:
+        return None
+    try:
+        return resolve("collab_lora_finetune").shape_claim(
+            conn, held["run_id"], worker["id"], contributor.clearance,
+            profile, settings, worker_image_tag=worker["image_tag"],
+        )
+    except rounds.NotEligible:
+        return None
 
 
 def _task_payload(spec: TaskSpec, store: Store, settings: Settings) -> dict:
@@ -805,6 +1106,15 @@ def _task_payload(spec: TaskSpec, store: Store, settings: Settings) -> dict:
         "task_id": spec.id,
         "run_id": spec.run_id,
         "round_idx": spec.round_idx,
+        # Generic handles (docs/06 "Claim path"). image_* is null for
+        # first-party built-ins; input_ref is the type-agnostic input handle,
+        # with buckets still present for collab_lora_finetune.
+        "job_id": spec.job_id,
+        "job_type": "collab_lora_finetune",
+        "image_ref": None,
+        "image_digest": None,
+        "image_pull_url": None,
+        "input_ref": spec.input_ref,
         "buckets": spec.buckets,
         "num_buckets": spec.num_buckets,
         "seed": resolve("collab_lora_finetune").task_seed(spec.run_id, spec.round_idx, spec.id),

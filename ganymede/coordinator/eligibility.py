@@ -8,8 +8,17 @@ when the logs are on somebody else's server.
 
 Recorded, not recomputed
 ------------------------
-Every refusal in this table was produced by ``rounds.claim_task`` on a real
-poll and written down verbatim. Nothing here re-derives eligibility.
+Every refusal in this table was produced by the claim-path walk on a real poll
+and written down verbatim -- the constraint gate (docs/07 §2), then
+``claim_task``'s capability / clearance / image / throughput checks. Nothing here
+re-derives eligibility.
+
+Keyed by job, not run
+---------------------
+docs/07 §3 / docs/05: the row is one per ``(machine, job)``. ``run_id`` became
+``job_id`` in migration 005. ``explain()`` filters to non-terminal jobs so a
+contributor's diagnostic does not accrete rows for jobs that finished last month;
+those rows are GC-eligible, like ``audit``.
 
 That distinction is the whole design. A diagnostic that reimplements the
 decision it explains will eventually disagree with it, and the disagreement
@@ -46,6 +55,10 @@ LEASED = "leased"
 IDLE = "idle"
 REFUSED = "refused"
 
+# Frozen at the historical (run_id) shape on purpose: ``init_schema`` runs this
+# before the migration runner, and migration 005 rebuilds the table to be keyed
+# by ``job_id``. Keeping this string unchanged is what lets ``test_migrations``'s
+# old-db fixture stay an honest a1b4e36 reproduction.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS worker_eligibility (
     worker_id  TEXT NOT NULL REFERENCES workers(id),
@@ -60,9 +73,9 @@ CREATE TABLE IF NOT EXISTS worker_eligibility (
 
 @dataclass(frozen=True)
 class Verdict:
-    """One run's answer for one worker, as the claim path decided it."""
+    """One job's answer for one worker, as the claim-path walk decided it."""
 
-    run_id: str
+    job_id: str
     outcome: str
     reason: str | None = None
 
@@ -92,11 +105,11 @@ class Explanation:
         lines = [f"worker {self.worker_id} (last polled {self.checked_at}):"]
         for v in self.verdicts:
             if v.outcome == LEASED:
-                lines.append(f"  {v.run_id}: working -- last poll was handed a task")
+                lines.append(f"  {v.job_id}: working -- last poll was handed a task")
             elif v.outcome == IDLE:
-                lines.append(f"  {v.run_id}: eligible, but the run had nothing to hand out")
+                lines.append(f"  {v.job_id}: eligible, but the job had nothing to hand out")
             else:
-                lines.append(f"  {v.run_id}: REFUSED -- {v.reason}")
+                lines.append(f"  {v.job_id}: REFUSED -- {v.reason}")
         return "\n".join(lines)
 
 
@@ -107,31 +120,64 @@ def record(conn: sqlite3.Connection, worker_id: str, verdicts: list[Verdict],
     Diagnostics must not be able to break the thing they diagnose: a failure
     here would turn a successful claim into a 500 and cost the round, which is
     a strictly worse outcome than not knowing why a worker is idle.
+
+    Record only changed verdicts (docs/07 §3): keyed by ``job_id`` over a real
+    queue, an idle machine 204s and walks the whole thing, so most polls repeat
+    the previous answer verbatim. A verdict whose ``outcome`` and ``reason``
+    match the stored row gets only its ``checked_at`` bumped -- not skipped
+    entirely, because ``scripts/status.py``'s stall detector reads ``checked_at``
+    recency to tell an awake fleet from an absent one, and a steadily-polling
+    idle fleet must not age out of that.
     """
     stamp = (now or datetime.now(timezone.utc)).isoformat()
     try:
-        conn.executemany(
-            """INSERT INTO worker_eligibility (worker_id, run_id, outcome, reason, checked_at)
-               VALUES (?, ?, ?, ?, ?)
-               ON CONFLICT(worker_id, run_id) DO UPDATE SET
-                 outcome = excluded.outcome,
-                 reason = excluded.reason,
-                 checked_at = excluded.checked_at""",
-            [(worker_id, v.run_id, v.outcome, v.reason, stamp) for v in verdicts],
-        )
+        stored = {
+            r["job_id"]: (r["outcome"], r["reason"])
+            for r in conn.execute(
+                "SELECT job_id, outcome, reason FROM worker_eligibility "
+                "WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchall()
+        }
+        changed = [v for v in verdicts if stored.get(v.job_id) != (v.outcome, v.reason)]
+        unchanged = [v for v in verdicts if stored.get(v.job_id) == (v.outcome, v.reason)]
+        if changed:
+            conn.executemany(
+                """INSERT INTO worker_eligibility
+                     (worker_id, job_id, outcome, reason, checked_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(worker_id, job_id) DO UPDATE SET
+                     outcome = excluded.outcome,
+                     reason = excluded.reason,
+                     checked_at = excluded.checked_at""",
+                [(worker_id, v.job_id, v.outcome, v.reason, stamp) for v in changed],
+            )
+        if unchanged:
+            conn.executemany(
+                "UPDATE worker_eligibility SET checked_at = ? "
+                "WHERE worker_id = ? AND job_id = ?",
+                [(stamp, worker_id, v.job_id) for v in unchanged],
+            )
         conn.commit()
     except sqlite3.Error:
         pass
 
 
+# Non-terminal ``jobs.status`` values -- the only ones ``explain()`` reports.
+_LIVE_JOB_STATUS = ("draft", "queued", "running", "paused")
+
+
 def explain(conn: sqlite3.Connection, worker_id: str) -> Explanation:
+    placeholders = ", ".join("?" * len(_LIVE_JOB_STATUS))
     rows = conn.execute(
-        """SELECT run_id, outcome, reason, checked_at
-           FROM worker_eligibility WHERE worker_id = ?
-           ORDER BY run_id""",
-        (worker_id,),
+        f"""SELECT we.job_id, we.outcome, we.reason, we.checked_at
+           FROM worker_eligibility we
+           JOIN jobs j ON j.id = we.job_id
+           WHERE we.worker_id = ? AND j.status IN ({placeholders})
+           ORDER BY we.job_id""",
+        (worker_id, *_LIVE_JOB_STATUS),
     ).fetchall()
-    verdicts = [Verdict(r["run_id"], r["outcome"], r["reason"]) for r in rows]
+    verdicts = [Verdict(r["job_id"], r["outcome"], r["reason"]) for r in rows]
     checked = max((r["checked_at"] for r in rows), default=None)
     return Explanation(worker_id=worker_id, verdicts=verdicts, checked_at=checked)
 
@@ -158,7 +204,7 @@ def fleet_summary(conn: sqlite3.Connection) -> dict[str, list[str]]:
     read identically one worker at a time.
     """
     rows = conn.execute(
-        """SELECT worker_id, run_id, reason FROM worker_eligibility
+        """SELECT worker_id, job_id, reason FROM worker_eligibility
            WHERE outcome = ? ORDER BY reason, worker_id""",
         (REFUSED,),
     ).fetchall()
@@ -167,7 +213,7 @@ def fleet_summary(conn: sqlite3.Connection) -> dict[str, list[str]]:
         # Group on the reason's shape, not its exact text: "vram_mb 4096 <
         # 8000" and "vram_mb 6144 < 8000" are one problem, and keeping the
         # numbers would scatter it across as many buckets as there are cards.
-        key = f"{r['run_id']}: {_shape(r['reason'] or '')}"
+        key = f"{r['job_id']}: {_shape(r['reason'] or '')}"
         grouped.setdefault(key, []).append(r["worker_id"])
     return grouped
 
@@ -232,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps([
             {"worker_id": e.worker_id, "checked_at": e.checked_at,
-             "verdicts": [{"run_id": v.run_id, "outcome": v.outcome, "reason": v.reason}
+             "verdicts": [{"job_id": v.job_id, "outcome": v.outcome, "reason": v.reason}
                           for v in e.verdicts]}
             for e in explanations
         ], indent=2))

@@ -139,6 +139,25 @@ def test_newrun_creates_run_buckets_round_and_adapter(conn, store, settings, tin
     assert base_adapter_key(run_id, 0) in store.objects
 
 
+def test_newrun_creates_a_queued_jobs_row_linked_to_the_run(
+    conn, store, settings, tiny_base_model
+) -> None:
+    """Post-scheduler (docs/07): the claim path walks `jobs`, so newrun has to
+    mint the parent jobs row and point the run at it."""
+    run_id = "run-newrun-job"
+    assert newrun.main(_newrun_argv(run_id, tiny_base_model),
+                       settings=settings, store=store) == 0
+
+    job_id = conn.execute(
+        "SELECT job_id FROM runs WHERE id = ?", (run_id,)
+    ).fetchone()["job_id"]
+    assert job_id is not None
+    job = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    assert job["job_type"] == "collab_lora_finetune"
+    assert job["status"] == "queued"
+    assert job["owner_id"] == "system"
+
+
 def test_newrun_refuses_to_clobber_existing_run(conn, store, settings, tiny_base_model) -> None:
     run_id = "run-newrun-dup"
     argv = _newrun_argv(run_id, tiny_base_model)

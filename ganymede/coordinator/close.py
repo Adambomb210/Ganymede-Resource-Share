@@ -109,15 +109,49 @@ def advance_job(
     """
     now = now or rounds.utcnow()
     run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-    if run is None or run["status"] != "active":
+    if run is None:
+        return None
+    if run["status"] != "active":
+        # Still mirror a terminal run onto its generic jobs row -- a run flipped
+        # 'done' by an earlier close must leave the scheduler's queue walk even
+        # if nothing advances it again.
+        _mirror_job_status(conn, run)
         return None
 
     jt = resolve(_JOB_TYPE)
     idx = int(run["current_round"])
     close, reason = jt.should_close(conn, run_id, idx, now)
+    result = None
     if close:
-        return close_round(conn, store, run_id, idx, reason, now, settings)
+        result = close_round(conn, store, run_id, idx, reason, now, settings)
+    else:
+        # Backstop reached with nothing submitted: restart the clock, silently.
+        jt.reopen_empty_round(conn, run_id, idx, now)
 
-    # Backstop reached with nothing submitted: restart the clock, silently.
-    jt.reopen_empty_round(conn, run_id, idx, now)
-    return None
+    # The type's reduce may have flipped runs.status to 'done'. Keep the generic
+    # jobs row in step so the queue walk and worker_eligibility's non-terminal
+    # filter both see it (docs/07 §1: advance_job is the per-poll entry point).
+    run = conn.execute(
+        "SELECT id, status, job_id FROM runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    _mirror_job_status(conn, run)
+    return result
+
+
+# ``runs.status`` -> ``jobs.status``, terminal states only. The queued -> running
+# flip happens on the first lease (docs/07 §1), in ``app.py``, not here.
+_RUN_TO_JOB_TERMINAL = {"done": "done", "failed": "failed"}
+
+
+def _mirror_job_status(conn: sqlite3.Connection, run) -> None:
+    if run is None or run["job_id"] is None:
+        return
+    target = _RUN_TO_JOB_TERMINAL.get(run["status"])
+    if target is None:
+        return
+    with immediate(conn):
+        conn.execute(
+            "UPDATE jobs SET status = ? "
+            "WHERE id = ? AND status NOT IN ('done', 'failed', 'cancelled')",
+            (target, run["job_id"]),
+        )

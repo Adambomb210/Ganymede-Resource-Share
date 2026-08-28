@@ -191,6 +191,24 @@ def seeded_run(conn, store):
                 "INSERT INTO buckets (run_id, bucket_idx, times_trained) VALUES (?, ?, 0)",
                 (run_id, b),
             )
+        # Post-scheduler (docs/07): every runs row has a parent jobs row, and
+        # the claim path walks `jobs`, not `runs`. Mint it here the way
+        # scripts/newrun and migration 005 do -- owner is the synthetic
+        # `system` contributor migration 005 upserts, priority_rank is a sparse
+        # tail so two seeded_run() calls in one test get a deterministic order.
+        job_id = uuid.uuid4().hex
+        rank = conn.execute(
+            "SELECT COALESCE(MAX(priority_rank), 0) + 10 AS r FROM jobs"
+        ).fetchone()["r"]
+        conn.execute(
+            """INSERT INTO jobs
+                 (id, owner_id, job_type, spec_json, image_id, status,
+                  priority_rank, constraints_json, cancel_mode, created_at)
+               VALUES (?, 'system', 'collab_lora_finetune', '{}', NULL, 'queued',
+                       ?, '{}', NULL, ?)""",
+            (job_id, rank, rounds._iso(rounds.utcnow())),
+        )
+        conn.execute("UPDATE runs SET job_id = ? WHERE id = ?", (job_id, run_id))
         base_ref = base_adapter_key(run_id, 0)
         store.put_bytes(base_ref, save_adapter(make_adapter(scale=0.01, seed=0)))
         plan.open_round(conn, run_id, 0, base_ref, target_steps,

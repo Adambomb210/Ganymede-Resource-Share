@@ -54,10 +54,18 @@ def _worker(conn, worker_id: str) -> str:
     return worker_id
 
 
+def _job_of(conn, run_id):
+    """``worker_eligibility`` is keyed by job id now (docs/07 §3); ``seeded_run``
+    mints the parent job."""
+    return conn.execute(
+        "SELECT job_id FROM runs WHERE id = ?", (run_id,)
+    ).fetchone()["job_id"]
+
+
 def _poll_recorded(conn, worker_id, run_id, *, minutes_ago: float = 0.0):
     _worker(conn, worker_id)
     eligibility.record(
-        conn, worker_id, [eligibility.Verdict(run_id, eligibility.IDLE)],
+        conn, worker_id, [eligibility.Verdict(_job_of(conn, run_id), eligibility.IDLE)],
         now=datetime.now(timezone.utc) - timedelta(minutes=minutes_ago),
     )
 
@@ -143,7 +151,8 @@ def test_awake_workers_counts_a_machine_that_is_always_refused(conn, seeded_run)
     run_id = seeded_run()
     _worker(conn, "always-refused")
     eligibility.record(conn, "always-refused",
-                       [eligibility.Verdict(run_id, eligibility.REFUSED, "vram_mb 1 < 2")])
+                       [eligibility.Verdict(_job_of(conn, run_id), eligibility.REFUSED,
+                                            "vram_mb 1 < 2")])
     assert status_mod.awake_workers(conn) == ["always-refused"]
 
 
