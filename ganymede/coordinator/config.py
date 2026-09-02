@@ -132,6 +132,9 @@ class Settings:
     # First admin, named by env (Decision 14): comma-separated ``name`` or
     # ``name:secret``. Unset -> no bootstrap admin.
     bootstrap_admin: str | None = None
+    # Ledger (docs/09 "Constants"): the hard ceiling on provisioned hours while
+    # on probation (fraud brake, not billing exactitude).
+    probation_monthly_cap_hours: float = 40.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -156,4 +159,7 @@ class Settings:
             session_ttl_sec=_env_int("GANYMEDE_SESSION_TTL_SEC", 43200),
             enroll_ttl_sec=_env_int("GANYMEDE_ENROLL_TTL_SEC", 3600),
             bootstrap_admin=os.environ.get("GANYMEDE_BOOTSTRAP_ADMIN"),
+            probation_monthly_cap_hours=_env_float(
+                "GANYMEDE_PROBATION_MONTHLY_CAP_HOURS", 40.0
+            ),
         )

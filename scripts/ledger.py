@@ -1,0 +1,76 @@
+"""Run the contribution-ledger sweep (docs/09-ledger.md 1, 5.3).
+
+The provisioned-accrual engine is not a daemon and does no work on the claim
+path; it is a periodic sweep driven by this script from cron, next to
+``ganymede.coordinator.invariants`` and ``scripts/status.py --alert``. Each run:
+
+1. ``ledger.settle_windows`` -- integrate good-standing ``availability_ticks``
+   into settled hour windows and write one ``credit_events`` row each.
+2. ``ledger.evaluate_reputation`` -- recompute the per-machine ``reputation``
+   scalar from recorded outcomes and drive ``workers.standing`` transitions.
+3. ``identity.gc_expired_sessions`` -- drop dead web sessions (docs/08 "runs on
+   the audit / availability_ticks cron").
+
+Recommended cadence: once a minute. A 30-minute settle delay plus a minute
+sweep means a window settles within a minute of eligibility, and a standing
+change lands within the minute a rejection would have justified it. Nothing is
+latency-critical -- the sweep is idempotent and recomputes to a fixpoint.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from datetime import datetime, timezone
+
+from ganymede.coordinator import identity, ledger
+from ganymede.coordinator.db import connect
+
+
+def run(db_path: str, probation_monthly_cap_hours: float) -> dict:
+    """Execute one sweep, returning a small report dict."""
+    conn = connect(db_path)
+    now = datetime.now(timezone.utc)
+    try:
+        settled = ledger.settle_windows(
+            conn, probation_monthly_cap_hours=probation_monthly_cap_hours, now=now
+        )
+        evaluated = ledger.evaluate_reputation(conn, now)
+        sessions_gc = identity.gc_expired_sessions(conn)
+    finally:
+        conn.close()
+    return {
+        "at": now.isoformat(),
+        "windows_settled": settled,
+        "reputations_evaluated": evaluated,
+        "sessions_gc": sessions_gc,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="ganymede-ledger",
+        description="Run the contribution-ledger sweep (docs/09). For cron.",
+    )
+    p.add_argument("--db", default=None,
+                   help="path to the coordinator database; default GANYMEDE_DB")
+    p.add_argument("--probation-monthly-cap-hours", type=float,
+                   default=ledger.PROBATION_MONTHLY_CAP_HOURS,
+                   help="hard ceiling on provisioned hours while on probation")
+    args = p.parse_args(argv)
+    db_path = args.db
+    if db_path is None:
+        import os
+        db_path = os.environ.get("GANYMEDE_DB")
+        if not db_path:
+            print("no database: pass --db or set GANYMEDE_DB", file=sys.stderr)
+            return 2
+    report = run(db_path, args.probation_monthly_cap_hours)
+    print(f"{report['at']} settled {report['windows_settled']} window(s), "
+          f"evaluated {report['reputations_evaluated']} machine(s), "
+          f"gc'd {report['sessions_gc']} session(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

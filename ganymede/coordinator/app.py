@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 
 from ganymede.coordinator import budget as budget_mod
 from ganymede.coordinator import constraints as constraints_mod
-from ganymede.coordinator import eligibility, identity
+from ganymede.coordinator import eligibility, identity, ledger
 from ganymede.coordinator import close, rounds
 from ganymede.coordinator.migrations import SYSTEM_OWNER_ID
 from ganymede.coordinator.auth import (
@@ -346,6 +346,10 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                     (worker_id, contributor.id, json.dumps(profile),
                      body.image_tag, now, now),
                 )
+        # Re-probe (Decision 12, docs/09 3.4): a reweighting is a new
+        # ``computed_at`` stamp applied to windows settled *after* it -- never
+        # retroactive -- so correctness only requires the fresh row exists.
+        ledger.recompute_machine_weight(conn, worker_id, profile)
         return {"worker_id": worker_id,
                 "heartbeat_interval_sec": settings.heartbeat_interval_sec}
 
@@ -373,6 +377,12 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             "SELECT * FROM tasks WHERE worker_id = ? AND status = 'leased' LIMIT 1",
             (body.worker_id,),
         ).fetchone()
+        # The poll is the availability signal (docs/09 1.1): every worker polls
+        # whether or not it gets work, so this is where the ledger hears from
+        # the fleet. ``leased`` is informational (the leased-vs-idle split) and
+        # never changes the credited amount -- Decision 11 counts idle-available
+        # time. The good-standing gate is evaluated on the tick itself.
+        ledger.record_availability_tick(conn, body.worker_id, leased=held is not None)
         if held is not None:
             if held["run_id"] is not None:
                 spec = _resume_held(conn, held, worker, contributor, profile, settings)
@@ -575,6 +585,10 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except rounds.LeaseLost as exc:
             raise HTTPException(status_code=410, detail=str(exc)) from exc
+        # A heartbeat is an availability event too (docs/09 1.1): the machine is
+        # awake and holding work, so it polls the ledger. ``leased=True`` here is
+        # informational; it never changes the credited amount.
+        ledger.record_availability_tick(conn, worker_id, leased=True)
         return {"lease_expires_at": expires.isoformat()}
 
     @app.post(f"/{API_VERSION}/tasks/{{task_id}}/upload-url")
@@ -622,6 +636,8 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             ).fetchone()
             expected = jt.expected_manifest(store, rnd["base_adapter_ref"])
             accepted, reason = jt.gate_submission(conn, store, task_id, expected)
+            if accepted:
+                _credit_work(conn, jt, task, None, worker_id)
             result = close.advance_job(conn, store, task["run_id"], settings=settings)
             round_closed = result is not None
         else:
@@ -633,6 +649,8 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             verdict = jt.validate(task, result_obj, conn, store)
             _record_generic_verdict(conn, task_id, verdict, worker_id)
             accepted, reason = verdict.accepted, verdict.reason
+            if accepted:
+                _credit_work(conn, jt, task, result_obj, worker_id)
             close.advance_job(conn, store, job_id=task["job_id"], settings=settings)
             round_closed = False
 
@@ -680,6 +698,9 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         out = []
         for w in workers:
             profile = json.loads(w["compute_profile_json"])
+            weight, _ver = ledger.current_weight(conn, w["id"])
+            if weight == 0.0:
+                weight, _comp, _ver = ledger.machine_weight_for(profile)
             out.append({
                 "worker_id": w["id"],
                 "backend": profile.get("backend"),
@@ -689,6 +710,11 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                 "last_seen": w["last_seen"],
                 "rounds_joined": w["rounds_joined"],
                 "steps_total": w["steps_total"],
+                # Ledger (docs/06 observability): per-machine standing and the
+                # accrued Weighted System Hours (SUM kind='provisioned').
+                "standing": w.get("standing") or "good",
+                "weighted_hours_total": ledger.accrued(conn, machine_id=w["id"]),
+                "system_weight": weight,
             })
         tp = conn.execute("SELECT * FROM throughput").fetchall()
         return {
@@ -828,8 +854,11 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             if consumed.rowcount == 0:
                 # Lost the one-time race -- roll the whole block back.
                 raise HTTPException(status_code=404, detail="unknown enrollment")
-        # ``machine_key`` shown once. Weight recompute (Decision 12) is the
-        # ledger workstream's hook and not wired here.
+        # ``machine_key`` shown once. Compute the provisional weight from the
+        # enrollment probe (Decision 12, docs/09 3) -- the ``machine_weight``
+        # row gates how much a settled window is worth. Recomputed on every
+        # re-probe; never retroactive.
+        ledger.recompute_machine_weight(conn, machine_id, profile)
         return {"machine_id": machine_id, "machine_key": machine_key}
 
     @app.get(f"/{API_VERSION}/machines")
@@ -909,6 +938,143 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                 (machine_id, new_hash),
             )
         return {"machine_id": machine_id, "machine_key": new_key}
+
+    @app.get(f"/{API_VERSION}/me")
+    def me(conn: ConnDep, user: UserDep) -> dict:
+        """The contributor's machines, standings, accrued Weighted System Hours,
+        and recent credit events (docs/09 6.1). Field list owned by the ledger
+        doc. Retired machines still appear with frozen totals; a ``kind = 'work'``
+        row shows in ``recent_events`` with ``weighted_hours = 0.0`` and never in
+        any total."""
+        submitter = conn.execute(
+            "SELECT status FROM submitters WHERE user_id = ?", (user.id,)
+        ).fetchone()
+        machines = conn.execute(
+            "SELECT * FROM workers WHERE contributor_id = ? ORDER BY enrolled_at, first_seen",
+            (user.id,),
+        ).fetchall()
+        active = [m for m in machines if m["standing"] != "revoked"]
+        all_ids = [m["id"] for m in machines]
+        now = rounds.utcnow()
+        rendered = []
+        for m in machines:
+            weight, ver = ledger.current_weight(conn, m["id"])
+            if weight == 0.0:
+                weight, _comp, ver = ledger.machine_weight_for(
+                    json.loads(m["compute_profile_json"])
+                )
+            leased = conn.execute(
+                "SELECT 1 FROM tasks WHERE worker_id = ? AND status = 'leased' LIMIT 1",
+                (m["id"],),
+            ).fetchone()
+            rendered.append({
+                "machine_id": m["id"],
+                "display_name": m["display_name"],
+                "standing": m["standing"],
+                "reputation": m["reputation"],
+                "enrolled_at": m["enrolled_at"],
+                "last_available_at": m["last_available_at"],
+                "system_weight": weight,
+                "formula_version": ver,
+                "weighted_hours_total": ledger.accrued(conn, machine_id=m["id"]),
+                "accrued_current_window": ledger.accrued_current_window(
+                    conn, m["id"], weight, now
+                ),
+                "leased_now": leased is not None,
+                "in_good_standing_now": ledger.in_good_standing(conn, m["id"], now),
+                "unverified_tasks": ledger.unverified_tasks(conn, m["id"]),
+                "unverified_ceiling": ledger.unverified_ceiling(m["standing"]),
+            })
+        return {
+            "user": {
+                "id": user.id, "name": user.name,
+                "auth_provider": getattr(user, "auth_provider", "local"),
+                "is_admin": getattr(user, "is_admin", False),
+                "submitter_status": submitter["status"] if submitter else None,
+            },
+            "totals": {
+                "weighted_hours": ledger.accrued(conn, user_id=user.id),
+                "machines": len(active),
+            },
+            "machines": rendered,
+            "recent_events": ledger.recent_events(conn, all_ids),
+        }
+
+    @app.get(f"/{API_VERSION}/leaderboard")
+    def leaderboard(conn: ConnDep, user: UserDep, scope: str = "machines",
+                    limit: int = 50, offset: int = 0) -> dict:
+        """Machines / users by ``SUM(weighted_hours) WHERE kind='provisioned'``
+        (docs/09 6.2) -- Decision 7's "the leaderboard is the whole point", and
+        the one place the 404-not-403 cross-tenant rule is deliberately relaxed.
+        Exposed fields are display/user names and the sums only. Ranking spans
+        ``formula_version``s by construction and is never re-priced. The sum
+        filters ``kind = 'provisioned'``, so ``work`` signal can never inflate a
+        rank (disc/09 4.1)."""
+        limit = max(1, min(limit, 100))
+        offset = max(0, offset)
+        fv = conn.execute("SELECT MAX(formula_version) AS v FROM machine_weight").fetchone()
+        out: dict = {
+            "generated_at": rounds._iso(rounds.utcnow()),
+            "formula_version_current": int(fv["v"] or 0),
+        }
+        if scope == "users":
+            rows = conn.execute(
+                """SELECT c.id AS user_id, c.name AS user_name,
+                          SUM(e.weighted_hours) AS weighted_hours,
+                          COUNT(DISTINCT e.machine_id) AS machines
+                     FROM credit_events e JOIN contributors c ON c.id = e.user_id
+                    WHERE e.kind = 'provisioned'
+                    GROUP BY c.id
+                    ORDER BY weighted_hours DESC, user_name
+                    LIMIT ? OFFSET ?""",
+                (limit, offset),
+            ).fetchall()
+            out["by_user"] = [{
+                "rank": offset + i + 1, "user_id": r["user_id"],
+                "user_name": r["user_name"], "weighted_hours": r["weighted_hours"],
+                "machines": r["machines"],
+            } for i, r in enumerate(rows)]
+        else:
+            rows = conn.execute(
+                """SELECT w.id AS machine_id, w.display_name,
+                          w.contributor_id AS user_id, w.standing,
+                          COALESCE(mw.weight, 0.0) AS system_weight,
+                          COALESCE((SELECT SUM(e.weighted_hours) FROM credit_events e
+                                     WHERE e.machine_id = w.id AND e.kind = 'provisioned'),
+                                   0.0) AS weighted_hours
+                     FROM workers w
+                     LEFT JOIN machine_weight mw ON mw.machine_id = w.id
+                    WHERE EXISTS (SELECT 1 FROM credit_events e
+                                   WHERE e.machine_id = w.id AND e.kind = 'provisioned')
+                    ORDER BY weighted_hours DESC, display_name
+                    LIMIT ? OFFSET ?""",
+                (limit, offset),
+            ).fetchall()
+            out["by_machine"] = [{
+                "rank": offset + i + 1, "machine_id": r["machine_id"],
+                "display_name": r["display_name"], "user_id": r["user_id"],
+                "weighted_hours": r["weighted_hours"],
+                "system_weight": r["system_weight"], "standing": r["standing"],
+            } for i, r in enumerate(rows)]
+        # The optional ``work``-signal leaderboard (docs/09 4.2). ``job_type`` is
+        # null: the frozen ``credit_events`` schema carries no task/job link, so
+        # a ``work`` row's unit is not attributable from the row alone -- the sum
+        # is still a truthful total-units figure per machine, kept separate from
+        # Weighted System Hours.
+        work_rows = conn.execute(
+            """SELECT w.id AS machine_id, w.display_name,
+                      COALESCE(SUM(e.raw_seconds), 0) AS work_units
+                 FROM credit_events e JOIN workers w ON w.id = e.machine_id
+                WHERE e.kind = 'work' GROUP BY w.id
+                ORDER BY work_units DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        out["by_work"] = [{
+            "rank": i + 1, "machine_id": r["machine_id"],
+            "display_name": r["display_name"], "job_type": None,
+            "work_units": r["work_units"],
+        } for i, r in enumerate(work_rows)]
+        return out
 
     @app.get("/status")
     def status(conn: ConnDep) -> dict:
@@ -1334,6 +1500,34 @@ def _infer_result_for(task: sqlite3.Row, body: "SubmitRequest", key: str):
         output_ref=key,
         digest=str(metrics.get("digest") or ""),
         seconds=float(metrics.get("seconds", 0.0) or 0.0),
+    )
+
+
+def _credit_work(conn: sqlite3.Connection, jt, task, result, worker_id: str) -> None:
+    """Record the trusted ``credit()`` work signal on an accepted submission
+    (docs/09 4, docs/10 "credit": coordinator-side, trusted, never banked).
+
+    Only job types that implement ``credit`` contribute a ``kind = 'work'`` row
+    (``batch_inference`` does; ``collab_lora_finetune`` does not). The row has
+    ``weighted_hours = 0.0`` and carries the WorkUnits scalar in ``raw_seconds``;
+    every banked total filters ``kind = 'provisioned'``, so this can never mint
+    reputation. ``result`` is ``None`` for the collab path, whose artifact is not
+    deserialised here; a future type with ``credit`` on the collab branch would
+    pass its result through.
+    """
+    credit = getattr(jt, "credit", None)
+    if credit is None:
+        return
+    units = credit(task, result)
+    if units is None:
+        return
+    owner = conn.execute(
+        "SELECT contributor_id FROM workers WHERE id = ?", (worker_id,)
+    ).fetchone()
+    ledger.record_work(
+        conn, machine_id=worker_id,
+        user_id=owner["contributor_id"] if owner else "system",
+        units=units.count,
     )
 
 
