@@ -305,7 +305,9 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                 "target_rounds": r["target_rounds"],
             }
             for r in runs
-            if budget_mod.clearance_permits(contributor.clearance, r["data_classification"])
+            if budget_mod.clearance_and_terms_permit(
+                contributor.clearance, r["data_classification"], contributor.agreed_at
+            )
         ]
         return {"api_version": API_VERSION, "runs": visible,
                 "heartbeat_interval_sec": settings.heartbeat_interval_sec}
@@ -352,6 +354,26 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         ledger.recompute_machine_weight(conn, worker_id, profile)
         return {"worker_id": worker_id,
                 "heartbeat_interval_sec": settings.heartbeat_interval_sec}
+
+    @app.post(f"/{API_VERSION}/contributors/agree")
+    def agree_to_terms(conn: ConnDep, contributor: ContribDep) -> dict:
+        """Record the contributor's acceptance of the data-handling terms
+        (docs/03 open question 2). Stamps ``contributors.agreed_at`` on first
+        call; re-agreeing is a no-op that returns the original timestamp -- the
+        first acceptance is the one that counts, legally. Unlocks non-``open``
+        run claims."""
+        with immediate(conn):
+            existing = conn.execute(
+                "SELECT agreed_at FROM contributors WHERE id = ?", (contributor.id,)
+            ).fetchone()
+            if existing and existing["agreed_at"] is not None:
+                return {"agreed_at": existing["agreed_at"]}
+            now = rounds._iso(rounds.utcnow())
+            conn.execute(
+                "UPDATE contributors SET agreed_at = ? WHERE id = ?",
+                (now, contributor.id),
+            )
+        return {"agreed_at": now}
 
     @app.post(f"/{API_VERSION}/tasks/claim")
     def claim(body: ClaimRequest, conn: ConnDep, contributor: ContribDep):
@@ -487,8 +509,9 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                     continue
                 try:
                     spec = jt.shape_claim(
-                        conn, run_id, body.worker_id, contributor.clearance,
-                        profile, settings, worker_image_tag=worker["image_tag"],
+                        conn, run_id, body.worker_id, contributor.clearance, profile,
+                        settings, worker_image_tag=worker["image_tag"],
+                        agreed_at=contributor.agreed_at,
                     )
                 except rounds.NotEligible as exc:
                     verdicts.append(
@@ -1374,6 +1397,7 @@ def _resume_held(conn: sqlite3.Connection, held: sqlite3.Row, worker: sqlite3.Ro
         return resolve("collab_lora_finetune").shape_claim(
             conn, held["run_id"], worker["id"], contributor.clearance,
             profile, settings, worker_image_tag=worker["image_tag"],
+            agreed_at=contributor.agreed_at,
         )
     except rounds.NotEligible:
         return None

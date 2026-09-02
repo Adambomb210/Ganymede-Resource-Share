@@ -1390,20 +1390,23 @@ Two remain, and neither blocks M0.
    and which classification it warrants (§6.10). Dolly carries M0–M4; this is the
    first *real* run's input. *Not needed until after M4.*
 
-2. **Contributor agreement**, before the first non-`open` run. §6.10 gates `internal`
-   and `restricted` runs on clearance, which implies contributors accept something
-   before receiving non-public data. It needn't be elaborate, but it's also the
-   natural place to settle who owns the resulting adapters. Dormant while you're the
-   only contributor. *Needed before the first non-`open` run.*
+2. ~~**Contributor agreement**~~ — machinery landed (migration 006,
+   `budget.clearance_and_terms_permit`, `POST /v1/contributors/agree`). The
+   remaining part is the terms' *text* — who owns the resulting adapters belongs
+   there. That's prose to write offline, not code, and the gate is dormant but
+   armed while you're the only contributor. ~~*Needed before the first
+   non-`open` run*~~ — now state this as: the agreement must be a real document
+   before the first non-`open` run, not just an endpoint.
 
 ### Pre-rental checklist (before the M4b hardware afternoon)
 
 Work items to land before renting machines for the parallel run; none of them
 require the hardware:
 
-1. **Contributor agreement** (open question 2, brought forward) — a rental run might
-   be the first non-`open` run, which makes this blocking. Timestamp column +
-   gate on non-`open` classifications + accept endpoint. ~30 lines.
+1. ~~**Contributor agreement**~~ — done (migration 006). `contributors.agreed_at`,
+   `POST /v1/contributors/agree`, and `budget.clearance_and_terms_permit` gating
+   the claim path and manifest. Fails closed; `open` runs untouched. What remains
+   is writing the terms text itself — that is a you-decision, not code.
 2. **GPU invocation path dry-run** — the baseline harness already runs two seeds on
    CPU with the printed band/threshold; assert the CLI/env wiring so the same
    invocation "just works" on the rental GPU instead of being debugged on billed time.

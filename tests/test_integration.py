@@ -622,8 +622,9 @@ def test_requires_min_vram_excludes_undersized_card(client, store, conn, make_co
 
 def test_clearance_gates_claim_and_manifest_visibility(client, store, conn, make_contributor, seeded_run):
     """clearance: an open-clearance contributor gets 204 on an
-    internal-classification run; an internal contributor gets a task. The
-    manifest also hides the run from the first and shows it to the second."""
+    internal-classification run; an internal contributor who has agreed to the
+    terms gets a task. The manifest also hides the run from the first, hides
+    it from an unagreed internal contributor, and shows it once agreed."""
     run_id = seeded_run(classification="internal")
 
     _, key_open = make_contributor(clearance="open")
@@ -632,13 +633,28 @@ def test_clearance_gates_claim_and_manifest_visibility(client, store, conn, make
     assert fw_open.last_response.status_code == 204
 
     _, key_int = make_contributor(clearance="internal")
+    int_headers = {"Authorization": f"Bearer {key_int}"}
+
+    # Unagreed internal contributor fails closed (docs/03 open question 2).
+    unagreed_manifest = client.get("/v1/manifest", headers=int_headers).json()
+    assert run_id not in {r["run_id"] for r in unagreed_manifest["runs"]}
     fw_int = FakeWorker(client, store, key_int)
+    assert fw_int.claim(run_id) is None
+    assert fw_int.last_response.status_code == 204
+
+    # Agreement stamps agreed_at once; re-agreeing returns the same stamp.
+    agree = client.post("/v1/contributors/agree", headers=int_headers).json()
+    again = client.post("/v1/contributors/agree", headers=int_headers).json()
+    assert agree["agreed_at"] is not None
+    assert again["agreed_at"] == agree["agreed_at"]
+
+    # After agreeing, the internal run is visible and claimable.
     assert fw_int.claim(run_id) is not None
 
     open_manifest = client.get("/v1/manifest", headers={"Authorization": f"Bearer {key_open}"}).json()
     assert run_id not in {r["run_id"] for r in open_manifest["runs"]}
 
-    int_manifest = client.get("/v1/manifest", headers={"Authorization": f"Bearer {key_int}"}).json()
+    int_manifest = client.get("/v1/manifest", headers=int_headers).json()
     assert run_id in {r["run_id"] for r in int_manifest["runs"]}
 
 

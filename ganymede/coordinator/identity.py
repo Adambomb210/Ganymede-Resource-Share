@@ -135,7 +135,8 @@ def resolve_session_row(conn: sqlite3.Connection, token: str):
     session. Kept next to ``mint_session`` so the two halves of the mechanism
     read together."""
     row = conn.execute(
-        """SELECT c.id, c.name, c.clearance, c.is_admin, c.enabled, s.expires_at
+        """SELECT c.id, c.name, c.clearance, c.is_admin, c.enabled, s.expires_at,
+                  c.agreed_at
              FROM sessions s JOIN contributors c ON c.id = s.user_id
             WHERE s.token_hash = ?""",
         (hash_key(token),),

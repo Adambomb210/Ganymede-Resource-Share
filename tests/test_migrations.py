@@ -90,9 +90,9 @@ def old_db(tmp_path):
 
 
 def test_fresh_reaches_latest_version(fresh):
-    assert migrations.current_version(fresh) == migrations.LATEST_VERSION == 5
+    assert migrations.current_version(fresh) == migrations.LATEST_VERSION == 6
     rows = fresh.execute("SELECT version FROM schema_version ORDER BY version").fetchall()
-    assert [r["version"] for r in rows] == [1, 2, 3, 4, 5]
+    assert [r["version"] for r in rows] == [1, 2, 3, 4, 5, 6]
 
 
 @pytest.mark.parametrize("table", [
@@ -150,9 +150,9 @@ def test_foreign_keys_pragma_is_left_on_after_the_rebuild(fresh):
 def test_runner_is_idempotent(fresh):
     assert migrations.apply_pending(fresh) == []
     init_schema(fresh)  # the real re-entry path -- a coordinator restart
-    assert migrations.current_version(fresh) == 5
+    assert migrations.current_version(fresh) == 6
     rows = fresh.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0]
-    assert rows == 5  # no duplicate cursor rows
+    assert rows == 6  # no duplicate cursor rows
 
 
 # --------------------------------------------------------------------------
@@ -164,7 +164,7 @@ def test_old_db_migrates_forward(old_db):
     conn, _cid, _wid = old_db
     assert migrations.current_version(conn) == 0
     init_schema(conn)
-    assert migrations.current_version(conn) == 5
+    assert migrations.current_version(conn) == 6
 
 
 def test_old_rows_survive_with_ids_and_values_intact(old_db):
@@ -242,5 +242,5 @@ def test_partial_upgrade_from_v2_runs_only_whats_pending(old_db):
     assert migrations.current_version(conn) == 2
 
     applied = migrations.apply_pending(conn)
-    assert applied == [3, 4, 5]
-    assert migrations.current_version(conn) == 5
+    assert applied == [3, 4, 5, 6]
+    assert migrations.current_version(conn) == 6

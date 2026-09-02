@@ -51,6 +51,9 @@ class Contributor:
     # is the only reader in this phase. Defaulted so the existing single
     # construction site and any test that builds one positionally keep working.
     is_admin: bool = False
+    # docs/03 open question 2: when this contributor accepted the data-handling
+    # terms. None means never -- fails closed on any non-'open' run (budget.py).
+    agreed_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -115,7 +118,7 @@ def authenticate(
 
     # 2. contributor key -- CLI, operators, admins.
     row = conn.execute(
-        "SELECT id, name, clearance, is_admin, enabled, key_hash "
+        "SELECT id, name, clearance, is_admin, enabled, key_hash, agreed_at "
         "FROM contributors WHERE key_hash = ?",
         (digest,),
     ).fetchone()
@@ -127,7 +130,7 @@ def authenticate(
             raise AuthError("unknown key")
         if not row["enabled"]:
             raise AuthError("key revoked")
-        return Contributor(row["id"], row["name"], row["clearance"], bool(row["is_admin"]))
+        return Contributor(row["id"], row["name"], row["clearance"], bool(row["is_admin"]), row["agreed_at"])
 
     # 3. session token -- the web UI, via the placeholder provider.
     from ganymede.coordinator.identity import resolve_session_row
@@ -135,7 +138,8 @@ def authenticate(
     row = resolve_session_row(conn, token)
     if row is not None:
         return Contributor(
-            row["id"], row["name"], row["clearance"], bool(row["is_admin"])
+            row["id"], row["name"], row["clearance"], bool(row["is_admin"]),
+            row["agreed_at"],
         )
 
     raise AuthError("unknown credential")

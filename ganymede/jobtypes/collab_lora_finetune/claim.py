@@ -42,6 +42,7 @@ def claim_task(
     settings,
     now: datetime | None = None,
     worker_image_tag: str | None = None,
+    agreed_at: str | None = None,
 ) -> TaskSpec | None:
     """Lease one task, or return None meaning 204 No Content.
 
@@ -67,10 +68,12 @@ def claim_task(
         if run is None or run["status"] != "active":
             return None
 
-        if not budget_mod.clearance_permits(contributor_clearance, run["data_classification"]):
+        if not budget_mod.clearance_and_terms_permit(
+            contributor_clearance, run["data_classification"], agreed_at
+        ):
             raise NotEligible(
-                f"clearance {contributor_clearance!r} < classification "
-                f"{run['data_classification']!r}"
+                f"clearance {contributor_clearance!r} or unagreed terms < "
+                f"classification {run['data_classification']!r}"
             )
 
         ok, why = budget_mod.is_eligible(profile, json.loads(run["requires_json"]))

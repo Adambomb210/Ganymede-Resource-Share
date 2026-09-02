@@ -320,3 +320,22 @@ def clearance_permits(contributor_clearance: str, run_classification: str) -> bo
     except ValueError:
         return False
     return contributor_idx >= run_idx
+
+
+def clearance_and_terms_permit(
+    contributor_clearance: str,
+    run_classification: str,
+    agreed_at: str | None,
+) -> bool:
+    """``clearance_permits`` plus the contributor-agreement gate (docs/03 open
+    question 2 / 6.10): a contributor may touch a non-``open`` run only after
+    ``agreed_at`` is set by ``POST /v1/contributors/agree``. ``open`` runs
+    remain open in the other sense -- anyone with a valid key can claim them
+    without agreeing, since the dataset is public anyway.
+
+    Same fail-closed posture as ``clearance_permits``: a NULL ``agreed_at``
+    silently excludes from non-``open`` work rather than admitting.
+    """
+    if run_classification != "open" and agreed_at is None:
+        return False
+    return clearance_permits(contributor_clearance, run_classification)

@@ -144,7 +144,9 @@ def test_clearance_refusal_is_recorded(
     verdict = next(v for v in eligibility.explain(conn, worker_id).verdicts
                    if v.job_id == _job(conn, run_id))
     assert verdict.outcome == eligibility.REFUSED
-    assert verdict.reason == "clearance 'open' < classification 'restricted'"
+    assert verdict.reason == (
+        "clearance 'open' or unagreed terms < classification 'restricted'"
+    )
 
 
 # --------------------------------------------------------------------------

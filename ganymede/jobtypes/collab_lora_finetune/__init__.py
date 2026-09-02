@@ -81,9 +81,10 @@ class CollabLoraFinetune:
     # and body verbatim. Refusal is still `raise rounds.NotEligible`, recorded
     # in worker_eligibility exactly as today.
     def shape_claim(self, conn, run_id, worker_id, contributor_clearance, profile,
-                    settings, now=None, worker_image_tag=None):
+                    settings, now=None, worker_image_tag=None, agreed_at=None):
         return claim.claim_task(conn, run_id, worker_id, contributor_clearance,
-                                profile, settings, now, worker_image_tag)
+                                profile, settings, now, worker_image_tag,
+                                agreed_at=agreed_at)
 
     # -- 409 seam (ex-rounds heartbeat/record_submission round-status read) --
     def still_accepting(self, conn, run_id, round_idx):

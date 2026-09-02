@@ -521,6 +521,21 @@ def _m005_scheduler(conn: sqlite3.Connection) -> None:
 
 
 # --------------------------------------------------------------------------
+# 006 -- contributor agreement (docs/03 roadmap open question 2): contributors
+# need to record acceptance of the data-handling terms before touching any
+# non-`open` run. One nullable timestamp, append-only semantics upstream in
+# ``budget.clearance_and_terms_permit``.
+# --------------------------------------------------------------------------
+
+
+def _m006_contributor_agreement(conn: sqlite3.Connection) -> None:
+    with immediate(conn):
+        if "agreed_at" not in _columns(conn, "contributors"):
+            conn.execute("ALTER TABLE contributors ADD COLUMN agreed_at TEXT")
+        _record(conn, 6)
+
+
+# --------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------
 
@@ -530,6 +545,7 @@ MIGRATIONS: list[tuple[int, str, Migration]] = [
     (3, "additive_delta", _m003_additive_delta),
     (4, "identity_machine_id", _m004_identity),
     (5, "scheduler", _m005_scheduler),
+    (6, "contributor_agreement", _m006_contributor_agreement),
 ]
 
 
