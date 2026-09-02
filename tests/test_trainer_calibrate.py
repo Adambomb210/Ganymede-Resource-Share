@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import types
+
 import pytest
 import torch
 
@@ -76,3 +78,94 @@ def test_oom_detection_covers_both_shapes_torch_raises():
     assert C._is_oom(RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB"))
     assert not C._is_oom(RuntimeError("shape mismatch"))
     assert not C._is_oom(ValueError("out of memory"))  # wrong type: not an OOM
+
+
+# --------------------------------------------------------------------------
+# The fit ladder under simulated VRAM constraints (docs/03 pre-rental item 3)
+# --------------------------------------------------------------------------
+
+
+class _SimulatedCard(torch.nn.Module):
+    """A fake causal-LM whose forward "OOMs" at seq_len above a cap, standing
+    in for a real card whose memory a test can't allocate. Records which rungs
+    it was asked to run so a test can assert the ladder *stops* rather than
+    retrying higher rungs after a failure."""
+
+    def __init__(self, cap: int):
+        super().__init__()
+        self.lin = torch.nn.Linear(8, 8)
+        self.cap = cap
+        self.attempted: list[int] = []
+
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        seq = int(input_ids.shape[1])
+        self.attempted.append(seq)
+        if seq > self.cap:
+            raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+        out = types.SimpleNamespace()
+        out.loss = self.lin(torch.zeros(input_ids.shape[0], seq, 8)).sum()
+        return out
+
+
+@pytest.fixture
+def fake_cards(monkeypatch):
+    """Point probe_fit's model layer at _SimulatedCard instances. Caps are per
+    precision -- nf4 fits deeper rungs than bf16 on the same card."""
+    cards: list[_SimulatedCard] = []
+
+    def load_base(base_model, precision, device=None):
+        cap = {"bf16": 1024, "nf4": 4096}[precision]
+        card = _SimulatedCard(cap)
+        cards.append(card)
+        return card
+
+    monkeypatch.setattr(C.model_mod, "load_base", load_base)
+    monkeypatch.setattr(C.model_mod, "load_tokenizer",
+                        lambda base_model: types.SimpleNamespace(pad_token_id=0))
+    monkeypatch.setattr(C.model_mod, "attach_lora", lambda model, cfg: model)
+    monkeypatch.setattr(C.model_mod, "lora_params",
+                        lambda model: list(model.parameters()))
+    return cards
+
+
+def test_ladder_stops_at_the_first_rung_that_ooms(fake_cards):
+    """A ladder that retried past a failure would waste minutes per round on
+    rungs a cap of 1024 has already ruled out -- and on a CUDA card the retry
+    could fragment the allocator badly enough to OOM rungs that would have fit."""
+    result = C.probe_fit("m", "bf16", {"rank": 8, "alpha": 16,
+                                       "target_modules": []},
+                         micro_batch=1, ladder=(512, 1024, 2048, 4096),
+                         device=torch.device("cpu"))
+    assert result["ok"] and result["max_seq_len"] == 1024
+    # 512 and 1024 succeeded, 2048 OOMed, 4096 was never attempted.
+    assert fake_cards[0].attempted == [512, 1024, 2048]
+
+
+def test_nf4_fits_deeper_rungs_than_bf16_on_the_same_card(fake_cards):
+    """The reason the probe runs per-precision at all: bf16 and nf4 give
+    different answers, and the fits map downstream decides which a run needs."""
+    bf16 = C.probe_fit("m", "bf16", {"rank": 8, "alpha": 16,
+                                     "target_modules": []},
+                       micro_batch=1, ladder=(512, 1024, 2048, 4096),
+                       device=torch.device("cpu"))
+    nf4 = C.probe_fit("m", "nf4", {"rank": 8, "alpha": 16,
+                                   "target_modules": []},
+                      micro_batch=1, ladder=(512, 1024, 2048, 4096),
+                      device=torch.device("cpu"))
+    assert bf16["max_seq_len"] == 1024
+    assert nf4["max_seq_len"] == 4096
+
+
+def test_first_rung_oom_reports_no_fit(fake_cards, monkeypatch):
+    """Nothing fits -- the answer is False/None, not an exception, because a
+    calibration probe must always afford an answer downstream code can carry."""
+    monkeypatch.setattr(
+        C.model_mod, "load_base",
+        lambda *a, **k: _SimulatedCard(cap=0),
+    )
+    result = C.probe_fit("m", "bf16", {"rank": 8, "alpha": 16,
+                                       "target_modules": []},
+                         micro_batch=1, ladder=(512, 1024),
+                         device=torch.device("cpu"))
+    assert result["ok"] is False
+    assert result["max_seq_len"] is None

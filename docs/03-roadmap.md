@@ -1410,9 +1410,10 @@ require the hardware:
 2. **GPU invocation path dry-run** — the baseline harness already runs two seeds on
    CPU with the printed band/threshold; assert the CLI/env wiring so the same
    invocation "just works" on the rental GPU instead of being debugged on billed time.
-3. **`nf4` fit-ladder ordering test** — the trainer already refuses bitsandbytes on
-   CPU with a clear error, and the fit probe picks `nf4` as a precision fallback.
-   Test the ladder's ordering under simulated VRAM constraints.
+3. ~~**`nf4` fit-ladder ordering test**~~ — done (three cases in
+   `test_trainer_calibrate.py`: the ladder stops at the first OOM instead of
+   retrying higher rungs, bf16's answer is stricter than nf4's on the same card,
+   and a first-rung OOM is a clean False/None rather than an exception).
 4. **Solo multi-worker distributed run** — one host, several worker processes:
    exercises everything in the coordination path except latency/throughput realism.
    The strongest pre-rental smoke available without hardware.
