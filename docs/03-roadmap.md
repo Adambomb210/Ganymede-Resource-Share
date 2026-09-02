@@ -1396,6 +1396,24 @@ Two remain, and neither blocks M0.
    natural place to settle who owns the resulting adapters. Dormant while you're the
    only contributor. *Needed before the first non-`open` run.*
 
+### Pre-rental checklist (before the M4b hardware afternoon)
+
+Work items to land before renting machines for the parallel run; none of them
+require the hardware:
+
+1. **Contributor agreement** (open question 2, brought forward) — a rental run might
+   be the first non-`open` run, which makes this blocking. Timestamp column +
+   gate on non-`open` classifications + accept endpoint. ~30 lines.
+2. **GPU invocation path dry-run** — the baseline harness already runs two seeds on
+   CPU with the printed band/threshold; assert the CLI/env wiring so the same
+   invocation "just works" on the rental GPU instead of being debugged on billed time.
+3. **`nf4` fit-ladder ordering test** — the trainer already refuses bitsandbytes on
+   CPU with a clear error, and the fit probe picks `nf4` as a precision fallback.
+   Test the ladder's ordering under simulated VRAM constraints.
+4. **Solo multi-worker distributed run** — one host, several worker processes:
+   exercises everything in the coordination path except latency/throughput realism.
+   The strongest pre-rental smoke available without hardware.
+
 ### Closed
 
 - ~~**Base model**~~ → `Qwen/Qwen3-1.7B-Base`, dense, text-only, bf16, for bring-up;
