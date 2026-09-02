@@ -1417,9 +1417,12 @@ require the hardware:
    `test_trainer_calibrate.py`: the ladder stops at the first OOM instead of
    retrying higher rungs, bf16's answer is stricter than nf4's on the same card,
    and a first-rung OOM is a clean False/None rather than an exception).
-4. **Solo multi-worker distributed run** — one host, several worker processes:
-   exercises everything in the coordination path except latency/throughput realism.
-   The strongest pre-rental smoke available without hardware.
+4. ~~**Solo multi-worker distributed run**~~ — done. Exactly what
+   `tests/test_worker_concurrency.py` already was (three real worker processes,
+   one real coordinator, one real MinIO, several rounds); the work was fixing the
+   Windows-only blockers standing between the suite and this box: hosts-file
+   path/permissions, port 9010 being taken by an unrelated vendor service, and
+   `SIGKILL` not existing on Windows. 7/7 pass (~6 min).
 
 ### Closed
 
