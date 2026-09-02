@@ -169,7 +169,11 @@ class Fleet:
     def kill(self, index: int) -> None:
         """SIGKILL, not terminate: a machine that loses power does not get to
         run its abandon handler, and that is the case the lease exists for."""
-        self.procs[index].send_signal(signal.SIGKILL)
+        # .kill(), not .terminate(): a machine that loses power does not get a
+        # chance to run its abandon handler, and that is the case the lease
+        # exists for. kill() is SIGKILL on POSIX and TerminateProcess on
+        # Windows (which has no SIGKILL constant -- dead is dead either way).
+        self.procs[index].kill()
         self.procs[index].wait(timeout=30)
 
     def alive(self) -> int:

@@ -12,6 +12,7 @@ suite doesn't hard-fail CI on a machine without Docker.
 
 from __future__ import annotations
 
+import os
 import shutil
 import socket
 import subprocess
@@ -34,7 +35,9 @@ from ganymede.coordinator.store import (
 )
 
 CONTAINER_NAME = "ganymede-test-minio"
-HOST_PORT = 9010  # deliberately not 9000, to avoid colliding with a real MinIO
+HOST_PORT = 9410  # deliberately not 9000, to avoid colliding with a real MinIO;
+# deliberately not 9010, which Logitech G HUB claims on this dev box (its
+# "426 Upgrade Required" reply against the MinIO health probe was the prompt).
 PUBLIC_HOST = "storage-test.local"
 PUBLIC_ENDPOINT = f"http://{PUBLIC_HOST}:{HOST_PORT}"
 ROOT_USER = "ganymede-test"
@@ -53,17 +56,27 @@ def _docker_available() -> bool:
     return True
 
 
+def _hosts_file() -> str:
+    """Where the hosts file lives here. Windows keeps it under System32 and
+    needs admin rights to edit; POSIX keeps it under /etc/."""
+    if os.name == "nt":
+        return os.path.join(os.environ.get("SystemRoot", r"C:\\Windows"),
+                            r"System32\drivers\etc\hosts")
+    return "/etc/hosts"
+
+
 def _ensure_hosts_entry() -> None:
     """Make sure `storage-test.local` resolves, so the test genuinely exercises
     a non-localhost hostname rather than accidentally hitting loopback by name
     coincidence."""
+    hosts_file = _hosts_file()
     try:
-        with open("/etc/hosts") as f:
+        with open(hosts_file) as f:
             contents = f.read()
         if PUBLIC_HOST not in contents:
-            with open("/etc/hosts", "a") as f:
+            with open(hosts_file, "a") as f:
                 f.write(f"\n127.0.0.1 {PUBLIC_HOST}\n")
-    except PermissionError:
+    except (PermissionError, FileNotFoundError):
         # Fall back to checking it already resolves (e.g. pre-provisioned).
         pass
     # Verify it actually resolves now, one way or another.
