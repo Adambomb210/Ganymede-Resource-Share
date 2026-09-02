@@ -103,6 +103,64 @@ def test_loading_an_adapter_of_the_wrong_rank_is_refused(tiny_model_dir, tiny_lo
         M.attach_lora(base, tiny_lora_cfg, init_from=wrong_rank)
 
 
+# --------------------------------------------------------------------------
+# require_device -- the rental-box invocation guard (docs/03 pre-rental item 2).
+# Simulating the rental box means monkeypatching torch's availability probes,
+# because this dev machine has no GPU to be wrong about.
+# --------------------------------------------------------------------------
+
+
+def _fake_cuda(monkeypatch, *, available: bool, count: int = 1):
+    monkeypatch.setattr(M.torch.cuda, "is_available", lambda: available)
+    monkeypatch.setattr(M.torch.cuda, "device_count", lambda: count)
+
+
+def test_auto_device_still_falls_through_to_cpu_here():
+    """No spec = the old behavior: never refuse to run at all."""
+    assert M.require_device(None) in (M.torch.device("cpu"),
+                                      M.torch.device("mps"),
+                                      M.torch.device("cuda"))
+
+
+def test_cpu_is_always_a_valid_request():
+    assert M.require_device("cpu") == M.torch.device("cpu")
+
+
+def test_an_explicit_cuda_request_on_a_cuda_box_parses(monkeypatch):
+    """The happy path the rental run relies on."""
+    _fake_cuda(monkeypatch, available=True, count=8)
+    assert M.require_device("cuda") == M.torch.device("cuda")
+    assert M.require_device("cuda:3") == M.torch.device("cuda", 3)
+
+
+def test_an_explicit_cuda_request_on_a_box_without_cuda_is_refused(monkeypatch):
+    """The failure that must happen at CLI parse time, not three model-loads
+    into billed run time. The whole point of the flag."""
+    _fake_cuda(monkeypatch, available=False)
+    with pytest.raises(RuntimeError, match="torch.cuda.is_available"):
+        M.require_device("cuda")
+
+
+def test_a_card_index_outside_the_visible_set_is_refused(monkeypatch):
+    """A typo'd --device cuda:3 on a 2-GPU box, or a CUDA_VISIBLE_DEVICES mask
+    the operator forgot about: refuse before `load_base` paints a confusing
+    fingerprint on a card they didn't intend to use."""
+    _fake_cuda(monkeypatch, available=True, count=2)
+    with pytest.raises(RuntimeError, match="CUDA_VISIBLE_DEVICES"):
+        M.require_device("cuda:3")
+
+
+def test_a_mps_request_requires_the_backend(monkeypatch):
+    monkeypatch.setattr(M.torch.backends.mps, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="MPS"):
+        M.require_device("mps")
+
+
+def test_a_garbage_device_string_names_itself_in_the_error():
+    with pytest.raises(RuntimeError, match="'foobar'"):
+        M.require_device("foobar")
+
+
 def test_unknown_precision_names_the_ones_that_exist(tiny_model_dir):
     with pytest.raises(ValueError, match="nf4"):
         M.load_base(tiny_model_dir, "int3", device=CPU)

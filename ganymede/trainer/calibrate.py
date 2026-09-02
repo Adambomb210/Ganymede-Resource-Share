@@ -484,7 +484,11 @@ def main(argv: list[str] | None = None) -> int:
     with open(args.run_config) as fh:
         run_cfg = json.load(fh)
 
-    device = torch.device(args.device) if args.device else model_mod.pick_device()
+    try:
+        device = model_mod.require_device(args.device)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     precisions = tuple(p for p in args.probe_precisions.split(",") if p.strip())
 
     if device.type != "cuda":

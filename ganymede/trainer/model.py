@@ -45,6 +45,64 @@ def pick_device(prefer: str | None = None) -> torch.device:
     return torch.device("cpu")
 
 
+def require_device(spec: str | None) -> torch.device:
+    """Like ``pick_device``, except an explicit spec fails loudly when the
+    backend it names is not actually usable -- the rental-box invocation
+    path (docs/03 pre-rental checklist). ``pick_device`` silently downgrades
+    a dead CUDA installation to CPU; that is fine on a laptop and a waste of
+    billed GPU hours on a rental, where the whole point is that the card is
+    busy.
+
+    * ``None``    -- same as ``pick_device()``: auto, CPU allowed.
+    * ``cpu``     -- always fine.
+    * ``cuda`` / ``cuda:N`` -- ``torch.cuda.is_available()`` must hold, and
+      ``N`` must be inside the visible set (respecting
+      ``CUDA_VISIBLE_DEVICES``).
+    * ``mps``     -- must be built and available.
+    Anything else fails with a message naming the check that failed and what
+    to look at, so a broken rental image is debugged with zero GPU minutes
+    burned rather than after a supervisor notices the slow run.
+    """
+    if spec is None:
+        return pick_device()
+    try:
+        device = torch.device(spec)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"--device {spec!r} does not parse (torch said: {exc})"
+        ) from exc
+    if device.type == "cpu":
+        return device
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "--device 'cuda' requested but torch cannot see the card: "
+                "torch.cuda.is_available() is False. Check the nvidia driver "
+                "and CUDA runtime on the box (nvidia-smi), and that this "
+                "torch build is the CUDA one, not CPU-only."
+            )
+        n = torch.cuda.device_count()
+        idx = device.index if device.index is not None else 0
+        if idx >= n:
+            raise RuntimeError(
+                f"--device 'cuda:{idx}' is out of range: {n} device(s) visible. "
+                "If the rental has more cards, check CUDA_VISIBLE_DEVICES."
+            )
+        return device
+    if device.type == "mps":
+        if not (getattr(torch.backends, "mps", None) is not None
+                and torch.backends.mps.is_available()):
+            raise RuntimeError(
+                "--device 'mps' requested but this torch build has no usable "
+                "MPS backend."
+            )
+        return device
+    raise RuntimeError(
+        f"--device {spec!r}: device type {device.type!r} is not one the "
+        "trainer knows how to train on (cuda | mps | cpu)."
+    )
+
+
 def load_base(base_model: str, precision: str, device: torch.device | None = None):
     """Load the frozen base model at the run's pinned precision (8, J).
 

@@ -1407,9 +1407,12 @@ require the hardware:
    `POST /v1/contributors/agree`, and `budget.clearance_and_terms_permit` gating
    the claim path and manifest. Fails closed; `open` runs untouched. What remains
    is writing the terms text itself — that is a you-decision, not code.
-2. **GPU invocation path dry-run** — the baseline harness already runs two seeds on
-   CPU with the printed band/threshold; assert the CLI/env wiring so the same
-   invocation "just works" on the rental GPU instead of being debugged on billed time.
+2. ~~**GPU invocation path dry-run**~~ — done. `require_device` in
+   `ganymede/trainer/model.py` is pick_device's fail-loud twin: an explicit
+   `--device cuda` that torch can't see (wrong driver, CPU-only torch build,
+   `CUDA_VISIBLE_DEVICES` masking every card) is a parse-time exit 2 with the
+   check to run, on `baseline`, `calibrate`, and `evalround` alike — not a
+   silent CPU-burn of billed hours discovered after the `load_base` download.
 3. ~~**`nf4` fit-ladder ordering test**~~ — done (three cases in
    `test_trainer_calibrate.py`: the ladder stops at the first OOM instead of
    retrying higher rungs, bf16's answer is stricter than nf4's on the same card,

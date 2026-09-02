@@ -2,9 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import statistics
 
 from ganymede.trainer import baseline as B
+
+
+def test_cli_refuses_an_explicit_device_it_cannot_see(tmp_path, monkeypatch):
+    """docs/03 pre-rental item 2, the debug cost this avoids: on the rental box,
+    `main("--device cuda")` exits 2 with the check to run -- not hours into a
+    2000-step run on CPU "by accident." The refusal is simulated so the test
+    passes on this box whether or not this box has a real card: without the
+    monkeypatch, --device cuda just works here."""
+    monkeypatch.setattr(B.model_mod.torch.cuda, "is_available", lambda: False)
+    p = tmp_path / "run.json"
+    p.write_text(json.dumps({}))
+    ref = B.main(["--run-config", str(p), "--device", "cuda"])
+    assert ref == 2
 
 
 def _seed_result(seed: int, curve: list[float], grid=(0, 100, 200)) -> dict:

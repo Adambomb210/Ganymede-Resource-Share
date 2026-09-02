@@ -198,6 +198,11 @@ def main(argv: list[str] | None = None, settings: Settings | None = None,
 
     settings = settings or Settings.from_env()
     store = store or Store(settings.storage)
+    try:
+        model_mod.require_device(args.device)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     evaluator = Evaluator(store, device=args.device, eval_examples=args.eval_examples)
 
     conn = connect(settings.db_path)

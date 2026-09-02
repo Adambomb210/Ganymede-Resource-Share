@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 import time
 from typing import Any
 
@@ -302,7 +303,11 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
 
-    device = torch.device(args.device) if args.device else model_mod.pick_device()
+    try:
+        device = model_mod.require_device(args.device)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     result = run_baseline(
         run_cfg, seeds=seeds, total_steps=args.steps, eval_every=args.eval_every,
         eval_examples=args.eval_examples, device=device, tolerance_k=args.tolerance_k,
