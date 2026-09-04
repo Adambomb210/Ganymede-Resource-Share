@@ -140,6 +140,15 @@ def probe_fit(
     params = model_mod.lora_params(peft_model)
     pad = tokenizer.pad_token_id or 0
 
+    # Physical capacity, read once, for the oversubscription stop below. Only
+    # CUDA has a queryable capacity; on CPU/MPS oversubscription is the OS's
+    # problem and the probe's only stop is a real exception.
+    total_vram_gb: float | None = None
+    if device.type == "cuda":
+        total_vram_gb = (
+            torch.cuda.get_device_properties(device).total_memory / 2**30
+        )
+
     for seq_len in ladder:
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -152,9 +161,26 @@ def probe_fit(
             out.loss.backward()
             for p in params:
                 p.grad = None
+            peak = _peak_vram_gb(device)
+            # Windows-WDDM oversubscription: the driver silently pages the
+            # overflow into shared system RAM, so "it fits" technically -- and
+            # runs 45x slower in practice (measured: 0.31s/step at seq 512 vs
+            # 13.85s at seq 2048 spilling ~8 GB). Linux would OOM here instead;
+            # this stop is what makes the answer mean the same thing on both.
+            if (
+                total_vram_gb is not None
+                and peak is not None
+                and peak > total_vram_gb
+            ):
+                result["error"] = (
+                    f"oversubscribed: peak {peak:.2f} GB > card capacity "
+                    f"{total_vram_gb:.2f} GB (WDDM shared-memory spill would "
+                    "stall this rung)"
+                )
+                break
             result["ok"] = True
             result["max_seq_len"] = seq_len
-            result["peak_vram_gb"] = _peak_vram_gb(device)
+            result["peak_vram_gb"] = peak
             if progress_path:
                 # Written after every success so that a run killed at the next
                 # rung still reports the last one that worked. See

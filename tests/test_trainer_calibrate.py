@@ -156,6 +156,44 @@ def test_nf4_fits_deeper_rungs_than_bf16_on_the_same_card(fake_cards):
     assert nf4["max_seq_len"] == 4096
 
 
+def test_a_rung_that_spills_past_the_card_is_not_a_fit(fake_cards, monkeypatch):
+    """Windows WDDM pages CUDA overflow into shared system RAM, so a rung can
+    complete while exceeding the card's physical memory -- measured 45x slower
+    than the rung below it (13.85s vs 0.31s/step on a 12GB 3060 at seq 2048,
+    ~8GB spilled). The probe stops on such a rung as if it had OOMed, which
+    is exactly what Linux would have done with the same allocation: the two
+    platforms must give the same answer. The fake torch.cuda surface means
+    the test itself runs on any box, card or no card."""
+    props = types.SimpleNamespace(total_memory=6 * 2**30, major=8, minor=6)
+    monkeypatch.setattr(C.torch.cuda, "get_device_properties", lambda d: props)
+    monkeypatch.setattr(C.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(C.torch.cuda, "reset_peak_memory_stats", lambda d: None)
+
+    def fake_max(d=None):
+        # Per-rung: rung 512 sits inside the fake 6GB card; anything deeper
+        # "completes" while allocating 20GB -- the WDDM-spill shape.
+        current = fake_cards[0].attempted[-1]
+        return 4 * 2**30 if current <= 512 else 20 * 2**30
+
+    monkeypatch.setattr(C.torch.cuda, "max_memory_allocated", fake_max)
+    # The fake card lives on CPU; strip the cuda device off tensor creation so
+    # the probe never touches a real card and the test runs on any box.
+    real_full = torch.full
+    monkeypatch.setattr(
+        C.torch, "full",
+        lambda size, fill, dtype=None, device=None: real_full(size, fill, dtype=dtype),
+    )
+    result = C.probe_fit("m", "bf16", {"rank": 8, "alpha": 16,
+                                       "target_modules": []},
+                         micro_batch=1, ladder=(512, 1024, 2048),
+                         device=torch.device("cuda"))
+    # rung 512 fit inside the (fake) 6GB; rung 1024 allocated 20GB and was
+    # refused; rung 2048 was never attempted.
+    assert result["ok"] is True and result["max_seq_len"] == 512
+    assert "oversubscribed" in result["error"]
+    assert fake_cards[0].attempted == [512, 1024]
+
+
 def test_first_rung_oom_reports_no_fit(fake_cards, monkeypatch):
     """Nothing fits -- the answer is False/None, not an exception, because a
     calibration probe must always afford an answer downstream code can carry."""

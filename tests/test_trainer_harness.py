@@ -104,9 +104,14 @@ def test_the_coordinator_actually_reads_the_calibration_we_emit(
     assert budgeted > 100
 
 
-def test_probe_fit_reports_a_missing_backend_rather_than_crashing(tiny_model_dir, tiny_lora_cfg):
+def test_probe_fit_reports_a_missing_backend_rather_than_crashing(tiny_model_dir, tiny_lora_cfg, monkeypatch):
     """nf4 is CUDA-only. A worker that cannot honor the run's pinned precision
-    must find out before it claims, not three steps into a round."""
+    must find out before it claims, not three steps into a round. Absence is
+    simulated: bitsandbytes may perfectly well be installed on the dev box (it
+    is, for the real-card nf4 probe), and the claim path's behavior is about
+    what happens when it *isn't*."""
+    import sys
+    monkeypatch.setitem(sys.modules, "bitsandbytes", None)  # import -> ImportError
     fit = C.probe_fit(tiny_model_dir, "nf4", tiny_lora_cfg, micro_batch=1, device=CPU)
     assert fit["ok"] is False
     assert "bitsandbytes" in fit["error"]
