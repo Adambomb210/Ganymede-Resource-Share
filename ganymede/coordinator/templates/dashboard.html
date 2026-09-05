@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Ganymede{% endblock %}
+{% block content %}
+<h1>Fleet health</h1>
+{% include "frags/fleet.html" %}
+
+<section class="card">
+  <h2>Runs</h2>
+  <table>
+    <tr><th>run</th><th>status</th><th>round</th><th>base model</th></tr>
+    {% for r in runs %}
+    <tr>
+      <td>{{ r.id }}</td><td>{{ r.status }}</td>
+      <td>{{ r.current_round }}/{{ r.target_rounds }}</td>
+      <td>{{ r.base_model }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="4">no runs</td></tr>
+    {% endfor %}
+  </table>
+</section>
+
+<section class="card">
+  <h2>Jobs</h2>
+  <table>
+    <tr><th>job</th><th>type</th><th>status</th><th>rank</th></tr>
+    {% for j in jobs %}
+    <tr><td><a href="/ui/jobs/{{ j.id }}">{{ j.id[:8] }}</a></td>
+        <td>{{ j.job_type }}</td><td>{{ j.status }}</td><td>{{ j.priority_rank }}</td></tr>
+    {% else %}
+    <tr><td colspan="4">no jobs</td></tr>
+    {% endfor %}
+  </table>
+</section>
+
+{% if is_admin and fleet_summary %}
+<section class="card">
+  <h2>Refusal breakdown (admin)</h2>
+  <table>
+    <tr><th>reason</th><th>workers</th></tr>
+    {% for reason, workers in fleet_summary.items() %}
+    <tr><td>{{ reason }}</td><td>{{ workers|join(", ") }}</td></tr>
+    {% endfor %}
+  </table>
+</section>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,34 @@
+<table>
+  <tr><th>rank</th><th>job</th><th>type</th><th>owner</th><th>status</th><th>leased</th><th>move</th></tr>
+  {% for j in queue %}
+  <tr>
+    <td>{{ j.priority_rank }}</td>
+    <td><a href="/ui/jobs/{{ j.id }}">{{ j.id[:8] }}</a></td>
+    <td>{{ j.job_type }}</td>
+    <td>{{ j.owner_name }}</td>
+    <td>{{ j.status }}</td>
+    <td>{{ j.leased_tasks }}</td>
+    <td>
+      {# Move-up / move-down, not drag (docs/12): each is one frozen-body
+         POST /v1/admin/queue/reorder. Neighbour ids come from the
+         server-rendered DOM -- never js: (CSP). The SSE queue.change event
+         refetches this whole table after any reorder, so no inline JS is
+         needed to re-enable or re-render buttons. #}
+      {% if not loop.first %}
+      <button hx-post="/v1/admin/queue/reorder" hx-ext="json-enc"
+              hx-headers='{"X-Ganymede-UI":"1"}'
+              hx-vals='{"job_id": "{{ j.id }}", "before": "{{ queue[loop.index0 - 1].id }}"}'
+              hx-swap="none">↑</button>
+      {% endif %}
+      {% if not loop.last %}
+      <button hx-post="/v1/admin/queue/reorder" hx-ext="json-enc"
+              hx-headers='{"X-Ganymede-UI":"1"}'
+              hx-vals='{"job_id": "{{ j.id }}", "after": "{{ queue[loop.index0 + 1].id }}"}'
+              hx-swap="none">↓</button>
+      {% endif %}
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="7">queue is empty</td></tr>
+  {% endfor %}
+</table>

@@ -231,8 +231,8 @@ def test_the_measured_throughput_lands_under_the_key_the_next_claim_reads(
     """
     import sqlite3
 
+    from ganymede.trainer.model import pick_device
     from ganymede.device import device_name
-    import torch
 
     assert _worker(live_stack, tmp_path).run() == 0
 
@@ -244,7 +244,10 @@ def test_the_measured_throughput_lands_under_the_key_the_next_claim_reads(
         conn.close()
 
     assert len(recorded) == 1
-    assert recorded[0]["gpu_model"] == device_name(torch.device("cpu"))
+    # The worker names whatever device it actually picked -- CUDA on a GPU
+    # box (the dev box has a real RTX 3060), cpu where nothing else exists.
+    # Asserting "cpu" made the suite hardware-dependent.
+    assert recorded[0]["gpu_model"] == device_name(pick_device())
     assert recorded[0]["steps_per_min"] > 0
 
 

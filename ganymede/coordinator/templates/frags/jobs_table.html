@@ -1,0 +1,12 @@
+<table>
+  <tr><th>job</th><th>owner</th><th>type</th><th>status</th><th>rank</th><th>leased</th><th>created</th></tr>
+  {% for j in jobs %}
+  {% set job = j %}
+  {% include "frags/job_row.html" %}
+  {% else %}
+  <tr><td colspan="7">no jobs</td></tr>
+  {% endfor %}
+</table>
+{% if before %}
+<p><a href="/ui/jobs?before={{ before[0] }},{{ before[1] }}">older →</a></p>
+{% endif %}

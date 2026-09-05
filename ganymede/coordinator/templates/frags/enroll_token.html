@@ -1,0 +1,10 @@
+{# The one-time enroll token, rendered exactly once in the POST response
+   (docs/05 enrollments, docs/12 /ui/machines). No GET returns it; a refresh
+   loses it. Replaces the #enroll section, htmx outerHTML swap. #}
+<section class="card" id="enroll">
+  <h2>Machine enrolled — token (shown once)</h2>
+  <p>Copy this into the host config now; it is never shown again and expires
+     at {{ expires_at }}.</p>
+  <div class="token">{{ enroll_token }}</div>
+  <p><a href="/ui/machines">Done — back to machines</a></p>
+</section>

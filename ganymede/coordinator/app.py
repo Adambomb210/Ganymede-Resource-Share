@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 from ganymede.coordinator import budget as budget_mod
 from ganymede.coordinator import constraints as constraints_mod
 from ganymede.coordinator import eligibility, identity, ledger
-from ganymede.coordinator import close, rounds
+from ganymede.coordinator import close, events, rounds
 from ganymede.coordinator.migrations import SYSTEM_OWNER_ID
 from ganymede.coordinator.auth import (
     AuthError,
@@ -117,6 +117,14 @@ class EnrollRequest(BaseModel):
 class ClaimEnrollmentRequest(BaseModel):
     enroll_token: str
     compute_profile: ComputeProfile
+
+
+class SubmitterDecisionRequest(BaseModel):
+    """The body docs/06 froze: ``{status, note}`` -- one of approved / denied /
+    revoked, plus an optional note the contributor sees."""
+
+    status: str
+    note: str | None = None
 
 
 # --------------------------------------------------------------------------
@@ -276,6 +284,39 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
     app = FastAPI(title="Ganymede coordinator", version="0.1.0")
     app.state.settings = settings
     app.state.store = store
+    # webui imports this module (ConnDep, _SESSION_COOKIE), so it cannot be a
+    # module-level import here -- circular. By create_app time this module is
+    # fully initialized and the import resolves cleanly.
+    from ganymede.coordinator import webui
+
+    webui.mount(app, settings)
+    events.db_path = settings.db_path
+
+    # ------------------------------------------------- SSE stream (docs/12)
+
+    @app.get(f"/{API_VERSION}/events")
+    async def events_stream(
+        request: Request,
+        authorization: Annotated[str | None, Header()] = None,
+    ):
+        """Cookie-authenticated SSE (docs/12): EventSource cannot set a header,
+        so the stream rides the session cookie. Auth class user -- a machine
+        key is rejected inside the endpoint. An async endpoint must not touch
+        a threadpool-created connection (Starlette runs sync generator
+        dependencies in a worker thread and hands the object back across
+        threads), so the principal resolves on a short-lived connection here
+        -- and nothing DB is held for the stream's life (docs/12).
+        """
+        conn = connect(settings.db_path)
+        try:
+            cookie = request.cookies.get(_SESSION_COOKIE)
+            try:
+                principal = authenticate(conn, authorization, cookie=cookie)
+            except AuthError as exc:
+                raise HTTPException(status_code=401, detail=str(exc)) from exc
+        finally:
+            conn.close()
+        return await events.events_endpoint(request, principal)
 
     # ---------------- discovery / health ----------------
 
@@ -352,6 +393,7 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         # ``computed_at`` stamp applied to windows settled *after* it -- never
         # retroactive -- so correctness only requires the fresh row exists.
         ledger.recompute_machine_weight(conn, worker_id, profile)
+        events.hub.publish("fleet.delta")
         return {"worker_id": worker_id,
                 "heartbeat_interval_sec": settings.heartbeat_interval_sec}
 
@@ -537,10 +579,17 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                 # own transaction; eligibility.record comes after, never between
                 # (docs/07 §1 freezes that ordering).
                 with immediate(conn):
-                    conn.execute(
+                    flipped = conn.execute(
                         "UPDATE jobs SET status = 'running' "
                         "WHERE id = ? AND status = 'queued'",
                         (job["id"],),
+                    ).rowcount
+                if flipped:
+                    owner = conn.execute(
+                        "SELECT owner_id FROM jobs WHERE id = ?", (job["id"],)
+                    ).fetchone()
+                    events.hub.publish(
+                        "job.status", job_id=job["id"], owner_id=owner["owner_id"]
                     )
                 verdicts.append(eligibility.Verdict(job["id"], eligibility.LEASED))
                 eligibility.record(conn, body.worker_id, verdicts)
@@ -810,7 +859,7 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         return resp
 
     @app.post(f"/{API_VERSION}/machines/enroll")
-    def machine_enroll(body: EnrollRequest, conn: ConnDep, user: UserDep) -> dict:
+    def machine_enroll(body: EnrollRequest, request: Request, conn: ConnDep, user: UserDep) -> dict:
         """Mint a one-time enrollment token bound to the calling user. The
         operator pastes it into the host config; the host then calls
         ``claim-enrollment`` with the token alone."""
@@ -828,6 +877,18 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         expires_at = rounds._iso(
             rounds.utcnow() + timedelta(seconds=settings.enroll_ttl_sec)
         )
+        # Content negotiation (docs/12): the htmx form sends Accept: text/html
+        # and gets the one-time token rendered once, inline, in this fragment;
+        # no GET ever returns it, it never enters a URL. A JSON caller gets the
+        # frozen JSON shape unchanged.
+        accept = request.headers.get("accept", "")
+        if "text/html" in accept:
+            from ganymede.coordinator import webui as _webui
+
+            return _webui.templates.TemplateResponse(
+                request, "frags/enroll_token.html",
+                {"enroll_token": token, "expires_at": expires_at},
+            )
         # ``enroll_token`` is shown once -- only its sha256 is stored.
         return {"enroll_token": token, "enroll_id": enroll_id, "expires_at": expires_at}
 
@@ -877,6 +938,7 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             if consumed.rowcount == 0:
                 # Lost the one-time race -- roll the whole block back.
                 raise HTTPException(status_code=404, detail="unknown enrollment")
+        events.hub.publish("fleet.delta")
         # ``machine_key`` shown once. Compute the provisional weight from the
         # enrollment probe (Decision 12, docs/09 3) -- the ``machine_weight``
         # row gates how much a settled window is worth. Recomputed on every
@@ -938,6 +1000,8 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                 "VALUES (?, ?, ?, 'owner_retire', '{}')",
                 (now, user.id, machine_id),
             )
+        events.hub.publish("standing.change", machine_id=machine_id)
+        events.hub.publish("fleet.delta")
         return {"machine_id": machine_id, "standing": "revoked"}
 
     @app.post(f"/{API_VERSION}/machines/{{machine_id}}/rotate-key")
@@ -1190,6 +1254,8 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                 "UPDATE jobs SET status = 'queued', priority_rank = ? WHERE id = ?",
                 (tail, job_id),
             )
+        events.hub.publish("job.status", job_id=job_id, owner_id=row["owner_id"])
+        events.hub.publish("queue.change", job_id=job_id)
         # A static (no ``shape_claim``) type fans its task set out once, now
         # (docs/10 §3, §4). A dynamic type -- ``collab_lora_finetune`` -- is
         # sized per machine at claim time and seeds its own round elsewhere.
@@ -1239,12 +1305,14 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         state."""
         if body.mode not in ("soft", "hard"):
             raise HTTPException(status_code=422, detail="mode must be 'soft' or 'hard'")
-        _job_for_caller(conn, job_id, user)
+        row = _job_for_caller(conn, job_id, user)
         with immediate(conn):
             conn.execute(
                 "UPDATE jobs SET status = 'cancelled', cancel_mode = ? WHERE id = ?",
                 (body.mode, job_id),
             )
+        events.hub.publish("job.status", job_id=job_id, owner_id=row["owner_id"])
+        events.hub.publish("queue.change", job_id=job_id)
         return {"job_id": job_id, "status": "cancelled", "cancel_mode": body.mode}
 
     # ---------------- admin queue surface (docs/06, auth: admin) ----------
@@ -1300,7 +1368,36 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                 "UPDATE jobs SET priority_rank = ? WHERE id = ?",
                 (new_rank, body.job_id),
             )
+        events.hub.publish("queue.change", job_id=body.job_id)
         return {"job_id": body.job_id, "priority_rank": new_rank}
+
+    @app.post(f"/{API_VERSION}/admin/submitters/{{user_id}}")
+    def admin_submitters_decide(
+        user_id: str, body: SubmitterDecisionRequest, conn: ConnDep,
+        admin: Annotated[Contributor, Depends(require_admin)],
+    ) -> dict:
+        """The submitter allowlist's only writer (docs/06, Decisions 3, 9):
+        ``{status, note}`` with status one of approved / denied / revoked.
+        Revoking does **not** kill running jobs -- the admin cancels those
+        explicitly, per job, with a chosen ``mode`` (Decision 18)."""
+        if body.status not in ("approved", "denied", "revoked"):
+            raise HTTPException(status_code=422, detail="status must be approved | denied | revoked")
+        row = conn.execute(
+            "SELECT user_id, status FROM submitters WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="not found")
+        now = rounds._iso(rounds.utcnow())
+        with immediate(conn):
+            conn.execute(
+                """UPDATE submitters
+                      SET status = ?, decided_by = ?, decided_at = ?, note = ?
+                    WHERE user_id = ?""",
+                (body.status, admin.id, now, body.note, user_id),
+            )
+        events.hub.publish("submitter.change", user_id=user_id)
+        return {"user_id": user_id, "status": body.status, "decided_by": admin.id,
+                "decided_at": now}
 
     return app
 

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Ganymede{% endblock %}</title>
+  <link rel="stylesheet" href="/ui/static/style.css">
+  <script src="/ui/static/htmx.min.js"></script>
+  <script src="/ui/static/sse.js"></script>
+  <script src="/ui/static/json-enc.js"></script>
+</head>
+<body {% if user %}hx-ext="sse" sse-connect="/v1/events"{% endif %}>
+{% if user %}
+<header>
+  <nav>
+    <a href="/ui/" class="brand">Ganymede</a>
+    <a href="/ui/jobs">Jobs</a>
+    <a href="/ui/leaderboard">Leaderboard</a>
+    <a href="/ui/machines">Machines</a>
+    {% if user.is_admin %}
+    <a href="/ui/queue">Queue</a>
+    <a href="/ui/submitters">Submitters</a>
+    {% endif %}
+    <span class="spacer"></span>
+    <span class="who">{{ user.name }}{% if user.is_admin %} (admin){% endif %}</span>
+    {# Plain form POST: SameSite=Lax already stops a cross-site form from
+       carrying the session cookie; logout is the one /ui POST beside login. #}
+    <form method="post" action="/ui/logout" class="inline">
+      <button type="submit">Log out</button>
+    </form>
+  </nav>
+</header>
+{% endif %}
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

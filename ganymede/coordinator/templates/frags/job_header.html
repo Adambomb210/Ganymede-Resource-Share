@@ -1,0 +1,29 @@
+<section class="card" id="job-header-{{ job.id }}"
+         hx-trigger="sse:job.status, sse:sync" hx-swap="outerHTML"
+         hx-get="/ui/frag/job-header/{{ job.id }}">
+  <div class="kpis">
+    <div class="kpi"><b>{{ job.status }}</b> status</div>
+    <div class="kpi"><b>{{ job.job_type }}</b> type</div>
+    <div class="kpi"><b>{{ job.priority_rank }}</b> rank</div>
+    <div class="kpi"><b>{{ job.owner_id }}</b> owner</div>
+  </div>
+  {% if job.status == "draft" %}
+  {# A plain form POST to the frozen /v1 endpoint; hx-headers carries the CSRF
+     header. json-enc omitted: an empty body needs no encoder. #}
+  <button hx-post="/v1/jobs/{{ job.id }}/enqueue"
+          hx-headers='{"X-Ganymede-UI":"1"}'
+          hx-swap="none">Enqueue</button>
+  {% endif %}
+  {% if job.status in ("queued", "running") %}
+  <form hx-post="/v1/jobs/{{ job.id }}/cancel" hx-headers='{"X-Ganymede-UI":"1"}'
+        hx-swap="none" class="inline">
+    <input type="hidden" name="mode" value="soft">
+    <button type="submit">Cancel (soft)</button>
+  </form>
+  <form hx-post="/v1/jobs/{{ job.id }}/cancel" hx-headers='{"X-Ganymede-UI":"1"}'
+        hx-swap="none" class="inline">
+    <input type="hidden" name="mode" value="hard">
+    <button type="submit">Cancel (hard)</button>
+  </form>
+  {% endif %}
+</section>

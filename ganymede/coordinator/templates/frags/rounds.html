@@ -1,0 +1,16 @@
+<h2>Rounds</h2>
+<table>
+  <tr><th>idx</th><th>status</th><th>contributors</th><th>eval loss</th>
+      <th>divergence</th><th>opened</th><th>closed</th></tr>
+  {% for r in rounds %}
+  <tr>
+    <td>{{ r.idx }}</td><td>{{ r.status }}</td>
+    <td>{{ r.distinct_contributors }}</td>
+    <td>{{ "%g" | format(r.eval_loss) if r.eval_loss is not none else "—" }}</td>
+    <td>{{ "%g" | format(r.adapter_divergence) if r.adapter_divergence is not none else "—" }}</td>
+    <td>{{ r.opened_at }}</td><td>{{ r.closed_at or "—" }}</td>
+  </tr>
+</table>
+{% if coverage %}
+<p>Coverage: {{ coverage }}</p>
+{% endif %}

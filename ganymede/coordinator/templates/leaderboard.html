@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Leaderboard — Ganymede{% endblock %}
+{% block content %}
+<h1>Leaderboard</h1>
+<nav class="tabs">
+  <a href="/ui/leaderboard?scope=machines" class="{{ 'active' if scope == 'machines' }}">machines</a>
+  <a href="/ui/leaderboard?scope=users" class="{{ 'active' if scope == 'users' }}">users</a>
+</nav>
+{% if scope == "users" %}
+<table>
+  <tr><th>rank</th><th>user</th><th>weighted hours</th><th>machines</th></tr>
+  {% for r in rows %}
+  <tr><td>{{ loop.index }}</td><td>{{ r.user_name }}</td>
+      <td>{{ "%g" | format(r.weighted_hours) }}</td><td>{{ r.machines }}</td></tr>
+  {% else %}
+  <tr><td colspan="4">no ranked users yet</td></tr>
+  {% endfor %}
+</table>
+{% else %}
+<table>
+  <tr><th>rank</th><th>machine</th><th>weighted hours</th></tr>
+  {% for r in rows %}
+  <tr><td>{{ loop.index }}</td>
+      <td>{{ r.display_name if user and (r.user_id == user.id or user.is_admin) else "worker-" + loop.index|string }}</td>
+      <td>{{ "%g" | format(r.weighted_hours) }}</td></tr>
+  {% else %}
+  <tr><td colspan="3">no ranked machines yet</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}

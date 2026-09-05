@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Jobs — Ganymede{% endblock %}
+{% block content %}
+<h1>Jobs</h1>
+<section id="jobs-list"
+         hx-trigger="sse:job.status, sse:sync"
+         hx-get="/ui/frag/jobs-table" hx-swap="outerHTML">
+  {% include "frags/jobs_table.html" %}
+</section>
+{% endblock %}

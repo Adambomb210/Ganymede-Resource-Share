@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}{{ job.id[:8] }} — Ganymede{% endblock %}
+{% block content %}
+<h1>Job <code>{{ job.id }}</code></h1>
+{% include "frags/job_header.html" %}
+
+<section class="card">
+  <h2>Tasks</h2>
+  <table>
+    <tr><th>task</th><th>status</th><th>worker</th><th>group</th><th>attempts</th></tr>
+    {% for t in tasks %}
+    <tr><td>{{ t.id[:8] }}</td><td>{{ t.status }}</td><td>{{ t.worker_id or "—" }}</td>
+        <td>{{ t.attempt_group or "—" }}</td><td>{{ t.attempts }}</td></tr>
+    {% else %}
+    <tr><td colspan="5">no tasks</td></tr>
+    {% endfor %}
+  </table>
+</section>
+
+{% if rounds %}
+<section class="card" id="rounds"
+         hx-trigger="sse:round.close, sse:sync" hx-swap="outerHTML"
+         hx-get="/ui/frag/rounds/{{ job.id }}">
+  {% include "frags/rounds.html" %}
+</section>
+{% endif %}
+{% endblock %}

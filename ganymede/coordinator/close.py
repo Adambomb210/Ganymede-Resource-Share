@@ -22,6 +22,7 @@ from datetime import datetime
 from ganymede.coordinator import rounds
 from ganymede.coordinator.config import DEFAULT_DOMINANCE_CAP, DEFAULT_NORM_REJECT_K
 from ganymede.coordinator.db import immediate
+from ganymede.coordinator import events
 from ganymede.jobtypes import resolve
 
 log = logging.getLogger("ganymede.coordinator.close")
@@ -107,6 +108,26 @@ def close_round(
         )
         log.exception("closing round %s#%s failed; reopened for retry", run_id, round_idx)
         raise
+    _publish_close(conn, run_id)
+    return result
+
+
+def _publish_close(conn: sqlite3.Connection, run_id: str) -> None:
+    """After a successful close: ``round.close`` + ``job.status`` to the run's
+    owner + admin (docs/12 audience table). Envelopes carry the job id -- the
+    fragments key on job_id -- so resolve runs -> jobs here, once."""
+    try:
+        row = conn.execute(
+            "SELECT j.id AS job_id, j.owner_id FROM runs r "
+            "JOIN jobs j ON j.id = r.job_id WHERE r.id = ?",
+            (run_id,),
+        ).fetchone()
+    except Exception:
+        return
+    if row is None:
+        return
+    events.hub.publish("round.close", job_id=row["job_id"], owner_id=row["owner_id"])
+    events.hub.publish("job.status", job_id=row["job_id"], owner_id=row["owner_id"])
 
 
 def advance_job(
@@ -180,11 +201,21 @@ def _mirror_job_status(conn: sqlite3.Connection, run) -> None:
     if target is None:
         return
     with immediate(conn):
-        conn.execute(
+        changed = conn.execute(
             "UPDATE jobs SET status = ? "
             "WHERE id = ? AND status NOT IN ('done', 'failed', 'cancelled')",
             (target, run["job_id"]),
-        )
+        ).rowcount
+    if changed:
+        events.hub.publish("job.status", job_id=run["job_id"], owner_id=_owner_of(conn, run["job_id"]))
+
+
+def _owner_of(conn: sqlite3.Connection, job_id: str) -> str | None:
+    try:
+        row = conn.execute("SELECT owner_id FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        return row["owner_id"] if row is not None else None
+    except Exception:
+        return None
 
 
 # --------------------------------------------------------------------------

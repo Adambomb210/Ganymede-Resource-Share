@@ -1,0 +1,24 @@
+<table>
+  <tr><th>machine</th><th>standing</th><th>leased</th><th>system weight</th>
+      <th>weighted hrs</th><th>window</th><th>unverified</th><th></th></tr>
+  {% for m in machines %}
+  <tr id="machine-row-{{ m.machine_id }}">
+    <td>{{ m.display_name or m.machine_id[:8] }}</td>
+    <td>{{ m.standing }}</td>
+    <td>{{ "yes" if m.leased_now else "no" }}</td>
+    <td>{{ "%g" | format(m.system_weight) }}</td>
+    <td>{{ "%g" | format(m.weighted_hours_total) }}</td>
+    <td>{{ "%g" | format(m.accrued_current_window) }}</td>
+    <td>{{ m.unverified_tasks }}/{{ m.unverified_ceiling }}</td>
+    <td>
+      {% if m.standing != "revoked" %}
+      <button hx-post="/v1/machines/{{ m.machine_id }}/retire"
+              hx-headers='{"X-Ganymede-UI":"1"}'
+              hx-swap="none">retire</button>
+      {% endif %}
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="8">no machines enrolled</td></tr>
+  {% endfor %}
+</table>

@@ -1,0 +1,11 @@
+<tr id="job-row-{{ job.id }}"
+    hx-trigger="sse:job.status, sse:sync" hx-swap="outerHTML"
+    hx-get="/ui/frag/jobs-row/{{ job.id }}">
+  <td><a href="/ui/jobs/{{ job.id }}">{{ job.id[:8] }}</a></td>
+  <td>{{ job.owner_name }}</td>
+  <td>{{ job.job_type }}</td>
+  <td>{{ job.status }}</td>
+  <td>{{ job.priority_rank }}</td>
+  <td>{{ job.leased_tasks }}</td>
+  <td>{{ job.created_at }}</td>
+</tr>

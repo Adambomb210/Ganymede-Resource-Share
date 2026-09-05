@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Machines — Ganymede{% endblock %}
+{% block content %}
+<h1>Your machines</h1>
+{% include "frags/enroll.html" %}
+<section id="machines-list"
+         hx-trigger="sse:standing.change, sse:fleet.delta, sse:sync" hx-swap="outerHTML"
+         {# the list refetches whole; per-row fragments keep SSE simple #}
+         hx-get="/ui/frag/machines-list">
+  {% include "frags/machines_table.html" %}
+</section>
+
+<section class="card">
+  <h2>Recent credit events</h2>
+  <table>
+    <tr><th>at</th><th>machine</th><th>kind</th><th>weighted hours</th></tr>
+    {% for e in recent_events %}
+    <tr><td>{{ e.at }}</td><td>{{ e.machine_id[:8] }}</td><td>{{ e.kind }}</td>
+        <td>{{ e.weighted_hours }}</td></tr>
+    {% else %}
+    <tr><td colspan="4">no events yet</td></tr>
+    {% endfor %}
+  </table>
+</section>
+{% endblock %}

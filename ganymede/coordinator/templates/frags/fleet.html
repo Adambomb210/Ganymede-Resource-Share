@@ -1,0 +1,24 @@
+{# The dashboard fleet-health fragment. The outer <section> carries the SSE
+   triggers: any of the listed events refetches this whole fragment, the swap
+   re-reads truth, and applying it twice is harmless (docs/12). #}
+<section id="fleet-health"
+         hx-trigger="sse:fleet.delta, sse:sync, sse:job.status, sse:round.close, sse:standing.change"
+         hx-get="/ui/frag/dashboard-fleet" hx-swap="outerHTML">
+  <div class="kpis">
+    <div class="kpi"><b>{{ awake|length }}</b> awake workers</div>
+    <div class="kpi"><b>{{ queued_jobs }}</b> queued jobs</div>
+    <div class="kpi"><b>{{ leased_tasks }}</b> leased tasks</div>
+    <div class="kpi"><b>{{ stalls|length }}</b> stalls</div>
+    <div class="kpi"><b>{{ violations|length }}</b> invariant violations</div>
+  </div>
+  {% if stalls %}
+  <ul class="warn">
+    {% for s in stalls %}<li>{{ s.run_id }}#{{ s.idx }} — {{ s.reason }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+  {% if violations %}
+  <ul class="warn">
+    {% for v in violations %}<li>{{ v.check }}: {{ v.detail }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+</section>
