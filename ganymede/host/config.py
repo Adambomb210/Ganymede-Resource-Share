@@ -44,6 +44,10 @@ DEFAULT_CONTAINER_NAME = "ganymede-worker"
 # alike, and the failure is silent in both directions.
 CONTAINER_CACHE_DIR = "/cache/hf"
 CONTAINER_STATE_DIR = "/var/lib/ganymede"
+# Writable, unlike the state dir: the worker stages a job's inputs here, reads
+# its outputs back, and drops the lease crumb the agent's orphan reaper reads
+# (docs/11 §2.3, §3).
+CONTAINER_JOB_SCRATCH = "/var/lib/ganymede/jobs"
 
 # The uid the worker image runs as (docker/worker-core.Dockerfile). The cache
 # bind mount has to be writable by it, which the installer arranges.
@@ -158,6 +162,17 @@ class HostConfig:
     state_dir: str = ""
     cache_dir: str = ""
     cache_cap_gb: float = DEFAULT_CACHE_CAP_GB
+    # Where a contained job's scratch lives (docs/11 §2.3). Mounted rw into
+    # the worker -- unlike the state dir, which is mounted read-only so the
+    # worker cannot forge the contributor's kill switch -- and read by this
+    # agent for the lease crumb the wedged-worker backstop needs (§3). Empty
+    # disables the whole contained-job path on this machine, which is the
+    # right default: a host opts in to running submitter code.
+    job_scratch_dir: str = ""
+    # The coordinator's lease length, as this machine understands it. Only the
+    # orphan reaper reads it: a job container whose worker has not renewed in
+    # longer than this has no lease behind it any more (§3).
+    lease_seconds: int = 900
 
     # --- when it may run -------------------------------------------------
     # Seconds of no keyboard or mouse before the machine counts as idle. Zero
@@ -180,6 +195,10 @@ class HostConfig:
 
     def resolved_cache_dir(self) -> Path:
         return Path(self.cache_dir) if self.cache_dir else default_cache_dir()
+
+    def resolved_job_scratch_dir(self) -> Path | None:
+        """None when this host has not opted into running submitter code."""
+        return Path(self.job_scratch_dir) if self.job_scratch_dir else None
 
     @property
     def pause_path(self) -> Path:

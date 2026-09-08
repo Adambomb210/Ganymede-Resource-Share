@@ -40,6 +40,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from ganymede.worker import probe as probe_mod
@@ -89,6 +90,10 @@ class WorkerConfig:
     max_rounds: int | None = None
     verify_tls: bool = True
     skip_bench: bool = False
+    # Host-visible scratch for contained jobs (docs/11 §2.3). Unset means this
+    # machine did not opt into running submitter code, and the profile it
+    # registers says so -- see ``Worker.create``.
+    job_scratch: str | None = None
 
     @classmethod
     def from_env(cls, **overrides: Any) -> "WorkerConfig":
@@ -102,6 +107,7 @@ class WorkerConfig:
             state_dir=os.environ.get("GANYMEDE_STATE"),
             cache_dir=os.environ.get("GANYMEDE_CACHE_DIR"),
             backend=os.environ.get("GANYMEDE_BACKEND"),
+            job_scratch=os.environ.get("GANYMEDE_JOB_SCRATCH"),
         )
         for key, value in overrides.items():
             if value is not None:
@@ -118,14 +124,26 @@ class Heartbeater:
     3.2 contract -- a closed round's work is dropped, not argued with.
     """
 
-    def __init__(self, client: CoordinatorClient, task_id: str, interval_sec: int):
+    def __init__(self, client: CoordinatorClient, task_id: str, interval_sec: int,
+                 crumb_root: "Path | None" = None, container: str | None = None):
         self.client = client
         self.task_id = task_id
         self.interval = max(MIN_HEARTBEAT_INTERVAL_SEC, interval_sec)
+        # Where the host agent looks to tell a live lease from a wedged worker
+        # (docs/11 §3). Written from here rather than from the loop because
+        # this is the thread that knows a renewal actually succeeded.
+        self.crumb_root = crumb_root
+        self.container = container
         self.steps = 0
         self.loss: float | None = None
         self.round_closed = False
         self.lease_lost = False
+        # docs/11 §3 step 2: the cancel arrives on a heartbeat response and
+        # nowhere else. Latched rather than read once -- the beat that carries
+        # it is not the beat anyone is looking at, and it must not be lost
+        # between the thread seeing it and the loop asking.
+        self.cancel_mode: str | None = None
+        self.on_cancel = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -145,12 +163,49 @@ class Heartbeater:
             self._thread.join(timeout=5)
 
     def should_drop(self) -> bool:
-        return self.round_closed or self.lease_lost
+        return self.round_closed or self.lease_lost or self.cancel_mode is not None
+
+    def cancelled(self) -> str | None:
+        """The cancel mode seen so far, or None."""
+        return self.cancel_mode
+
+    def _crumb(self) -> None:
+        """Best-effort by construction: a crumb that cannot be written must not
+        cost a lease that was successfully renewed. The cost of missing one is
+        that the host agent may reap a job container early, which is the safe
+        direction (docs/11 §3)."""
+        if self.crumb_root is None:
+            return
+        try:
+            from datetime import datetime, timezone
+
+            from ganymede.worker.sandbox import write_lease_crumb
+
+            write_lease_crumb(
+                self.crumb_root, self.task_id,
+                datetime.now(timezone.utc).isoformat(), self.container,
+            )
+        except OSError as exc:
+            log.debug("could not write the lease crumb: %s", exc)
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval):
             try:
-                self.client.heartbeat(self.task_id, self.steps, self.loss)
+                body = self.client.heartbeat(self.task_id, self.steps, self.loss)
+                self._crumb()
+                mode = (body or {}).get("cancel")
+                if mode and self.cancel_mode is None:
+                    log.info("task %s: %s cancel received", self.task_id, mode)
+                    self.cancel_mode = mode
+                    # Acting on the container happens here, on the thread that
+                    # heard it, rather than at the next should_stop() check: a
+                    # hard cancel that waits for the training loop to come round
+                    # is not a hard cancel.
+                    if self.on_cancel is not None:
+                        try:
+                            self.on_cancel(mode)
+                        except Exception:  # noqa: BLE001
+                            log.exception("task %s: cancel handler failed", self.task_id)
             except RoundClosed:
                 log.info("round closed under task %s; dropping the work", self.task_id)
                 self.round_closed = True
@@ -205,6 +260,18 @@ class Worker:
 
         log.info("probing hardware")
         profile = probe_mod.run_probe(config.backend, skip_bench=config.skip_bench)
+        # docs/11 §4: what the coordinator's claim gate reads to decide whether
+        # this machine may be handed submitter code. Both halves are required
+        # -- a runtime that answers *and* somewhere to stage a job's files --
+        # because either one alone is a capability this worker cannot honour,
+        # and a profile that overclaims costs a real task a real lease.
+        if config.job_scratch:
+            from ganymede.worker.sandbox import detect_runtime
+
+            profile["container_runtime"] = detect_runtime()
+        else:
+            profile["container_runtime"] = None
+        log.info("container runtime: %s", profile["container_runtime"] or "none")
         log.info("backend=%s device=%s supports=%s bench=%s",
                  profile["backend"], profile["device_name"], profile["supports"],
                  profile["probe"].get("bench_score"))
@@ -279,7 +346,10 @@ class Worker:
         from ganymede.trainer.train import Task, run_task
 
         task_id = task["task_id"]
-        beat = Heartbeater(self.client, task_id, self.heartbeat_interval).start()
+        beat = Heartbeater(
+            self.client, task_id, self.heartbeat_interval,
+            crumb_root=Path(self.config.job_scratch) if self.config.job_scratch else None,
+        ).start()
         started = time.monotonic()
 
         try:
@@ -300,6 +370,22 @@ class Worker:
                     or self.control.should_pause()
 
             result = run_task(parsed, base_adapter, on_step=on_step, should_stop=should_stop)
+
+            if beat.cancelled():
+                # docs/11 §3 step 3. For a *built-in* job type there is no job
+                # container, so soft and hard collapse into the same action:
+                # stop the loop and give the shard back. The distinction only
+                # exists for submitter code, which gets a SIGTERM and a grace
+                # period to checkpoint (sandbox.JobContainer.cancel) -- nothing
+                # here is trapping anything.
+                #
+                # The abandon is what turns the lease into `cancelled` rather
+                # than `abandoned` on the coordinator's side, which is what
+                # keeps an operator's cancel off this machine's record.
+                log.info("task %s: %s cancel, abandoning after %d steps",
+                         task_id, beat.cancelled(), result.steps)
+                self._abandon(task_id)
+                return None
 
             if beat.should_drop():
                 log.info("task %s: work dropped after %d steps", task_id, result.steps)

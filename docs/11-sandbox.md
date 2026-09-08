@@ -293,3 +293,55 @@ set there is no such thing as a recognised base, and the alternative — passing
 everything until someone remembers to configure it — is the failure mode this
 check exists to prevent. The operator either lists the vetted `diff_id`s or
 dispositions by hand, and both are visible.
+
+---
+
+## §2 / §3 status — confinement and the kill path, built
+
+`ganymede/worker/sandbox.py`, the cancel field on the heartbeat, and the host
+agent's orphan reaper.
+
+| §2 / §3 | State |
+|---|---|
+| Resource caps (§2.2) | **built.** `--memory` and `--memory-swap` equal, `--cpus`, `--pids-limit`, `--ipc=private`, `--ulimit core=0`, and the §4.6 baseline inherited whole |
+| Filesystem (§2.3) | **built.** `--read-only`, one bind mount (the task's scratch), `/tmp` and `/run` as tmpfs, and *not* the worker's state dir |
+| Digest verification after pull (§2.3) | **built**, and ordered before `docker load` — an archive that failed its check is never parsed by anything. The image runs by **id**, never by the tag the archive carries |
+| Egress (§2.4) | **`--network none`, unconditionally.** The per-job allowlist and its CONNECT proxy are deferred — see below |
+| Soft / hard cancel (§3) | **built.** The mode rides the heartbeat response; `soft` is `stop --time <grace>`, `hard` is `kill` |
+| Wedged-worker backstop (§3) | **built.** The worker writes a lease crumb on every heartbeat and the host agent's tick reaps a job container whose crumb has gone stale |
+| Storage quota (§2.2) | **built, off by default.** `--storage-opt size=` is a hard error on overlay2, the common driver, so opting in is a config flag |
+
+### Three deviations, all recorded rather than hidden
+
+**The socket proxy is not shipped.** §2.1 says the worker must not get the
+host's Docker socket, and offers a scoped proxy or rootless Podman. What is
+built is the *seam*: the worker invokes a runtime **binary** and never a socket
+path, so `GANYMEDE_JOB_RUNTIME` plus a `DOCKER_HOST` pointing at a proxy — or at
+a rootless Podman — is a deployment change, not a code change. Until an operator
+does one of those, a worker configured with a plain `docker` against the host
+socket **has more than §2.1 wants it to have**. That is the honest state of it.
+
+**The egress proxy is deferred.** §2.4's default-deny is what shipped;
+`spec.egress_allow`, the internal bridge and the CONNECT proxy are not. Nothing
+in tree declares an allowlist — by §4 every first-party type carries
+`image_id IS NULL` and takes none of this path — so the proxy would be built
+against no consumer, and it is the piece most likely to churn when the first one
+appears. Default-deny is a complete state by §2.4's own reasoning: the common
+job reads `/scratch/in`, computes, writes `/scratch/out`, and the worker does
+every transfer.
+
+**Soft and hard collapse for first-party built-ins.** There is no job container
+to signal, so both modes mean "stop the loop, abandon the shard" — which is what
+the existing `control.should_stop()` path already did. The distinction is real
+only for submitter code, which gets a SIGTERM and a grace period to checkpoint.
+Worth stating because someone will otherwise expect `hard` to SIGKILL a training
+worker mid-step.
+
+### What has no consumer yet
+
+No in-tree job type takes the §2 path: `collab_lora_finetune` and the
+first-party `batch_inference` both carry `image_id IS NULL`. So the confinement
+machinery is built and unit-tested against an injectable runner, and the first
+end-to-end contained job arrives with Phase E's second job class. The pieces
+that *are* live today are the ones on the built-in path — the cancel transport,
+the `cancelled` task status, and the claim gate.

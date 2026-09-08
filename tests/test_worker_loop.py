@@ -26,6 +26,7 @@ class StubClient:
         self.submit_response = submit_response or {"accepted": True}
         self.calls: list[tuple] = []
         self.heartbeat_raises: Exception | None = None
+        self.heartbeat_body: dict = {}
         self.upload_raises: Exception | None = None
 
     def register(self, profile, image_tag=None):
@@ -42,7 +43,7 @@ class StubClient:
         self.calls.append(("heartbeat", task_id, steps))
         if self.heartbeat_raises:
             raise self.heartbeat_raises
-        return {}
+        return dict(self.heartbeat_body)
 
     def download(self, url):
         self.calls.append(("download", url))
@@ -192,6 +193,112 @@ def test_a_transient_heartbeat_failure_does_not_drop_the_work(fast_heartbeat):
     client = StubClient()
     client.heartbeat_raises = CoordinatorError(500, "boom", "http://c")
     beat = Heartbeater(client, "t1", interval_sec=0).start()
+
+    import time
+
+    time.sleep(0.2)
+    beat.stop()
+    assert not beat.should_drop()
+
+
+def test_a_cancel_on_the_heartbeat_is_latched(fast_heartbeat):
+    """docs/11 §3 step 2: the cancel arrives on a heartbeat response and
+    nowhere else. Latched rather than read once -- the beat that carries it is
+    not the beat anyone is looking at."""
+    client = StubClient()
+    client.heartbeat_body = {"cancel": "soft"}
+    beat = Heartbeater(client, "t1", interval_sec=0).start()
+
+    import time
+
+    time.sleep(0.2)
+    beat.stop()
+    assert beat.cancelled() == "soft"
+    assert beat.should_drop()
+
+
+def test_the_cancel_handler_runs_on_the_thread_that_heard_it(fast_heartbeat):
+    """A hard cancel that waits for the training loop to come round is not a
+    hard cancel, so the container is signalled from the heartbeat thread."""
+    client = StubClient()
+    client.heartbeat_body = {"cancel": "hard"}
+    seen: list[str] = []
+    beat = Heartbeater(client, "t1", interval_sec=0)
+    beat.on_cancel = seen.append
+    beat.start()
+
+    import time
+
+    time.sleep(0.2)
+    beat.stop()
+    assert seen[:1] == ["hard"]
+
+
+def test_the_handler_fires_once_however_many_beats_carry_it(fast_heartbeat):
+    client = StubClient()
+    client.heartbeat_body = {"cancel": "soft"}
+    seen: list[str] = []
+    beat = Heartbeater(client, "t1", interval_sec=0)
+    beat.on_cancel = seen.append
+    beat.start()
+
+    import time
+
+    time.sleep(0.3)
+    beat.stop()
+    assert len(seen) == 1
+
+
+def test_a_handler_that_raises_does_not_kill_the_heartbeat_thread(fast_heartbeat):
+    """The cancel is still latched, and the loop still abandons. A failure to
+    stop a container must not also cost the shard's clean release."""
+    client = StubClient()
+    client.heartbeat_body = {"cancel": "hard"}
+
+    def explode(mode):
+        raise RuntimeError("docker is wedged")
+
+    beat = Heartbeater(client, "t1", interval_sec=0)
+    beat.on_cancel = explode
+    beat.start()
+
+    import time
+
+    time.sleep(0.2)
+    beat.stop()
+    assert beat.cancelled() == "hard"
+
+
+def test_the_lease_crumb_is_written_on_each_beat(fast_heartbeat, tmp_path):
+    """What the host agent reads to tell a live lease from a wedged worker
+    (docs/11 §3)."""
+    from ganymede.worker import sandbox
+
+    client = StubClient()
+    beat = Heartbeater(client, "t1", interval_sec=0, crumb_root=tmp_path,
+                       container="ganymede-job-t1").start()
+
+    import time
+
+    time.sleep(0.2)
+    beat.stop()
+    crumb = sandbox.read_lease_crumb(tmp_path)
+    assert crumb["task_id"] == "t1"
+    assert crumb["container"] == "ganymede-job-t1"
+
+
+def test_an_unwritable_crumb_does_not_cost_a_renewed_lease(fast_heartbeat, tmp_path,
+                                                            monkeypatch):
+    """Best-effort by construction: the beat succeeded, and a bookkeeping file
+    that could not be written must not turn that into a dropped task."""
+    from ganymede.worker import sandbox
+
+    def explode(*args, **kwargs):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(sandbox, "write_lease_crumb", explode)
+    client = StubClient()
+    beat = Heartbeater(client, "t1", interval_sec=0, crumb_root=tmp_path).start()
 
     import time
 

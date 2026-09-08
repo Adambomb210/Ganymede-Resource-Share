@@ -29,7 +29,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from ganymede.host.config import CONTAINER_CACHE_DIR, CONTAINER_STATE_DIR, HostConfig
+from ganymede.host.config import (
+    CONTAINER_CACHE_DIR,
+    CONTAINER_JOB_SCRATCH,
+    CONTAINER_STATE_DIR,
+    HostConfig,
+)
 
 log = logging.getLogger("ganymede.host.runtime")
 
@@ -244,6 +249,15 @@ class DockerRuntime:
             "--cpus", cfg.cpus,
             "--pids-limit", str(cfg.pids_limit),
         ]
+        # docs/11 §2.3: a host that opted into running submitter code gets one
+        # writable directory, and only this one. It is separate from the state
+        # mount above rather than a relaxation of it -- the state dir stays
+        # read-only, because the argument for that (a worker that can write
+        # there can forge the kill switch) does not weaken just because the
+        # worker now needs somewhere else to write.
+        scratch = cfg.resolved_job_scratch_dir()
+        if scratch is not None:
+            argv += ["-v", f"{scratch}:{CONTAINER_JOB_SCRATCH}"]
         user = _user_flag()
         if user:
             argv += ["--user", user]

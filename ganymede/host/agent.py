@@ -37,6 +37,7 @@ import argparse
 import logging
 import sys
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any
 
@@ -45,6 +46,7 @@ from ganymede.host import idle as idle_mod
 from ganymede.host import manifest as manifest_mod
 from ganymede.host import runtime as runtime_mod
 from ganymede.host.config import (
+    CONTAINER_JOB_SCRATCH,
     MIN_FREE_DISK_GB,
     MIN_FREE_DISK_GB_NATIVE,
     HostConfig,
@@ -97,6 +99,15 @@ def tick(
     status = _status(runtime)
     if status is None:
         return TickResult("error", "could not ask the container runtime for status")
+
+    # Before any decision about the worker: a job container with no live worker
+    # behind it holds the GPU that every branch below reasons about (docs/11
+    # §3). Best-effort -- a reaper that raises would take the whole tick with
+    # it, and the thing it is cleaning up is already an anomaly.
+    try:
+        reap_orphaned_jobs(config)
+    except Exception:  # noqa: BLE001
+        log.exception("reaping orphaned job containers failed")
 
     # Steps 1 and 2 are inverted relative to the spec block, deliberately.
     # ------------------------------------------------------------------
@@ -166,6 +177,66 @@ def tick(
     return TickResult("started", decision.reason, image=image)
 
 
+def reap_orphaned_jobs(config: HostConfig, *, runner=None, now=None) -> list[str]:
+    """Kill job containers whose supervising worker has stopped renewing.
+
+    docs/11 §3, the wedged-worker path. The worker signals its own job
+    container on a cancel and is the fast path; this is the backstop for the
+    case where the worker itself is gone or hung, and it exists because the
+    alternative is a container holding a GPU with nothing watching it and no
+    lease behind it any more.
+
+    The signal is the lease crumb the worker rewrites on every heartbeat
+    (``sandbox.write_lease_crumb``). Older than one lease means the coordinator
+    has already reclaimed the shard, so whatever the container is still
+    computing is work nobody will accept. The soft/hard distinction collapses
+    to hard here by construction -- there is nobody left to drain gracefully,
+    and the latency bound is one host-timer interval rather than one heartbeat.
+
+    Returns the container names it killed, for the log line and the tests.
+    """
+    from ganymede.worker import sandbox as sandbox_mod
+
+    scratch = config.resolved_job_scratch_dir()
+    if scratch is None:
+        return []
+    crumb = sandbox_mod.read_lease_crumb(scratch)
+    container = (crumb or {}).get("container")
+    if not container:
+        return []
+
+    now = now or datetime.now(timezone.utc)
+    try:
+        renewed = datetime.fromisoformat(str(crumb.get("renewed_at")))
+    except (TypeError, ValueError):
+        # An unparseable crumb is not evidence of a live lease. Treating it as
+        # stale is the fail-safe direction: the cost is killing a container
+        # that might have been fine, and the alternative is never killing one.
+        renewed = None
+    if renewed is not None:
+        if renewed.tzinfo is None:
+            renewed = renewed.replace(tzinfo=timezone.utc)
+        if (now - renewed).total_seconds() <= config.lease_seconds:
+            return []
+
+    run = runner or runtime_mod._run
+    inspect = run([config.docker_bin, "inspect", "-f", "{{.State.Running}}",
+                   container], timeout=runtime_mod.DOCKER_TIMEOUT_SEC, check=False)
+    if inspect.returncode != 0 or (inspect.stdout or "").strip() != "true":
+        # Nothing running under that name: the crumb outlived its container,
+        # which is the normal end of a task that finished while the agent slept.
+        sandbox_mod.clear_lease_crumb(scratch)
+        return []
+
+    log.warning("job container %s outlived its worker's lease; killing", container)
+    run([config.docker_bin, "kill", container],
+        timeout=runtime_mod.DOCKER_TIMEOUT_SEC, check=False)
+    run([config.docker_bin, "rm", "-f", container],
+        timeout=runtime_mod.DOCKER_TIMEOUT_SEC, check=False)
+    sandbox_mod.clear_lease_crumb(scratch)
+    return [container]
+
+
 def worker_env(config: HostConfig) -> dict[str, str]:
     """What the worker reads out of its environment (4.2 step 1)."""
     env = {
@@ -177,6 +248,15 @@ def worker_env(config: HostConfig) -> dict[str, str]:
         # native worker has to be told where the host actually put things.
         env["GANYMEDE_CACHE_DIR"] = str(config.resolved_cache_dir())
         env["GANYMEDE_STATE"] = str(config.resolved_state_dir())
+    scratch = config.resolved_job_scratch_dir()
+    if scratch is not None:
+        # Set only when the host opted in (docs/11 §2.3). Its absence is what
+        # makes the worker report no container runtime, which is what makes the
+        # coordinator refuse it submitter jobs -- one switch, three places it
+        # is felt, and no way to be half enrolled.
+        env["GANYMEDE_JOB_SCRATCH"] = (
+            str(scratch) if config.runtime == "native" else CONTAINER_JOB_SCRATCH
+        )
     if not config.verify_tls:
         env["GANYMEDE_INSECURE"] = "1"
     return env
