@@ -142,8 +142,20 @@ def test_the_runtime_ceiling_clamps_a_generous_spec(config):
     tight = sandbox.SandboxConfig(scratch_root=config.scratch_root,
                                   job_max_runtime_sec=600)
     job = sandbox.JobContainer("t", tight, runner=FakeRunner())
-    job.run_argv("img", max_runtime_sec=99_999)
-    assert job._last_runtime_sec == 600
+    assert job.runtime_ceiling(99_999) == 600
+    assert job.runtime_ceiling(60) == 60
+    assert job.runtime_ceiling(None) == 600
+
+
+def test_the_ceiling_does_not_leak_between_starts(config):
+    """It is a function of its argument, not of whichever call ran last: a
+    caller that builds argv once and starts twice must not inherit the previous
+    task's clamp."""
+    runner = FakeRunner()
+    job = sandbox.JobContainer("t", config, runner=runner)
+    job.start("img", max_runtime_sec=60)
+    job.start("img", max_runtime_sec=99_999)
+    assert job.runtime_ceiling(60) == 60
 
 
 def test_the_storage_quota_is_off_by_default(job, config):
@@ -398,6 +410,19 @@ def test_an_unparseable_crumb_is_treated_as_stale(tmp_path):
     runner = FakeRunner({"inspect": sandbox.Completed(0, stdout="true")})
     assert agent.reap_orphaned_jobs(_host_config(tmp_path), runner=runner) == \
         ["ganymede-job-t1"]
+
+
+def test_the_reaper_survives_its_real_runner(tmp_path):
+    """The tests above inject a runner; production resolves
+    ``runtime._run``. The tick swallows exceptions from the reaper and logs
+    them, so a signature drift here would silently stop the backstop with the
+    whole suite still green -- this is the path that would drift."""
+    from ganymede.host import agent
+
+    sandbox.write_lease_crumb(tmp_path, "t1", _fresh(5000), "ganymede-job-t1")
+    config = _host_config(tmp_path)
+    config.docker_bin = "definitely-not-a-real-binary-xyz"
+    assert agent.reap_orphaned_jobs(config) == []
 
 
 def test_a_host_that_never_opted_in_reaps_nothing(tmp_path):

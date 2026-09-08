@@ -219,9 +219,14 @@ def reap_orphaned_jobs(config: HostConfig, *, runner=None, now=None) -> list[str
         if (now - renewed).total_seconds() <= config.lease_seconds:
             return []
 
-    run = runner or runtime_mod._run
+    # sandbox's runner, not runtime's: this one answers a missing binary or a
+    # wedged daemon with a return code, where runtime._run raises. The reaper
+    # runs inside the tick's blanket except, so anything that raises here goes
+    # to a log line and the backstop quietly stops working -- exactly the
+    # failure it exists to prevent, one level up.
+    run = runner or sandbox_mod._run
     inspect = run([config.docker_bin, "inspect", "-f", "{{.State.Running}}",
-                   container], timeout=runtime_mod.DOCKER_TIMEOUT_SEC, check=False)
+                   container], timeout=runtime_mod.DOCKER_TIMEOUT_SEC)
     if inspect.returncode != 0 or (inspect.stdout or "").strip() != "true":
         # Nothing running under that name: the crumb outlived its container,
         # which is the normal end of a task that finished while the agent slept.
@@ -230,9 +235,9 @@ def reap_orphaned_jobs(config: HostConfig, *, runner=None, now=None) -> list[str
 
     log.warning("job container %s outlived its worker's lease; killing", container)
     run([config.docker_bin, "kill", container],
-        timeout=runtime_mod.DOCKER_TIMEOUT_SEC, check=False)
+        timeout=runtime_mod.DOCKER_TIMEOUT_SEC)
     run([config.docker_bin, "rm", "-f", container],
-        timeout=runtime_mod.DOCKER_TIMEOUT_SEC, check=False)
+        timeout=runtime_mod.DOCKER_TIMEOUT_SEC)
     sandbox_mod.clear_lease_crumb(scratch)
     return [container]
 

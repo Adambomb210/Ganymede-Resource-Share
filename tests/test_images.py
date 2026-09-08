@@ -662,3 +662,207 @@ def test_a_built_in_job_is_untouched_by_the_gate(client, store, make_contributor
     seeded_run(run_id="builtin")
     _, key = make_contributor()
     assert FakeWorker(client, store, key).claim() is not None
+
+
+# ==========================================================================
+# Retention (docs/11 §1.2)
+# ==========================================================================
+
+
+def _image_row(conn, store, image_id: str, *, finalized_at, uploaded_at=None,
+               submitter_id: str = "sys"):
+    """An images row placed directly, so a test can date it."""
+    key = image_key(image_id)
+    store.put_bytes(key, b"archive bytes")
+    conn.execute(
+        """INSERT INTO images
+             (id, submitter_id, digest, size_bytes, object_ref, uploaded_at,
+              scan_status, finalized_at, scanned_at, scan_detail_json)
+           VALUES (?, ?, ?, 13, ?, ?, 'clean', ?, NULL, NULL)""",
+        (image_id, submitter_id, "a" * 64, key,
+         uploaded_at or finalized_at or rounds._iso(rounds.utcnow()), finalized_at),
+    )
+    conn.commit()
+    return key
+
+
+def _job_row(conn, job_id: str, image_id: str, status: str, terminal_at=None,
+             owner_id: str = "sys"):
+    conn.execute(
+        """INSERT INTO jobs
+             (id, owner_id, job_type, spec_json, image_id, status,
+              priority_rank, constraints_json, cancel_mode, created_at,
+              terminal_at)
+           VALUES (?, ?, 'batch_inference', '{}', ?, ?, 0, '{}', NULL, ?, ?)""",
+        (job_id, owner_id, image_id, status, rounds._iso(rounds.utcnow()),
+         terminal_at),
+    )
+    conn.commit()
+
+
+@pytest.fixture
+def sys_owner(conn, make_contributor):
+    cid, _ = make_contributor(name="sysowner")
+    return cid
+
+
+def _days_ago(n: int) -> str:
+    from datetime import timedelta
+
+    return rounds._iso(rounds.utcnow() - timedelta(days=n))
+
+
+def test_an_upload_that_never_finalized_is_reaped(conn, store, sys_owner):
+    """Nothing can reference one -- a job cannot pin an image it cannot see --
+    so this is pure cleanup."""
+    from datetime import timedelta
+
+    key = _image_row(conn, store, "abandoned", finalized_at=None,
+                     uploaded_at=rounds._iso(rounds.utcnow() - timedelta(hours=48)),
+                     submitter_id=sys_owner)
+    assert images.gc(conn, store) == ["abandoned"]
+    assert key not in store.objects
+    assert conn.execute("SELECT COUNT(*) c FROM images").fetchone()["c"] == 0
+
+
+def test_an_upload_still_in_flight_is_left_alone(conn, store, sys_owner):
+    """A 10 GiB PUT takes a while, and finalize comes after it."""
+    _image_row(conn, store, "inflight", finalized_at=None, submitter_id=sys_owner)
+    assert images.gc(conn, store) == []
+
+
+def test_an_image_a_live_job_needs_is_never_collected(conn, store, sys_owner):
+    """Age is not the question while something still references it -- a queued
+    job that has waited two months still has to be runnable."""
+    _image_row(conn, store, "img1", finalized_at=_days_ago(200),
+               submitter_id=sys_owner)
+    _job_row(conn, "job1", "img1", "queued", owner_id=sys_owner)
+    assert images.gc(conn, store, keep_days=30) == []
+
+
+def test_an_image_outlives_its_last_job_by_the_keep_window(conn, store, sys_owner):
+    _image_row(conn, store, "img1", finalized_at=_days_ago(200),
+               submitter_id=sys_owner)
+    _job_row(conn, "job1", "img1", "done", terminal_at=_days_ago(10),
+             owner_id=sys_owner)
+    assert images.gc(conn, store, keep_days=30) == []
+
+    _job_row(conn, "job2", "img1", "done", terminal_at=_days_ago(40),
+             owner_id=sys_owner)
+    # Still held: the *last* job to end is what starts the clock, and job1
+    # ended ten days ago.
+    assert images.gc(conn, store, keep_days=30) == []
+
+
+def test_an_image_whose_jobs_all_ended_long_ago_is_collected(conn, store, sys_owner):
+    _image_row(conn, store, "img1", finalized_at=_days_ago(200),
+               submitter_id=sys_owner)
+    _job_row(conn, "job1", "img1", "done", terminal_at=_days_ago(90),
+             owner_id=sys_owner)
+    _job_row(conn, "job2", "img1", "cancelled", terminal_at=_days_ago(60),
+             owner_id=sys_owner)
+    assert images.gc(conn, store, keep_days=30) == ["img1"]
+
+
+def test_a_job_with_no_end_stamp_falls_back_to_the_finalize_date(conn, store,
+                                                                 sys_owner):
+    """A row that ended before migration 007 has no terminal_at. It must not
+    pin an image forever just because the column did not exist when it ran."""
+    _image_row(conn, store, "old", finalized_at=_days_ago(400), submitter_id=sys_owner)
+    _job_row(conn, "job1", "old", "done", terminal_at=None, owner_id=sys_owner)
+    assert images.gc(conn, store, keep_days=30) == ["old"]
+
+
+def test_an_unreferenced_image_still_gets_its_keep_window(conn, store, sys_owner):
+    """Uploaded, never used. The window runs from finalize, so a submitter who
+    uploads on Friday and submits the job on Monday still has an image."""
+    _image_row(conn, store, "fresh", finalized_at=_days_ago(2), submitter_id=sys_owner)
+    assert images.gc(conn, store, keep_days=30) == []
+
+    _image_row(conn, store, "stale", finalized_at=_days_ago(90),
+               submitter_id=sys_owner)
+    assert images.gc(conn, store, keep_days=30) == ["stale"]
+
+
+def test_a_store_that_refuses_the_delete_keeps_the_row(conn, store, sys_owner,
+                                                       monkeypatch):
+    """The object goes first and the row second, so a failed delete leaves both.
+    The other order strands an object nothing points at, and a worker meets an
+    image whose pull 404s rather than one that was collected."""
+    _image_row(conn, store, "img1", finalized_at=_days_ago(90), submitter_id=sys_owner)
+
+    def explode(key):
+        raise OSError("store is down")
+
+    monkeypatch.setattr(store, "delete", explode)
+    assert images.gc(conn, store, keep_days=30) == []
+    row = conn.execute("SELECT object_ref, collected_at FROM images").fetchone()
+    assert row["object_ref"] is not None and row["collected_at"] is None
+
+
+def test_collection_takes_the_archive_and_keeps_the_record(conn, store, sys_owner):
+    """The bytes are what cost gigabytes; the row is what says which image a
+    finished job actually ran. Only the first is worth reclaiming."""
+    key = _image_row(conn, store, "img1", finalized_at=_days_ago(90),
+                     submitter_id=sys_owner)
+    _job_row(conn, "job1", "img1", "done", terminal_at=_days_ago(60),
+             owner_id=sys_owner)
+    assert images.gc(conn, store, keep_days=30) == ["img1"]
+
+    assert key not in store.objects
+    row = conn.execute(
+        "SELECT digest, scan_status, object_ref, collected_at FROM images "
+        "WHERE id = 'img1'").fetchone()
+    assert row is not None
+    assert row["object_ref"] is None and row["collected_at"] is not None
+    assert row["digest"] and row["scan_status"] == "clean"
+
+
+def test_a_collected_image_cannot_be_leased(client, conn, store, sys_owner,
+                                            make_contributor, seeded_run):
+    """Unreachable through the GC itself -- collection only happens once every
+    referencing job is terminal, and a terminal job is never walked -- which is
+    why the collected state is written here by hand. The gate should not be
+    resting on that argument, and this is what checks that it isn't.
+    """
+    _image_row(conn, store, "img1", finalized_at=_days_ago(90), submitter_id=sys_owner)
+    seeded_run(run_id="pinned-job")
+    conn.execute(
+        "UPDATE jobs SET image_id = 'img1' WHERE id = "
+        "(SELECT job_id FROM runs WHERE id = 'pinned-job')")
+    conn.execute(
+        "UPDATE images SET object_ref = NULL, collected_at = ? WHERE id = 'img1'",
+        (rounds._iso(rounds.utcnow()),))
+    conn.commit()
+
+    _, key = make_contributor()
+    assert FakeWorker(client, store, key, container_runtime="docker").claim() is None
+
+
+def test_a_new_job_cannot_pin_a_collected_image(client, conn, store,
+                                                make_submitter):
+    """Said plainly at submit time. The alternative is a job that queues,
+    never leases, and gives the submitter nothing to go on."""
+    sub_id, key = make_submitter()
+    _image_row(conn, store, "old", finalized_at=_days_ago(90), submitter_id=sub_id)
+    images.gc(conn, store, keep_days=30)
+
+    r = client.post("/v1/jobs", headers=_hdr(key), json={
+        "job_type": "batch_inference", "spec": _batch_spec(), "image_id": "old"})
+    assert r.status_code == 422
+    assert "collected" in r.json()["detail"]
+
+
+def test_a_cancelled_job_stamps_when_it_ended(client, conn, store, make_submitter):
+    """The retention clock reads terminal_at, so the cancel path has to set it
+    in the same statement that makes the job terminal."""
+    _, key = make_submitter()
+    r = client.post("/v1/jobs", headers=_hdr(key), json={
+        "job_type": "batch_inference", "spec": _batch_spec()})
+    job_id = r.json()["job_id"]
+    client.post(f"/v1/jobs/{job_id}/cancel", headers=_hdr(key),
+                json={"mode": "soft"})
+    row = conn.execute("SELECT status, terminal_at FROM jobs WHERE id = ?",
+                       (job_id,)).fetchone()
+    assert row["status"] == "cancelled"
+    assert row["terminal_at"] is not None

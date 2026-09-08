@@ -1250,6 +1250,7 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             "finalized_at": row["finalized_at"],
             "scan_status": row["scan_status"],
             "scanned_at": row["scanned_at"],
+            "collected_at": row["collected_at"],
             "scan_detail": json.loads(detail) if detail else None,
         }
 
@@ -1459,11 +1460,20 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         # jobs may pin one image, but only the uploader's own).
         if body.image_id is not None:
             img = conn.execute(
-                "SELECT submitter_id FROM images WHERE id = ?", (body.image_id,)
+                "SELECT submitter_id, object_ref FROM images WHERE id = ?",
+                (body.image_id,),
             ).fetchone()
             if img is None or (img["submitter_id"] != user.id and not user.is_admin):
                 raise HTTPException(
                     status_code=422, detail=f"unknown image: {body.image_id}")
+            if img["object_ref"] is None:
+                # Retention took the archive (docs/11 §1.2). Said plainly here,
+                # because the alternative is a job that queues, never leases,
+                # and gives the submitter nothing to go on.
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"image {body.image_id} has been collected; "
+                           "upload it again")
 
         job_id = uuid.uuid4().hex
         now = rounds._iso(rounds.utcnow())
@@ -1549,8 +1559,9 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         row = _job_for_caller(conn, job_id, user)
         with immediate(conn):
             conn.execute(
-                "UPDATE jobs SET status = 'cancelled', cancel_mode = ? WHERE id = ?",
-                (body.mode, job_id),
+                "UPDATE jobs SET status = 'cancelled', cancel_mode = ?, "
+                "terminal_at = ? WHERE id = ?",
+                (body.mode, rounds._iso(rounds.utcnow()), job_id),
             )
         events.hub.publish("job.status", job_id=job_id, owner_id=row["owner_id"])
         events.hub.publish("queue.change", job_id=job_id)
@@ -1690,7 +1701,11 @@ def _image_schedulable(row: sqlite3.Row) -> bool:
     if row["image_id"] is None:
         return True
     return (row["image_scan_status"] == "clean"
-            and row["image_finalized_at"] is not None)
+            and row["image_finalized_at"] is not None
+            # Retention collected the archive (docs/11 §1.2). The row survives
+            # so a terminal job still records what it ran; there is nothing
+            # left to pull, so nothing left to lease.
+            and row["image_object_ref"] is not None)
 
 
 def _selectable_jobs(conn: sqlite3.Connection, pinned_job_id: str | None,
@@ -1716,7 +1731,8 @@ def _selectable_jobs(conn: sqlite3.Connection, pinned_job_id: str | None,
                   j.constraints_json, j.image_id, j.spec_json,
                   r.id AS run_id, r.base_model,
                   i.scan_status AS image_scan_status,
-                  i.finalized_at AS image_finalized_at
+                  i.finalized_at AS image_finalized_at,
+                  i.object_ref AS image_object_ref
            FROM jobs j
            LEFT JOIN runs r ON r.job_id = j.id
            LEFT JOIN images i ON i.id = j.image_id
@@ -1974,7 +1990,12 @@ def _image_handles(conn: sqlite3.Connection, job_id: str | None,
             WHERE j.id = ?""",
         (job_id,),
     ).fetchone()
-    if row is None:
+    if row is None or row["object_ref"] is None:
+        # No row, or an image whose archive retention collected. Both are
+        # unreachable from the claim path (``_image_schedulable`` refuses
+        # either), so this is the belt to that braces -- and it must return the
+        # built-in shape rather than a half-filled one, because a payload with
+        # an image_ref and no pull URL is a worker crash waiting to happen.
         return blank
     url, _expires = store.presign_get(row["object_ref"])
     return {"image_ref": row["id"], "image_digest": row["digest"],

@@ -265,7 +265,7 @@ used exactly as frozen. The following are additive:
 | The four checks — manifest sanity, base provenance, secrets, entrypoint | **built**, with the decompression-bomb guard enforced while streaming |
 | A non-`clean` image cannot be scheduled (§1.4) | **built**, and asserted through the claim endpoint rather than the selector |
 | Admin disposition / re-scan | **built** (`POST /v1/admin/images/{id}/scan`), audited, and recorded *beside* the scan's own findings rather than over them |
-| Retention GC (§1.2) | **deferred.** Nothing references an image but a job, and no job outlives its rows yet. It lands with the §2 worker-side work, where the same sweep has more to do |
+| Retention GC (§1.2) | **built** (migration 007). What is collected is the *archive*, not the row: a terminal job still records which image it ran, and that is worth more than the row it occupies. A collected image keeps its id, digest and verdict, loses `object_ref`, and gains `collected_at`; an upload that never finalized goes entirely, since nothing can reference one. Rides the scan sweep |
 
 ### Two deviations, both narrower than the design
 

@@ -232,6 +232,17 @@ class JobContainer:
 
     # -- run (§2.2, §2.3, §2.4) -------------------------------------------
 
+    def runtime_ceiling(self, max_runtime_sec: int | None) -> int:
+        """The job's ask, clamped by the operator's ceiling (§2.2).
+
+        Its own method rather than a value stashed on the instance by whichever
+        of ``run_argv`` / ``start`` ran last: a caller that builds argv once and
+        starts twice would otherwise inherit the previous task's clamp, and
+        nothing would say so.
+        """
+        return min(max_runtime_sec or self.config.job_max_runtime_sec,
+                   self.config.job_max_runtime_sec)
+
     def run_argv(self, image_id: str, *, env: dict[str, str] | None = None,
                  max_runtime_sec: int | None = None) -> list[str]:
         """The flag template. §4.6's baseline plus §2.2's additions.
@@ -255,8 +266,6 @@ class JobContainer:
           flag is advice; this is the enforcement.
         """
         cfg = self.config
-        runtime_sec = min(max_runtime_sec or cfg.job_max_runtime_sec,
-                          cfg.job_max_runtime_sec)
         argv = [
             cfg.runtime_bin, "run",
             "--detach",
@@ -294,7 +303,6 @@ class JobContainer:
             "-e", "GANYMEDE_MAX_RUNTIME_SEC",
             image_id,
         ]
-        self._last_runtime_sec = runtime_sec
         return argv
 
     def start(self, image_id: str, *, env: dict[str, str] | None = None,
@@ -303,7 +311,9 @@ class JobContainer:
         child_env = dict(os.environ)
         child_env.update(env or {})
         child_env["GANYMEDE_SCRATCH"] = CONTAINER_SCRATCH
-        child_env["GANYMEDE_MAX_RUNTIME_SEC"] = str(self._last_runtime_sec)
+        child_env["GANYMEDE_MAX_RUNTIME_SEC"] = str(
+            self.runtime_ceiling(max_runtime_sec)
+        )
         result = self._run(argv, timeout=RUNTIME_TIMEOUT_SEC, env=child_env)
         if result.returncode != 0:
             raise SandboxError(f"could not start job container: {result.stderr.strip()}")

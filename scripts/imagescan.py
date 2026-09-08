@@ -31,10 +31,15 @@ def run(db_path: str, settings: Settings, store, max_images: int) -> dict:
             conn, store, images.ScanLimits.from_settings(settings),
             max_images=max_images,
         )
+        # Retention (docs/11 §1.2) rides the same sweep: it is the same cadence
+        # and the same two objects, and a separate cron for one DELETE is a
+        # thing to forget to install.
+        collected = images.gc(conn, store, keep_days=settings.image_keep_days)
     finally:
         conn.close()
     return {
         "scanned": scanned,
+        "collected": collected,
         "clean": sum(1 for _, status in scanned if status == "clean"),
         "flagged": sum(1 for _, status in scanned if status == "flagged"),
     }
@@ -59,7 +64,8 @@ def main(argv: list[str] | None = None) -> int:
 
     report = run(db_path, settings, Store(settings.storage), args.max_images)
     print(f"scanned {len(report['scanned'])} image(s): "
-          f"{report['clean']} clean, {report['flagged']} flagged")
+          f"{report['clean']} clean, {report['flagged']} flagged; "
+          f"collected {len(report['collected'])}")
     for image_id, status in report["scanned"]:
         print(f"  {image_id} {status}")
     return 0

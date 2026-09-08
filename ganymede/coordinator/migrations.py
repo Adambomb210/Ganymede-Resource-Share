@@ -536,6 +536,31 @@ def _m006_contributor_agreement(conn: sqlite3.Connection) -> None:
 
 
 # --------------------------------------------------------------------------
+# 007 -- when a job ended (docs/11 1.2 retention). "Keep an image while any
+# non-terminal job references it, and for image_keep_days after the last
+# referencing job reaches a terminal status" needs that moment written down;
+# ``created_at`` is the wrong end of the job and nothing else recorded it.
+# Backfilled to NULL, which the GC reads as "ended at some unknown past time"
+# and treats with the image's own finalize stamp instead -- an old job cannot
+# pin an image forever just because this column did not exist when it ran.
+# --------------------------------------------------------------------------
+
+
+def _m007_job_terminal_at(conn: sqlite3.Connection) -> None:
+    with immediate(conn):
+        if "terminal_at" not in _columns(conn, "jobs"):
+            conn.execute("ALTER TABLE jobs ADD COLUMN terminal_at TEXT")
+        # The other half of retention: an image whose *bytes* have been
+        # collected keeps its row, because terminal jobs still point at it and
+        # that history is worth more than the row. ``collected_at`` plus a
+        # nulled ``object_ref`` is how everything downstream can tell that the
+        # archive is gone without inferring it from a 404.
+        if "collected_at" not in _columns(conn, "images"):
+            conn.execute("ALTER TABLE images ADD COLUMN collected_at TEXT")
+        _record(conn, 7)
+
+
+# --------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------
 
@@ -546,6 +571,7 @@ MIGRATIONS: list[tuple[int, str, Migration]] = [
     (4, "identity_machine_id", _m004_identity),
     (5, "scheduler", _m005_scheduler),
     (6, "contributor_agreement", _m006_contributor_agreement),
+    (7, "job_terminal_at", _m007_job_terminal_at),
 ]
 
 

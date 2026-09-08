@@ -202,9 +202,12 @@ def _mirror_job_status(conn: sqlite3.Connection, run) -> None:
         return
     with immediate(conn):
         changed = conn.execute(
-            "UPDATE jobs SET status = ? "
+            # ``terminal_at`` is stamped in the same statement that makes the
+            # job terminal, so the two can never disagree (docs/11 §1.2's
+            # retention clock reads it).
+            "UPDATE jobs SET status = ?, terminal_at = ? "
             "WHERE id = ? AND status NOT IN ('done', 'failed', 'cancelled')",
-            (target, run["job_id"]),
+            (target, rounds._iso(rounds.utcnow()), run["job_id"]),
         ).rowcount
     if changed:
         events.hub.publish("job.status", job_id=run["job_id"], owner_id=_owner_of(conn, run["job_id"]))

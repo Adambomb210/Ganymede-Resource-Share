@@ -29,14 +29,19 @@ from __future__ import annotations
 import gzip
 import io
 import json
+import logging
 import re
 import sqlite3
 import tarfile
 from dataclasses import dataclass, field
 from typing import Any, BinaryIO, Callable
 
+from datetime import datetime, timedelta
+
 from ganymede.coordinator.db import immediate
 from ganymede.coordinator.rounds import _iso, utcnow
+
+log = logging.getLogger("ganymede.coordinator.images")
 
 # --------------------------------------------------------------------------
 # Limits
@@ -584,6 +589,83 @@ def run_scan(conn: sqlite3.Connection, store, image_id: str,
             (result.status, _iso(utcnow()), json.dumps(result.detail()), image_id),
         )
     return result
+
+
+# An upload that never finalized is reaped after this long. Long enough for a
+# slow 10 GiB PUT to finish and the client to call /finalize; short enough that
+# an abandoned upload does not sit in the bucket for a week.
+UNFINALIZED_TTL_HOURS = 24
+
+
+def gc(conn: sqlite3.Connection, store, keep_days: int = 30,
+       now: datetime | None = None) -> list[str]:
+    """Delete images nothing needs any more (docs/11 §1.2).
+
+    What is collected is the **archive**, which is the thing that costs
+    gigabytes; the ``images`` row survives it. Terminal jobs still point at
+    their image, and that record of what a past job actually ran is worth more
+    than the row it occupies -- so a collected image keeps its id, its digest
+    and its scan verdict, and loses only ``object_ref``, with ``collected_at``
+    saying when. The one exception is an upload that never finalized: nothing
+    can reference it (a job cannot pin an image it cannot see), so that row goes
+    with its bytes.
+
+    Two rules, and the conservative reading of each:
+
+    - **Un-finalized rows** older than a day are an upload that never completed.
+    - **Finalized rows** are kept while any *non-terminal* job references them,
+      and for ``keep_days`` after the last referencing job ended. A job with no
+      ``terminal_at`` (it ended before migration 007, or was never started)
+      falls back to the image's own finalize stamp: an old row must not pin an
+      image forever just because the column did not exist when it ran.
+
+    The object goes first and the bookkeeping second. The other order can leave
+    a row claiming an object that is gone, which reads to a worker as a pull
+    that 404s rather than as an image that was collected.
+    """
+    now = now or utcnow()
+    removed: list[str] = []
+
+    stale = conn.execute(
+        "SELECT id, object_ref FROM images WHERE finalized_at IS NULL "
+        "AND object_ref IS NOT NULL AND uploaded_at < ?",
+        (_iso(now - timedelta(hours=UNFINALIZED_TTL_HOURS)),),
+    ).fetchall()
+
+    cutoff = _iso(now - timedelta(days=keep_days))
+    expired = conn.execute(
+        """SELECT i.id, i.object_ref FROM images i
+            WHERE i.finalized_at IS NOT NULL
+              AND i.object_ref IS NOT NULL
+              AND NOT EXISTS (
+                    SELECT 1 FROM jobs j WHERE j.image_id = i.id
+                     AND j.status NOT IN ('done', 'failed', 'cancelled'))
+              AND COALESCE(
+                    (SELECT MAX(COALESCE(j.terminal_at, i.finalized_at))
+                       FROM jobs j WHERE j.image_id = i.id),
+                    i.finalized_at) < ?""",
+        (cutoff,),
+    ).fetchall()
+
+    for row, drop_row in [(r, True) for r in stale] + [(r, False) for r in expired]:
+        try:
+            store.delete(row["object_ref"])
+        except Exception as exc:  # noqa: BLE001
+            # A store blip is a reason to try again next sweep, not a reason to
+            # forget which object still needs deleting.
+            log.warning("could not delete %s: %s", row["object_ref"], exc)
+            continue
+        with immediate(conn):
+            if drop_row:
+                conn.execute("DELETE FROM images WHERE id = ?", (row["id"],))
+            else:
+                conn.execute(
+                    "UPDATE images SET object_ref = NULL, collected_at = ? "
+                    "WHERE id = ?",
+                    (_iso(now), row["id"]),
+                )
+        removed.append(row["id"])
+    return removed
 
 
 def drain_pending(conn: sqlite3.Connection, store, limits: ScanLimits | None = None,
