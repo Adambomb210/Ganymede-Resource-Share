@@ -611,7 +611,7 @@ def test_a_clean_image_is_leased(client, conn, store, make_contributor,
     _pin_image(conn, "pinned-job", image_id)
 
     _, key = make_contributor()
-    fw = FakeWorker(client, store, key)
+    fw = FakeWorker(client, store, key, container_runtime="docker")
     assert fw.claim() is None
 
     images.drain_pending(conn, store, images.ScanLimits(
@@ -630,7 +630,7 @@ def test_an_admin_disposition_opens_the_gate(client, conn, store, make_contribut
         vetted_base_diff_ids=frozenset({VETTED})))
 
     _, key = make_contributor()
-    fw = FakeWorker(client, store, key)
+    fw = FakeWorker(client, store, key, container_runtime="docker")
     assert fw.claim() is None
 
     client.post(f"/v1/admin/images/{image_id}/scan", headers=_hdr(admin_key),

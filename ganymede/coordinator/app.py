@@ -63,6 +63,11 @@ class ComputeProfile(BaseModel):
     package_version: str | None = None
     supports: list[str] = Field(default_factory=list)
     probe: dict[str, Any] = Field(default_factory=dict)
+    # The runtime this machine can launch a job container with, or None
+    # (docs/11 §4). Self-reported like the rest of the profile, and absent on
+    # every worker built before the sandbox -- the claim gate reads a missing
+    # value as "no", so an old worker simply never matches a submitter job.
+    container_runtime: str | None = None
 
 
 class RegisterRequest(BaseModel):
@@ -485,7 +490,10 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                         conn, body.worker_id,
                         [eligibility.Verdict(job_id, eligibility.LEASED)],
                     )
-                    return JSONResponse(_task_payload(spec, store, settings))
+                    return JSONResponse(_task_payload(
+                        spec, store, settings,
+                        image=_image_handles(conn, job_id, store),
+                    ))
             else:
                 # A held task from a static (no-``shape_claim``) type: rebuild
                 # the payload from the ``tasks`` row and a fresh ``inputs_for``
@@ -502,6 +510,7 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                     return JSONResponse(_task_payload(
                         spec, store, settings, jt=jt, task_inputs=task_inputs,
                         sdk={"job_type": jt.name, "version": jt.version},
+                        image=_image_handles(conn, held["job_id"], store),
                     ))
 
         # Map a v1 worker's run_id pin to its parent job (docs/07 §1); job_id is
@@ -552,6 +561,19 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                 close.advance_job(conn, store, job["run_id"], settings=settings)
             else:
                 close.advance_job(conn, store, job_id=job["id"], settings=settings)
+
+            # Submitter code only ever runs contained (docs/11 §4). A host
+            # that never opted into a container runtime -- macOS, a native
+            # Windows or Linux install -- is refused here rather than handed an
+            # image it has no way to run. Fails closed on a profile that does
+            # not carry the field at all: every worker registered before this
+            # existed reports nothing, and "we cannot tell" has to read as "no"
+            # for the gate to mean anything.
+            if job["image_id"] is not None and not profile.get("container_runtime"):
+                verdicts.append(eligibility.Verdict(
+                    job["id"], eligibility.REFUSED, "no_container_runtime"
+                ))
+                continue
 
             # The constraint gate (Decision 15, docs/07 §2). Pure -- reads only
             # (machine_id, profile), no DB, no write lock. A refusal is a
@@ -618,7 +640,8 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                 verdicts.append(eligibility.Verdict(job["id"], eligibility.LEASED))
                 eligibility.record(conn, body.worker_id, verdicts)
                 return JSONResponse(_task_payload(
-                    spec, store, settings, jt=jt, task_inputs=task_inputs, sdk=sdk
+                    spec, store, settings, jt=jt, task_inputs=task_inputs, sdk=sdk,
+                    image=_image_handles(conn, job["id"], store),
                 ))
 
             # Eligible, but nothing to hand out: no open round / no unleased
@@ -685,7 +708,15 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         # awake and holding work, so it polls the ledger. ``leased=True`` here is
         # informational; it never changes the credited amount.
         ledger.record_availability_tick(conn, worker_id, leased=True)
-        return {"lease_expires_at": expires.isoformat()}
+        body_out: dict[str, Any] = {"lease_expires_at": expires.isoformat()}
+        # docs/11 §3 step 2: the cancel rides the heartbeat response and
+        # nothing else. Pull-only (Decision 8) means the worst-case latency
+        # from an operator's cancel to the worker acting is one heartbeat
+        # interval, and no inbound path to a contributor's machine is needed.
+        mode = rounds.cancel_outstanding(conn, task_id)
+        if mode is not None:
+            body_out["cancel"] = mode
+        return body_out
 
     @app.post(f"/{API_VERSION}/tasks/{{task_id}}/upload-url")
     def upload_url(task_id: str, conn: ConnDep, contributor: ContribDep) -> dict:
@@ -1923,8 +1954,36 @@ def _record_generic_verdict(conn: sqlite3.Connection, task_id: str, verdict,
             )
 
 
+def _image_handles(conn: sqlite3.Connection, job_id: str | None,
+                   store: Store) -> dict:
+    """``image_ref`` / ``image_digest`` / ``image_pull_url`` for one task.
+
+    All three are ``None`` for a first-party built-in (docs/11 §4): no
+    ``docker load``, no per-job pull, none of §2 applies. For a submitter job
+    they are the archive's identity and a presigned GET, and the digest is what
+    the worker re-computes after the pull before it loads anything (§2.3) --
+    the coordinator never hashes those bytes itself, so this row is the only
+    thing the worker can check against.
+    """
+    blank = {"image_ref": None, "image_digest": None, "image_pull_url": None}
+    if job_id is None:
+        return blank
+    row = conn.execute(
+        """SELECT i.id, i.digest, i.object_ref FROM jobs j
+             JOIN images i ON i.id = j.image_id
+            WHERE j.id = ?""",
+        (job_id,),
+    ).fetchone()
+    if row is None:
+        return blank
+    url, _expires = store.presign_get(row["object_ref"])
+    return {"image_ref": row["id"], "image_digest": row["digest"],
+            "image_pull_url": url}
+
+
 def _task_payload(spec: TaskSpec, store: Store, settings: Settings, *,
-                  jt=None, task_inputs=None, sdk: dict | None = None) -> dict:
+                  jt=None, task_inputs=None, sdk: dict | None = None,
+                  image: dict | None = None) -> dict:
     if task_inputs is None:
         # collab_lora_finetune -- the payload assembled here since Phase A,
         # kept byte-for-byte (plus an optional additive ``sdk`` block, docs/06).
@@ -1938,9 +1997,8 @@ def _task_payload(spec: TaskSpec, store: Store, settings: Settings, *,
             # handle, with buckets still present for collab_lora_finetune.
             "job_id": spec.job_id,
             "job_type": "collab_lora_finetune",
-            "image_ref": None,
-            "image_digest": None,
-            "image_pull_url": None,
+            **(image or {"image_ref": None, "image_digest": None,
+                         "image_pull_url": None}),
             "input_ref": spec.input_ref,
             "buckets": spec.buckets,
             "num_buckets": spec.num_buckets,
@@ -1976,9 +2034,8 @@ def _task_payload(spec: TaskSpec, store: Store, settings: Settings, *,
         "job_type": jt.name,
         "run_id": None,
         "round_idx": None,
-        "image_ref": None,
-        "image_digest": None,
-        "image_pull_url": None,
+        **(image or {"image_ref": None, "image_digest": None,
+                     "image_pull_url": None}),
         "input_ref": spec.input_ref,
         "attempt_group": spec.attempt_group,
         "artifacts": task_inputs.artifacts,

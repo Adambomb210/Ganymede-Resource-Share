@@ -79,21 +79,56 @@ def _round_still_accepting(conn: sqlite3.Connection, task: sqlite3.Row):
 # --------------------------------------------------------------------------
 
 
+def cancel_outstanding(conn: sqlite3.Connection, task_id: str) -> str | None:
+    """The cancel mode owed to this task, or ``None`` (docs/11 §3).
+
+    A cancel is a fact about the *job*; a task learns about it on its next
+    heartbeat. Reading it through the join rather than copying a flag onto the
+    task means one write cancels a job however many tasks it has out, and there
+    is no second place for the two to disagree.
+    """
+    row = conn.execute(
+        """SELECT j.cancel_mode FROM tasks t
+             JOIN jobs j ON j.id = t.job_id
+            WHERE t.id = ? AND j.status = 'cancelled'""",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    # A job cancelled without a mode is a soft cancel: the gentler reading is
+    # the safe one to guess, and `hard` is never something to infer.
+    return row["cancel_mode"] or "soft"
+
+
 def expire_leases(conn: sqlite3.Connection, now: datetime | None = None) -> int:
     """Reclaim leases whose holder stopped heartbeating. Returns the count.
 
     A machine that was shut down mid-task is the common case, not an anomaly,
     so its shard has to become available again without operator involvement.
+
+    A lease belonging to a *cancelled* job lands on ``cancelled`` instead
+    (docs/11 §3): the wedged-worker path, where nobody drained anything and the
+    soft/hard distinction collapsed to hard. Keeping the two apart is not
+    cosmetic -- ``expired`` and ``abandoned`` are what the ledger counts as a
+    machine's infractions (docs/09 5.2), and an operator cancelling a job is not
+    the contributor's fault.
     """
     now = now or utcnow()
     with immediate(conn):
-        cur = conn.execute(
+        cancelled = conn.execute(
+            """UPDATE tasks SET status = 'cancelled', lease_expires_at = NULL
+               WHERE status = 'leased' AND lease_expires_at IS NOT NULL
+                 AND lease_expires_at < ?
+                 AND job_id IN (SELECT id FROM jobs WHERE status = 'cancelled')""",
+            (_iso(now),),
+        ).rowcount
+        expired = conn.execute(
             """UPDATE tasks SET status = 'expired'
                WHERE status = 'leased' AND lease_expires_at IS NOT NULL
                  AND lease_expires_at < ?""",
             (_iso(now),),
-        )
-        return cur.rowcount
+        ).rowcount
+        return cancelled + expired
 
 
 def heartbeat(
@@ -146,14 +181,24 @@ def last_heartbeat_steps(conn: sqlite3.Connection, task_id: str) -> int | None:
     return None if row is None else row["last_heartbeat_steps"]
 
 
-def abandon(conn: sqlite3.Connection, task_id: str, worker_id: str) -> None:
-    """Voluntary release. The host is going away; give the shard back cleanly."""
+def abandon(conn: sqlite3.Connection, task_id: str, worker_id: str) -> str:
+    """Voluntary release. The host is going away; give the shard back cleanly.
+
+    Returns the status the task landed on. With a cancel outstanding that is
+    ``cancelled`` rather than ``abandoned`` (docs/11 §3 step 4), which does two
+    things: the shard is not re-dispatched while it drains -- no second
+    container on one unit of work -- and the release is not counted against the
+    machine, because a job the operator cancelled is not an infraction of the
+    contributor's (docs/09 5.2).
+    """
+    status = "cancelled" if cancel_outstanding(conn, task_id) else "abandoned"
     with immediate(conn):
         conn.execute(
-            """UPDATE tasks SET status = 'abandoned', lease_expires_at = NULL
+            """UPDATE tasks SET status = ?, lease_expires_at = NULL
                WHERE id = ? AND worker_id = ? AND status = 'leased'""",
-            (task_id, worker_id),
+            (status, task_id, worker_id),
         )
+    return status
 
 
 def record_submission(

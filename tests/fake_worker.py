@@ -126,7 +126,8 @@ class FakeWorker:
 
     def __init__(self, client, store, key: str, *, device: str = "RTX 3060",
                  backend: str = "cuda", vram_mb: int = 12288,
-                 supports: list[str] | None = None, probe: dict | None = None) -> None:
+                 supports: list[str] | None = None, probe: dict | None = None,
+                 container_runtime: str | None = None) -> None:
         self.client = client
         self.store = store
         self.key = key
@@ -137,6 +138,9 @@ class FakeWorker:
         self.probe = probe if probe is not None else {
             "alloc_max_mb": vram_mb - 1000, "bench_score": 40.0,
         }
+        # None by default, because that is what a machine that never opted into
+        # Docker reports (docs/11 §4) and what every pre-sandbox worker reports.
+        self.container_runtime = container_runtime
         self.headers = {"Authorization": f"Bearer {key}"}
         self.worker_id: str | None = None
         self.task: dict | None = None  # last claimed task payload
@@ -148,6 +152,7 @@ class FakeWorker:
         return {
             "backend": self.backend, "device_name": self.device, "vram_mb": self.vram_mb,
             "supports": self.supports, "probe": self.probe,
+            "container_runtime": self.container_runtime,
         }
 
     def register(self) -> str:
