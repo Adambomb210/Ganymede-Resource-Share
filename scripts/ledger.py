@@ -10,6 +10,13 @@ path; it is a periodic sweep driven by this script from cron, next to
    scalar from recorded outcomes and drive ``workers.standing`` transitions.
 3. ``identity.gc_expired_sessions`` -- drop dead web sessions (docs/08 "runs on
    the audit / availability_ticks cron").
+4. ``fairness.recompute_shares`` -- rebuild the share rollup the scheduler reads
+   (docs/13 §1.5). Rides here rather than in its own cron for the same reason
+   retention rides the image sweep: same cadence, and a separate cron entry for
+   one rollup is a thing to forget to install.
+5. ``fairness.autopreempt`` -- at most one preemption (docs/13 §4.6). Off unless
+   ``GANYMEDE_AUTOPREEMPT``, and it returns before touching the database when it
+   is off.
 
 Recommended cadence: once a minute. A 30-minute settle delay plus a minute
 sweep means a window settles within a minute of eligibility, and a standing
@@ -23,12 +30,17 @@ import argparse
 import sys
 from datetime import datetime, timezone
 
-from ganymede.coordinator import identity, ledger
+from ganymede.coordinator import fairness, identity, ledger
 from ganymede.coordinator.db import connect
 
 
-def run(db_path: str, probation_monthly_cap_hours: float) -> dict:
-    """Execute one sweep, returning a small report dict."""
+def run(db_path: str, probation_monthly_cap_hours: float, settings=None) -> dict:
+    """Execute one sweep, returning a small report dict.
+
+    ``settings`` is optional so the existing two-argument call keeps working;
+    without it the Phase D steps that need configuration (autopreempt) sit out,
+    while the share rollup -- which needs none -- still runs.
+    """
     conn = connect(db_path)
     now = datetime.now(timezone.utc)
     try:
@@ -37,6 +49,10 @@ def run(db_path: str, probation_monthly_cap_hours: float) -> dict:
         )
         evaluated = ledger.evaluate_reputation(conn, now)
         sessions_gc = identity.gc_expired_sessions(conn)
+        shares = fairness.recompute_shares(conn, now)
+        preempted = (
+            fairness.autopreempt(conn, settings, now) if settings is not None else None
+        )
     finally:
         conn.close()
     return {
@@ -44,6 +60,8 @@ def run(db_path: str, probation_monthly_cap_hours: float) -> dict:
         "windows_settled": settled,
         "reputations_evaluated": evaluated,
         "sessions_gc": sessions_gc,
+        "shares_recomputed": len(shares),
+        "preempted": preempted,
     }
 
 
@@ -65,10 +83,24 @@ def main(argv: list[str] | None = None) -> int:
         if not db_path:
             print("no database: pass --db or set GANYMEDE_DB", file=sys.stderr)
             return 2
-    report = run(db_path, args.probation_monthly_cap_hours)
+    # ``from_env`` needs the storage block, which a bare ledger cron may not
+    # have configured. The sweep's ledger half predates Phase D and must not
+    # start depending on it, so a settings failure costs only the autopreempt
+    # step -- loudly, on stderr, not silently.
+    settings = None
+    try:
+        from ganymede.coordinator.config import Settings
+
+        settings = Settings.from_env()
+    except Exception as exc:  # noqa: BLE001
+        print(f"note: no settings ({exc}); autopreempt sits out", file=sys.stderr)
+
+    report = run(db_path, args.probation_monthly_cap_hours, settings)
     print(f"{report['at']} settled {report['windows_settled']} window(s), "
           f"evaluated {report['reputations_evaluated']} machine(s), "
-          f"gc'd {report['sessions_gc']} session(s)")
+          f"gc'd {report['sessions_gc']} session(s), "
+          f"shares for {report['shares_recomputed']} submitter(s)"
+          + (f", preempted {report['preempted']}" if report["preempted"] else ""))
     return 0
 
 

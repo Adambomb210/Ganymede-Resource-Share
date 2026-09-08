@@ -210,12 +210,18 @@ def claim_task(
         # in migration 003.
         job_id = run["job_id"] if "job_id" in run.keys() else None
         conn.execute(
+            # ``leased_at`` duplicates ``created_at`` on this path and does so
+            # on purpose: a dynamic type inserts its task rows already
+            # ``leased``, so the two *are* the same instant here, while a static
+            # type plans at enqueue and leases much later. Share accounting
+            # (docs/13 §1.2) reads one column for both.
             """INSERT INTO tasks
                  (id, run_id, round_idx, job_id, buckets_json, local_steps, status,
-                  worker_id, lease_expires_at, attempts, max_runtime_sec, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'leased', ?, ?, 1, ?, ?)""",
+                  worker_id, lease_expires_at, leased_at, attempts, max_runtime_sec,
+                  created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'leased', ?, ?, ?, 1, ?, ?)""",
             (task_id, run_id, rnd["idx"], job_id, json.dumps(buckets), plan.local_steps,
-             worker_id, _iso(expires), plan.usable_sec, _iso(now)),
+             worker_id, _iso(expires), _iso(now), plan.usable_sec, _iso(now)),
         )
         # Mark the shard as spoken for now, not at submit. If this worker
         # vanishes the lease expires and the buckets come back round on

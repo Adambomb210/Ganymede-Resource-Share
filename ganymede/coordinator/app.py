@@ -22,7 +22,8 @@ from pydantic import BaseModel, Field
 
 from ganymede.coordinator import budget as budget_mod
 from ganymede.coordinator import constraints as constraints_mod
-from ganymede.coordinator import eligibility, identity, images as images_mod, ledger
+from ganymede.coordinator import eligibility
+from ganymede.coordinator import fairness, identity, images as images_mod, ledger
 from ganymede.coordinator import close, events, rounds
 from ganymede.coordinator.migrations import SYSTEM_OWNER_ID
 from ganymede.coordinator.auth import (
@@ -154,6 +155,23 @@ class SubmitterDecisionRequest(BaseModel):
 
     status: str
     note: str | None = None
+
+
+class QuotaRequest(BaseModel):
+    """A submitter's caps (docs/13 §3.1). ``None`` in a field is *uncapped* on
+    that axis, not "leave it alone" -- the whole row is the state, so a PUT with
+    one field set is a deliberate "cap concurrency, do not cap spend"."""
+
+    max_concurrent_tasks: int | None = None
+    monthly_task_hours: float | None = None
+    note: str | None = None
+
+
+class PreemptRequest(BaseModel):
+    """``{mode}`` -- the same soft/hard grammar as a job cancel (docs/11 §3),
+    because it rides the same heartbeat field (docs/13 §4.1)."""
+
+    mode: str = "soft"
 
 
 # --------------------------------------------------------------------------
@@ -523,7 +541,9 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             if row is not None:
                 pinned_job_id = row["job_id"]
 
-        jobs = _selectable_jobs(conn, pinned_job_id, body.cached_base_models)
+        jobs = _selectable_jobs(conn, pinned_job_id, body.cached_base_models,
+                                settings)
+        quota_seen: dict[str, str | None] = {}
         # Every branch below records a verdict, including the ones that succeed.
         # A stale "refused" left behind by a worker that has since started
         # working would be worse than no record at all -- it is the answer a
@@ -572,6 +592,23 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             if job["image_id"] is not None and not profile.get("container_runtime"):
                 verdicts.append(eligibility.Verdict(
                     job["id"], eligibility.REFUSED, "no_container_runtime"
+                ))
+                continue
+
+            # Quotas and budgets (docs/13 §3.2). A ``continue`` with a recorded
+            # verdict, not a silent filter in ``_selectable_jobs``: it is every
+            # bit as absolute -- the job is not offered, full stop -- and it buys
+            # the explanation. A submitter whose jobs have stopped moving is told
+            # "you are at your cap" through ``explain()`` rather than watching a
+            # queued job sit there. A quota nobody can see hitting is a support
+            # ticket. Memoised per claim, so a queue of thirty jobs from three
+            # submitters costs three lookups.
+            owner = job["owner_id"]
+            if owner not in quota_seen:
+                quota_seen[owner] = fairness.quota_refusal(conn, owner)
+            if quota_seen[owner] is not None:
+                verdicts.append(eligibility.Verdict(
+                    job["id"], eligibility.REFUSED, quota_seen[owner]
                 ))
                 continue
 
@@ -1497,6 +1534,17 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         row = _job_for_caller(conn, job_id, user)
         if row["status"] != "draft":
             raise HTTPException(status_code=409, detail=f"job is {row['status']}, not draft")
+        # Admission control (docs/13 §3.4). Only the *budget* is checked here --
+        # the concurrency quota is transient by nature, and refusing an enqueue
+        # because four tasks happen to be running right now would be nonsense.
+        # Refusing here rather than letting the job queue and never lease is the
+        # difference between an answer and a mystery.
+        cap = fairness.budget_exhausted(conn, row["owner_id"])
+        if cap is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"monthly budget of {cap:g} machine-hours is spent",
+            )
         with immediate(conn):
             tail = conn.execute(
                 "SELECT COALESCE(MAX(priority_rank), 0) + 1 AS r FROM jobs"
@@ -1651,6 +1699,79 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         return {"user_id": user_id, "status": body.status, "decided_by": admin.id,
                 "decided_at": now}
 
+    @app.post(f"/{API_VERSION}/admin/submitters/{{user_id}}/quota")
+    def admin_submitter_quota(
+        user_id: str, body: QuotaRequest, conn: ConnDep,
+        admin: Annotated[Contributor, Depends(require_admin)],
+    ) -> dict:
+        """Set or clear a submitter's caps (docs/13 §3).
+
+        Admin-write-only, by the same argument docs/07 §5 makes about
+        ``priority_rank``: a submitter who could raise their own ceiling does not
+        have a ceiling. Both fields ``None`` writes an uncapped row, which is
+        distinguishable from no row only in the audit trail -- and that is the
+        point of writing it rather than deleting.
+        """
+        if body.max_concurrent_tasks is not None and body.max_concurrent_tasks < 0:
+            raise HTTPException(
+                status_code=422, detail="max_concurrent_tasks must not be negative")
+        if body.monthly_task_hours is not None and body.monthly_task_hours < 0:
+            raise HTTPException(
+                status_code=422, detail="monthly_task_hours must not be negative")
+        row = conn.execute(
+            "SELECT user_id FROM submitters WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="not found")
+        now = rounds._iso(rounds.utcnow())
+        with immediate(conn):
+            conn.execute(
+                """INSERT INTO submitter_quotas
+                     (user_id, max_concurrent_tasks, monthly_task_hours, note,
+                      updated_by, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                     max_concurrent_tasks = excluded.max_concurrent_tasks,
+                     monthly_task_hours   = excluded.monthly_task_hours,
+                     note                 = excluded.note,
+                     updated_by           = excluded.updated_by,
+                     updated_at           = excluded.updated_at""",
+                (user_id, body.max_concurrent_tasks, body.monthly_task_hours,
+                 body.note, admin.id, now),
+            )
+        events.hub.publish("submitter.change", user_id=user_id)
+        return {
+            "user_id": user_id,
+            "max_concurrent_tasks": body.max_concurrent_tasks,
+            "monthly_task_hours": body.monthly_task_hours,
+            "used_hours_this_month": round(fairness.month_hours(conn, user_id), 3),
+            "updated_by": admin.id, "updated_at": now,
+        }
+
+    @app.post(f"/{API_VERSION}/admin/tasks/{{task_id}}/preempt")
+    def admin_task_preempt(
+        task_id: str, body: PreemptRequest, conn: ConnDep,
+        admin: Annotated[Contributor, Depends(require_admin)],
+    ) -> dict:
+        """Aim the heartbeat ``cancel`` at one task instead of a whole job
+        (docs/07 §4, docs/13 §4.5).
+
+        No new transport: this writes ``tasks.preempt_mode`` and the *existing*
+        heartbeat response field carries it on the worker's next beat, in the
+        same shape a job cancel does. That is Decision 8 held to -- the cancel
+        rides the heartbeat and nothing else -- rather than a second mechanism
+        that would need its own delivery guarantees.
+        """
+        if body.mode not in ("soft", "hard"):
+            raise HTTPException(status_code=422, detail="mode must be soft | hard")
+        if not fairness.preempt(conn, task_id, body.mode, cause=f"admin:{admin.id}"):
+            # Not "no such task": a task that is not leased has nothing to
+            # preempt, and saying so is more useful than a 404 that sends an
+            # admin looking for a typo.
+            raise HTTPException(
+                status_code=409, detail="task is not leased; nothing to preempt")
+        return {"task_id": task_id, "preempt_mode": body.mode}
+
     return app
 
 
@@ -1709,7 +1830,7 @@ def _image_schedulable(row: sqlite3.Row) -> bool:
 
 
 def _selectable_jobs(conn: sqlite3.Connection, pinned_job_id: str | None,
-                     cached_models: list[str]) -> list[sqlite3.Row]:
+                     cached_models: list[str], settings=None) -> list[sqlite3.Row]:
     """Walk the admin-ordered queue (docs/07 §1).
 
     Rows: jobs in status ``queued`` or ``running`` -- **both**, because a
@@ -1719,15 +1840,17 @@ def _selectable_jobs(conn: sqlite3.Connection, pinned_job_id: str | None,
 
     Order: ``priority_rank`` ASC primary (lower = sooner), then the
     cache-affinity tiebreak **within a rank**, then ``created_at`` ASC. That
-    sort key -- ``(priority_rank, affinity_miss, created_at)`` -- is the single
-    seam a future weighted fair-share slots into (docs/07 §4); the walk itself
-    stays head-first, backfilling, one task per machine.
+    sort key was the single seam docs/07 §4 reserved for weighted fair-share,
+    and docs/13 §2 has now slotted into it: the primary term is
+    ``fairness.effective_rank(priority_rank, spread, share)``, which is
+    ``priority_rank`` itself while ``spread`` is 0.0 (the default). The walk
+    itself stays head-first, backfilling, one task per machine.
 
     ``pinned_job_id`` short-circuits to that one row if it is selectable, else
     the caller 204s.
     """
     rows = conn.execute(
-        """SELECT j.id, j.job_type, j.priority_rank, j.created_at,
+        """SELECT j.id, j.job_type, j.priority_rank, j.created_at, j.owner_id,
                   j.constraints_json, j.image_id, j.spec_json,
                   r.id AS run_id, r.base_model,
                   i.scan_status AS image_scan_status,
@@ -1748,13 +1871,25 @@ def _selectable_jobs(conn: sqlite3.Connection, pinned_job_id: str | None,
     rows = [r for r in rows if _image_schedulable(r)]
     cached = set(cached_models or [])
 
+    # Fair-share (docs/13 §2). A **sort term, never a filter** -- the exact
+    # inverse of the image gate three lines above, and the reason is the inverse
+    # too: an unscannable image must never be merely *unlikely* to be picked,
+    # while a submitter who has used a lot of the fleet must be merely *late* and
+    # never unschedulable. Filtering them would break the capability backfill --
+    # their job would stop being offered to a machine no other job fits, and the
+    # fleet would idle in order to punish them.
+    spread = float(getattr(settings, "fairshare_spread", 0.0) or 0.0)
+    shares = fairness.share_fractions(conn) if spread else {}
+
     def key(row: sqlite3.Row):
         # Affinity is advisory and never crosses a rank boundary. Two axes,
         # both advisory: base-model-on-disk (today) and image-digest-pulled
         # (Decision 18 -- stubbed while every first-party job's image_id is
         # NULL). The affinity function can be refined without touching the walk.
         base_warm = bool(row["base_model"]) and row["base_model"] in cached
-        return (row["priority_rank"], 0 if base_warm else 1, row["created_at"] or "")
+        rank = fairness.effective_rank(
+            row["priority_rank"], spread, shares.get(row["owner_id"], 0.0))
+        return (rank, 0 if base_warm else 1, row["created_at"] or "")
 
     ordered = sorted(rows, key=key)
     if pinned_job_id is not None:
@@ -1825,7 +1960,7 @@ def _claim_static_task(conn: sqlite3.Connection, jt, store: Store,
         row = conn.execute(
             """SELECT * FROM tasks
                 WHERE job_id = ? AND attempts < ?
-                  AND ( status IN ('planned', 'expired', 'abandoned')
+                  AND ( status IN ('planned', 'expired', 'abandoned', 'preempted')
                         OR (status = 'submitted' AND EXISTS (
                               SELECT 1 FROM submissions s
                                WHERE s.task_id = tasks.id AND s.accepted = 0)) )
@@ -1836,10 +1971,20 @@ def _claim_static_task(conn: sqlite3.Connection, jt, store: Store,
             return None, None
         expires = now + timedelta(seconds=settings.lease_duration_sec)
         changed = conn.execute(
+            # ``attempts`` does not move for a preempted shard (docs/13 §4.4).
+            # The attempt budget bounds *the shard's* failures; letting the
+            # scheduler spend it would fail a shard after five decisions nobody
+            # made about that shard -- and ``MAX_TASK_ATTEMPTS`` is 5.
+            #
+            # ``leased_at`` is the share accounting's only input (docs/13 §1.2).
+            # It cannot be derived from ``created_at`` here: a static type's
+            # tasks are planned at enqueue and leased minutes or days later.
             "UPDATE tasks SET status = 'leased', worker_id = ?, "
-            "lease_expires_at = ?, attempts = attempts + 1 "
+            "lease_expires_at = ?, leased_at = ?, "
+            "attempts = attempts + CASE WHEN status = 'preempted' THEN 0 ELSE 1 END "
             "WHERE id = ? AND status = ?",
-            (worker_id, rounds._iso(expires), row["id"], row["status"]),
+            (worker_id, rounds._iso(expires), rounds._iso(now),
+             row["id"], row["status"]),
         ).rowcount
         if not changed:
             return None, None

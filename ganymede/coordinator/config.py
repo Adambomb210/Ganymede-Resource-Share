@@ -155,6 +155,27 @@ class Settings:
     # Vetted bottom-of-stack ``diff_id``s. Empty means every image is flagged
     # for a human -- the fail-closed default, not an oversight (images.py).
     image_vetted_base_diff_ids: tuple[str, ...] = ()
+    # --- Phase D: fairness, preemption, anti-fraud (docs/13). ---
+    # Every one of these defaults to off, and docs/13 §0 argues the case rather
+    # than leaving it to look like caution: this is a fleet with one contributor
+    # and no contention, so there is nothing to tune scheduling policy against,
+    # and untuned scheduling policy moves work for reasons nobody can explain.
+    #
+    # How much of the queue ordering the admin delegates to fair-share, in units
+    # of ``priority_rank``. Ranks are sparse by convention (10, 20, 30), so 10
+    # lets a submitter monopolising the fleet slip at most one slot. 0.0 is off
+    # by arithmetic: the sort term becomes ``priority_rank + 0.0``.
+    fairshare_spread: float = 0.0
+    # The automatic preemption policy (docs/13 §4.6). Manual preemption is always
+    # available and needs no flag -- it is an explicit admin action.
+    autopreempt: bool = False
+    # Fraction of static-type claims served an already-accepted shard instead, as
+    # a known-answer probe (docs/13 §5). 0.0 means the dice never come up.
+    spotcheck_rate: float = 0.0
+    # Weight each machine's contribution to the outer merge by its reputation
+    # (docs/13 §6). The one numerically live switch in Phase D, which is why it
+    # is the one with a golden-trace test behind it.
+    reputation_weighted_agg: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -189,4 +210,10 @@ class Settings:
                 "GANYMEDE_IMAGE_MAX_UNCOMPRESSED_BYTES", 64 * 1024**3
             ),
             image_vetted_base_diff_ids=_env_list("GANYMEDE_VETTED_BASE_DIFF_IDS"),
+            fairshare_spread=_env_float("GANYMEDE_FAIRSHARE_SPREAD", 0.0),
+            autopreempt=_env_bool("GANYMEDE_AUTOPREEMPT", False),
+            spotcheck_rate=_env_float("GANYMEDE_SPOTCHECK_RATE", 0.0),
+            reputation_weighted_agg=_env_bool(
+                "GANYMEDE_REPUTATION_WEIGHTED_AGG", False
+            ),
         )

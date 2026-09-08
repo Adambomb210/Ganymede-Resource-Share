@@ -219,7 +219,17 @@ def test_submitted_metrics_carry_the_key_the_coordinator_folds_throughput_by(
     metrics = T.run_task(task, seed_bytes, rows=tiny_rows, device=CPU).metrics
 
     assert metrics["gpu_model"] == M.device_name(CPU)
-    assert metrics["steps_per_min"] > 0
+    # Present and a number -- deliberately not ``> 0``. Two steps on a tiny CPU
+    # model can finish inside a single clock tick (``time.monotonic`` is ~15.6 ms
+    # on Windows), and ``train.py`` then honestly reports ``0.0`` rather than
+    # dividing by zero. Asserting a positive rate here was asserting that this
+    # machine is slow, which it intermittently is not: the test passed alone and
+    # failed under a full-suite run, where the caches are warm. What this test is
+    # actually about is the two *keys* the coordinator folds by, so that is what
+    # it checks -- and ``reduce.py``'s ``if spm and gpu`` already treats a zero
+    # rate as no observation, which is the correct handling of an unmeasurably
+    # fast round.
+    assert isinstance(metrics["steps_per_min"], (int, float))
 
     # Exactly what close_round does with them.
     plan.update_throughput(conn, run_id, metrics["gpu_model"], float(metrics["steps_per_min"]))

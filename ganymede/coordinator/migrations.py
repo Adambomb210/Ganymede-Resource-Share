@@ -561,6 +561,91 @@ def _m007_job_terminal_at(conn: sqlite3.Connection) -> None:
 
 
 # --------------------------------------------------------------------------
+# 008 -- Phase D's fairness substrate (docs/13). Four tables and two columns,
+# every one of them inert on arrival: no ``submitter_quotas`` row means no cap,
+# an empty ``share_accounting`` means every share is zero, and both new ``tasks``
+# columns default to NULL, which is exactly "nothing has changed".
+# --------------------------------------------------------------------------
+
+_M008_TABLES = [
+    # docs/13 §1.5. The share rollup, recomputed on the sweep like reputation.
+    # ``decayed_seconds`` is as-of ``updated_at`` and the *reader* ages it
+    # forward, so a sweep that stops fades fairness out rather than freezing
+    # whoever happened to be ahead when it died.
+    """
+    CREATE TABLE IF NOT EXISTS share_accounting (
+        owner_id        TEXT PRIMARY KEY REFERENCES contributors(id),
+        decayed_seconds REAL NOT NULL,
+        formula_version INTEGER NOT NULL,
+        updated_at      TEXT NOT NULL
+    )
+    """,
+    # docs/13 §3.1. Absent = uncapped, which is the default for everybody
+    # including every submitter that already exists. NULL in one column is that
+    # one dimension uncapped, so a concurrency cap with no budget is a row with
+    # one column filled.
+    """
+    CREATE TABLE IF NOT EXISTS submitter_quotas (
+        user_id              TEXT PRIMARY KEY REFERENCES contributors(id),
+        max_concurrent_tasks INTEGER,
+        monthly_task_hours   REAL,
+        note                 TEXT,
+        updated_by           TEXT REFERENCES contributors(id),
+        updated_at           TEXT NOT NULL
+    )
+    """,
+    # docs/13 §5.3. The *only* thing that distinguishes a probe from real work,
+    # and it lives here rather than on ``tasks`` precisely so that nothing a
+    # worker can see carries it (§5.1).
+    """
+    CREATE TABLE IF NOT EXISTS spot_check_issues (
+        task_id        TEXT PRIMARY KEY REFERENCES tasks(id),
+        source_task_id TEXT NOT NULL REFERENCES tasks(id),
+        issued_at      TEXT NOT NULL,
+        outcome        TEXT,
+        decided_at     TEXT
+    )
+    """,
+]
+
+_M008_INDEXES = [
+    # The share sweep's one scan: tasks leased inside the lookback window.
+    "CREATE INDEX IF NOT EXISTS idx_tasks_leased_at ON tasks(leased_at)",
+    # ``recompute_reputation`` reads a machine's spot-check history per sweep.
+    "CREATE INDEX IF NOT EXISTS idx_spot_check_outcome "
+    "ON spot_check_issues(outcome, decided_at)",
+]
+
+
+def _m008_fairness(conn: sqlite3.Connection) -> None:
+    with immediate(conn):
+        task_cols = _columns(conn, "tasks")
+        if "leased_at" not in task_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN leased_at TEXT")
+            # Backfill from ``created_at``. That is *exact*, not approximate,
+            # for every row that can exist today: ``collab_lora_finetune``
+            # inserts its task rows already ``leased``, so creation and lease
+            # are the same instant. A static type's tasks are planned at
+            # enqueue and leased later -- for those the two differ by an
+            # unbounded margin, which is the whole reason this column exists --
+            # but no static-type task has ever been leased on a live database,
+            # so the backfill has nothing to be wrong about. A future reader
+            # will otherwise read this as a guess.
+            conn.execute(
+                "UPDATE tasks SET leased_at = created_at "
+                "WHERE leased_at IS NULL AND status <> 'planned'"
+            )
+        # docs/13 §4.2. NULL = not preempted, which is every row.
+        if "preempt_mode" not in task_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN preempt_mode TEXT")
+        for stmt in _M008_TABLES:
+            conn.execute(stmt)
+        for stmt in _M008_INDEXES:
+            conn.execute(stmt)
+        _record(conn, 8)
+
+
+# --------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------
 
@@ -572,6 +657,7 @@ MIGRATIONS: list[tuple[int, str, Migration]] = [
     (5, "scheduler", _m005_scheduler),
     (6, "contributor_agreement", _m006_contributor_agreement),
     (7, "job_terminal_at", _m007_job_terminal_at),
+    (8, "fairness", _m008_fairness),
 ]
 
 

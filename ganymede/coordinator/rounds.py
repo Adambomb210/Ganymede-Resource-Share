@@ -80,13 +80,26 @@ def _round_still_accepting(conn: sqlite3.Connection, task: sqlite3.Row):
 
 
 def cancel_outstanding(conn: sqlite3.Connection, task_id: str) -> str | None:
-    """The cancel mode owed to this task, or ``None`` (docs/11 §3).
+    """The cancel mode owed to this task, or ``None`` (docs/11 §3, docs/13 §4.2).
 
-    A cancel is a fact about the *job*; a task learns about it on its next
-    heartbeat. Reading it through the join rather than copying a flag onto the
-    task means one write cancels a job however many tasks it has out, and there
-    is no second place for the two to disagree.
+    Two causes, one answer. A **job cancel** is a fact about the job; a task
+    learns about it on its next heartbeat, which means one write cancels a job
+    however many tasks it has out, and there is no fan-out to get wrong. A
+    **preemption** (docs/13 §4) is a fact about one task, on a job that is still
+    perfectly alive.
+
+    Task first, because the job-level clause below reads ``jobs.status =
+    'cancelled'`` and a preempted task's job is ``queued`` or ``running`` -- it
+    would find nothing. The transport is identical either way: the same
+    ``{"cancel": mode}`` field on the same heartbeat response (Decision 8), which
+    is the whole point of aiming the existing mechanism at a task rather than
+    inventing a second one.
     """
+    row = conn.execute(
+        "SELECT preempt_mode FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is not None and row["preempt_mode"]:
+        return row["preempt_mode"]
     row = conn.execute(
         """SELECT j.cancel_mode FROM tasks t
              JOIN jobs j ON j.id = t.job_id
@@ -96,7 +109,7 @@ def cancel_outstanding(conn: sqlite3.Connection, task_id: str) -> str | None:
     if row is None:
         return None
     # A job cancelled without a mode is a soft cancel: the gentler reading is
-    # the safe one to guess, and `hard` is never something to infer.
+    # the safe one when nobody said.
     return row["cancel_mode"] or "soft"
 
 
@@ -106,15 +119,33 @@ def expire_leases(conn: sqlite3.Connection, now: datetime | None = None) -> int:
     A machine that was shut down mid-task is the common case, not an anomaly,
     so its shard has to become available again without operator involvement.
 
-    A lease belonging to a *cancelled* job lands on ``cancelled`` instead
-    (docs/11 §3): the wedged-worker path, where nobody drained anything and the
-    soft/hard distinction collapsed to hard. Keeping the two apart is not
-    cosmetic -- ``expired`` and ``abandoned`` are what the ledger counts as a
-    machine's infractions (docs/09 5.2), and an operator cancelling a job is not
-    the contributor's fault.
+    Three destinations, not one. A lease belonging to a *cancelled* job lands on
+    ``cancelled`` (docs/11 §3) and a *preempted* one on ``preempted`` (docs/13
+    §4.3) -- both here as well as in ``abandon``, because this is the wedged-
+    worker path where nobody acknowledged anything and the soft/hard distinction
+    collapsed to hard.
+
+    Keeping all three apart is not cosmetic. ``expired`` and ``abandoned`` are
+    what the ledger counts as a machine's infractions (docs/09 5.2), and neither
+    an operator cancelling a job nor the scheduler reclaiming a machine is the
+    contributor's fault. ``preempted`` is further distinct from ``cancelled`` in
+    the other direction: a cancelled task's work is not wanted, a preempted
+    task's is, so ``preempted`` is non-terminal and goes back in the pool.
+
+    Order matters: preempted first, then cancelled, then the rest. A task that is
+    both preempted and on a cancelled job is *cancelled* -- the job going away
+    outranks a scheduling decision about it -- so the preempt arm excludes those.
     """
     now = now or utcnow()
     with immediate(conn):
+        preempted = conn.execute(
+            """UPDATE tasks SET status = 'preempted', lease_expires_at = NULL,
+                                worker_id = NULL, preempt_mode = NULL
+               WHERE status = 'leased' AND lease_expires_at IS NOT NULL
+                 AND lease_expires_at < ? AND preempt_mode IS NOT NULL
+                 AND job_id NOT IN (SELECT id FROM jobs WHERE status = 'cancelled')""",
+            (_iso(now),),
+        ).rowcount
         cancelled = conn.execute(
             """UPDATE tasks SET status = 'cancelled', lease_expires_at = NULL
                WHERE status = 'leased' AND lease_expires_at IS NOT NULL
@@ -128,7 +159,7 @@ def expire_leases(conn: sqlite3.Connection, now: datetime | None = None) -> int:
                  AND lease_expires_at < ?""",
             (_iso(now),),
         ).rowcount
-        return cancelled + expired
+        return preempted + cancelled + expired
 
 
 def heartbeat(
@@ -184,20 +215,50 @@ def last_heartbeat_steps(conn: sqlite3.Connection, task_id: str) -> int | None:
 def abandon(conn: sqlite3.Connection, task_id: str, worker_id: str) -> str:
     """Voluntary release. The host is going away; give the shard back cleanly.
 
-    Returns the status the task landed on. With a cancel outstanding that is
-    ``cancelled`` rather than ``abandoned`` (docs/11 §3 step 4), which does two
-    things: the shard is not re-dispatched while it drains -- no second
-    container on one unit of work -- and the release is not counted against the
-    machine, because a job the operator cancelled is not an infraction of the
-    contributor's (docs/09 5.2).
+    Returns the status the task landed on -- one of three (docs/11 §3 step 4,
+    docs/13 §4.3):
+
+    - ``cancelled`` when the *job* was cancelled. The shard is not re-dispatched
+      while it drains -- no second container on one unit of work -- and the
+      release is not counted against the machine, because a job the operator
+      cancelled is not an infraction of the contributor's (docs/09 5.2).
+    - ``preempted`` when this *task* was preempted. Not an infraction either, for
+      the same reason: the machine was told to stop by the scheduler and did
+      nothing wrong. But unlike ``cancelled`` it is **not terminal** -- the work
+      is still wanted, it was interrupted rather than abandoned as an idea, so
+      the shard goes back in the pool and ``_reserve_static_task`` re-serves it
+      without burning an attempt (docs/13 §4.4).
+    - ``abandoned`` otherwise: the host is going away and this counts.
+
+    A preempted task clears ``worker_id`` and ``preempt_mode`` on the way out.
+    Leaving the marker set would preempt whichever machine picked the shard up
+    next, on the strength of a decision made about a different machine.
     """
-    status = "cancelled" if cancel_outstanding(conn, task_id) else "abandoned"
+    job_cancelled = conn.execute(
+        """SELECT 1 FROM tasks t JOIN jobs j ON j.id = t.job_id
+            WHERE t.id = ? AND j.status = 'cancelled'""",
+        (task_id,),
+    ).fetchone() is not None
+    if job_cancelled:
+        status = "cancelled"
+    elif cancel_outstanding(conn, task_id):
+        status = "preempted"
+    else:
+        status = "abandoned"
     with immediate(conn):
-        conn.execute(
-            """UPDATE tasks SET status = ?, lease_expires_at = NULL
-               WHERE id = ? AND worker_id = ? AND status = 'leased'""",
-            (status, task_id, worker_id),
-        )
+        if status == "preempted":
+            conn.execute(
+                """UPDATE tasks SET status = 'preempted', lease_expires_at = NULL,
+                                    worker_id = NULL, preempt_mode = NULL
+                   WHERE id = ? AND worker_id = ? AND status = 'leased'""",
+                (task_id, worker_id),
+            )
+        else:
+            conn.execute(
+                """UPDATE tasks SET status = ?, lease_expires_at = NULL
+                   WHERE id = ? AND worker_id = ? AND status = 'leased'""",
+                (status, task_id, worker_id),
+            )
     return status
 
 
