@@ -483,7 +483,7 @@ def test_a_preempted_task_is_not_an_infraction(conn, owner, worker):
 
     assert rounds.abandon(conn, "t1", wid) == "preempted"
     assert ledger._infraction_since(
-        conn, wid, rounds.utcnow() - timedelta(days=1)) == 0
+        conn, wid, rounds._iso(rounds.utcnow() - timedelta(days=1))) is False
 
 
 def test_a_preempted_task_goes_back_in_the_pool_and_burns_no_attempt(
@@ -554,6 +554,43 @@ def test_a_wedged_preempted_worker_expires_onto_preempted(conn, owner, worker):
     # different machine.
     assert row["preempt_mode"] is None
     assert row["worker_id"] is None
+
+
+def test_the_three_expiry_arms_partition(conn, owner, worker):
+    """Three expired leases at once, one for each arm. A single-task test cannot
+    tell "landed on preempted" from "counted twice" or "the arms overlapped",
+    and the arms are three UPDATEs over the same predicate -- exactly the shape
+    that double-counts if one of them forgets an exclusion."""
+    a, _ = owner("a")
+    _job(conn, "live", a, 10, status="running")
+    _job(conn, "dead", a, 10, status="cancelled")
+    conn.execute("UPDATE jobs SET cancel_mode = 'soft' WHERE id = 'dead'")
+    stale = dict(leased_at=_iso_ago(hours=2), ended=_iso_ago(hours=1))
+    _task(conn, "p", "live", "leased", worker_id=worker("p"), preempt="soft", **stale)
+    _task(conn, "c", "dead", "leased", worker_id=worker("c"), **stale)
+    _task(conn, "e", "live", "leased", worker_id=worker("e"), **stale)
+    conn.commit()
+
+    assert rounds.expire_leases(conn) == 3
+    got = {r["id"]: r["status"] for r in conn.execute(
+        "SELECT id, status FROM tasks").fetchall()}
+    assert got == {"p": "preempted", "c": "cancelled", "e": "expired"}
+
+
+def test_a_preempted_task_on_a_cancelled_job_expires_as_cancelled(conn, owner,
+                                                                   worker):
+    """Both markers at once, on the wedged-worker path. The job going away
+    outranks a scheduling decision about it, so this must land terminal --
+    the preempt arm has to exclude it, or a cancelled job keeps a live task."""
+    a, _ = owner("a")
+    _job(conn, "dead", a, 10, status="cancelled")
+    conn.execute("UPDATE jobs SET cancel_mode = 'hard' WHERE id = 'dead'")
+    _task(conn, "t1", "dead", "leased", leased_at=_iso_ago(hours=2),
+          ended=_iso_ago(hours=1), worker_id=worker(), preempt="soft")
+    conn.commit()
+    assert rounds.expire_leases(conn) == 1
+    assert conn.execute(
+        "SELECT status FROM tasks WHERE id = 't1'").fetchone()["status"] == "cancelled"
 
 
 def test_preempting_a_task_that_is_not_leased_says_so(client, conn, owner, admin):

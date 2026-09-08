@@ -49,6 +49,7 @@ def _close_claimed_round(
     now: datetime,
     norm_k: float,
     cap: float,
+    rep_weighted: bool = False,
 ) -> CloseResult | None:
     """The body of ``close_round``, after the close has been claimed."""
     run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
@@ -111,8 +112,23 @@ def _close_claimed_round(
     divergence: float | None = None
 
     if adapters:
+        # docs/13 §6. Off by default and off in the golden trace: this is the
+        # one Phase D switch that moves the loss rather than the schedule, so it
+        # ships behind a flag and is asked as an empirical question about a fleet
+        # whose reputations have actually diverged. Under a uniform vector -- a
+        # cohort that has all enrolled and none diverged -- it is exactly inert.
+        rep = None
+        if rep_weighted:
+            rep = [
+                float(conn.execute(
+                    "SELECT reputation FROM workers WHERE id = ?",
+                    (s["worker_id"],),
+                ).fetchone()["reputation"])
+                for s in kept
+            ]
         weights = aggregate.dense_weights(
-            [int(s["steps_completed"]) for s in kept], keys, cap=cap
+            [int(s["steps_completed"]) for s in kept], keys, cap=cap,
+            reputation=rep,
         )
         momentum = None
         if run["outer_momentum_ref"]:

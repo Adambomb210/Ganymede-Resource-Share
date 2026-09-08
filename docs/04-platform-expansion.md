@@ -298,6 +298,13 @@ vetted-allowlist level: resource caps, default-deny egress with a per-job
 allowlist, read-only mounts. gVisor / Kata deferred unless the allowlist opens
 up.
 
+**Built.** Sandboxing is `11-sandbox.md`; the allowlist's admin surface shipped
+with Phase C's C2 (`12`); the other five are `13-fairness.md`, which carries the
+formulas this line only named. Every one of the five ships **off by default** —
+`13` §0 argues the case, and its "Status — built" section records the five places
+the implementation departed from the design. The mechanism is the deliverable;
+the policy wants a fleet with contention, which this one does not yet have.
+
 **Phase E — A second job class for real.** Carry `batch_inference` end to end —
 its own `validate`, no `reduce`, shard-level credit. Then one more genuinely
 different type (dataset processing, or generic containerised batch) to confirm

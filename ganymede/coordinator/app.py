@@ -23,7 +23,8 @@ from pydantic import BaseModel, Field
 from ganymede.coordinator import budget as budget_mod
 from ganymede.coordinator import constraints as constraints_mod
 from ganymede.coordinator import eligibility
-from ganymede.coordinator import fairness, identity, images as images_mod, ledger
+from ganymede.coordinator import fairness
+from ganymede.coordinator import spotcheck, identity, images as images_mod, ledger
 from ganymede.coordinator import close, events, rounds
 from ganymede.coordinator.migrations import SYSTEM_OWNER_ID
 from ganymede.coordinator.auth import (
@@ -815,6 +816,15 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             accepted, reason = verdict.accepted, verdict.reason
             if accepted:
                 _credit_work(conn, jt, task, result_obj, worker_id)
+            # A probe is judged against the accepted answer, not against the
+            # type's own gate (docs/13 §5.3). ``validate`` asks "is this a
+            # well-formed result?"; the probe asks "is it the *same* result?",
+            # and a machine can pass the first while failing the second -- which
+            # is precisely the machine this mechanism exists to find.
+            job_row = conn.execute(
+                "SELECT * FROM jobs WHERE id = ?", (task["job_id"],)).fetchone()
+            if job_row is not None:
+                spotcheck.judge(conn, store, task_id, job_row)
             close.advance_job(conn, store, job_id=task["job_id"], settings=settings)
             round_closed = False
 
@@ -1956,6 +1966,14 @@ def _claim_static_task(conn: sqlite3.Connection, jt, store: Store,
     complete. Bounded by ``close.MAX_TASK_ATTEMPTS`` (a hard per-shard failure
     path is Phase D)."""
     now = rounds.utcnow()
+    # A known-answer probe, if the dice come up (docs/13 §5). Issued *instead
+    # of* the ordinary reserve rather than alongside it: a machine gets one
+    # task, and a probe that arrived as a second one would be distinguishable
+    # by the shape of the response, which is the one thing it must not be.
+    probe_id = spotcheck.maybe_issue(conn, job, worker_id, settings, now)
+    if probe_id is not None:
+        probe = conn.execute("SELECT * FROM tasks WHERE id = ?", (probe_id,)).fetchone()
+        return _static_task_spec(probe, settings), jt.inputs_for(probe, store)
     with immediate(conn):
         row = conn.execute(
             """SELECT * FROM tasks
@@ -1964,6 +1982,12 @@ def _claim_static_task(conn: sqlite3.Connection, jt, store: Store,
                         OR (status = 'submitted' AND EXISTS (
                               SELECT 1 FROM submissions s
                                WHERE s.task_id = tasks.id AND s.accepted = 0)) )
+                  -- A *failed* probe is a ``submitted`` row with
+                  -- ``accepted = 0``, which is exactly what this recycles. But
+                  -- its shard was accepted long ago from the source task; handing
+                  -- it out again as ordinary work would burn attempts re-doing
+                  -- finished work because one machine got it wrong.
+                  AND id NOT IN (SELECT task_id FROM spot_check_issues)
                 ORDER BY created_at, id LIMIT 1""",
             (job["id"], close.MAX_TASK_ATTEMPTS),
         ).fetchone()

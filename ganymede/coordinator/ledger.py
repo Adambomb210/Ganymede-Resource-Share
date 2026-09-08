@@ -57,6 +57,22 @@ K_GOOD = 48
 K_PROBATION = 3
 # How far back the reputation score looks for rejections / accepted work.
 REP_TRAILING_DAYS = 30
+# Reputation deltas (docs/13 §5.5). Earned slowly, lost fast -- invariant 2.
+#
+# A passed probe is worth twice a clean submission because it is *corroborated*:
+# an ordinary acceptance says the answer was well-formed, a passed probe says it
+# matched an answer already trusted.
+REP_CLEAN_STEP = 0.02
+REP_PROBE_PASS_STEP = 0.04
+# The two convictions, and the gap between them is the whole point. A failed
+# probe is compared against an already-accepted answer, so there is no question
+# which side is wrong: docs/09 §5.1 makes it the largest single penalty. A
+# minority in a redundancy disagreement is *suspected* -- N copies compared
+# against each other, and the minority is merely outvoted -- so it is a hard hit
+# and not the maximum.
+REP_PROBE_FAIL_FLOOR = 0.20
+REP_MINORITY_FLOOR = 0.15
+REP_REJECT_FLOOR = 0.10
 # The per-tick credit cap (docs/09 1.2) reuses scripts/status.py's judgment of
 # "still awake since the last poll". Kept as a literal here rather than importing
 # scripts/status.py into the coordinator package; the cross-package import would
@@ -475,6 +491,32 @@ def _trailing_outcomes(conn: sqlite3.Connection, machine_id: str,
     return int(row["rej"] or 0), int(row["acc"] or 0)
 
 
+def _minorities_since(conn: sqlite3.Connection, machine_id: str,
+                      since: str) -> int:
+    """Redundancy disagreements this machine was part of (docs/09 §5.1 input 2).
+
+    Read out of the ``attempt_group_disagreement`` audit event, which
+    ``close.py`` writes with each member's ``worker_id`` captured *before*
+    re-dispatch nulls it -- recorded at the time as "a Phase-D scorer can still
+    find the offending machine". This is that scorer.
+
+    Every member of a disagreeing group is counted, not just the minority. The
+    comparator is ``sample_agreement``, which answers "did they agree?" and not
+    "who was right"; docs/10 leaves the minority identification open, and
+    guessing here would apply a hard penalty to whichever machine happened to be
+    listed first. Penalising the whole group is the conservative reading: it is
+    the same answer redundancy already gives, where nobody in the group is
+    credited until it resolves.
+    """
+    rows = conn.execute(
+        """SELECT detail_json FROM audit
+            WHERE event = 'attempt_group_disagreement' AND at >= ?
+              AND detail_json LIKE ?""",
+        (since, f'%"worker_id": "{machine_id}"%'),
+    ).fetchall()
+    return len(rows)
+
+
 def recompute_reputation(conn: sqlite3.Connection, machine_id: str,
                          now: datetime | None = None) -> None:
     """Update one machine's ``reputation`` scalar and drive its ``standing``
@@ -482,11 +524,13 @@ def recompute_reputation(conn: sqlite3.Connection, machine_id: str,
     accepted work), lost fast (each rejection knocks it down). A cached
     rollup, recomputed on the sweep.
 
-    v0 inputs are the ``validate()`` rejection / acceptance stream only;
-    spot-checks and redundant-execution disagreement are Phase D and enter here
-    as the extra penalty terms the moment they exist.
+    All three of docs/09 §5.1's inputs are live as of docs/13 §5.5: the
+    ``validate()`` rejection / acceptance stream, spot-check outcomes, and
+    redundant-execution disagreement.
     """
     now = now or utcnow()
+    from ganymede.coordinator import spotcheck
+
     with immediate(conn):
         row = conn.execute(
             "SELECT reputation, standing FROM workers WHERE id = ?", (machine_id,)
@@ -495,33 +539,57 @@ def recompute_reputation(conn: sqlite3.Connection, machine_id: str,
             return
         score = float(row["reputation"])
         standing = row["standing"] or "good"
+        window = _iso(now - timedelta(days=REP_TRAILING_DAYS))
         rej, acc = _trailing_outcomes(conn, machine_id, now)
-        # Increment toward 1.0 on clean work; each rejection multiplies down
-        # and subtracts a floor (docs/09 5.2).
-        score = min(1.0, score + min(acc, 8) * 0.02)
+        passed, failed = spotcheck.outcomes_for(conn, machine_id, window)
+        minorities = _minorities_since(conn, machine_id, window)
+
+        # Increment toward 1.0 on clean work, faster on corroborated work.
+        score = min(1.0, score + min(acc, 8) * REP_CLEAN_STEP
+                    + min(passed, 8) * REP_PROBE_PASS_STEP)
+        # Then the convictions, worst first, so a machine with both a failed
+        # probe and a rejection lands where the failed probe puts it rather than
+        # where the order of the loops happened to leave it.
+        for _ in range(failed):
+            score = max(0.0, score * 0.5 - REP_PROBE_FAIL_FLOOR)
+        for _ in range(minorities):
+            score = max(0.0, score * 0.5 - REP_MINORITY_FLOOR)
         for _ in range(rej):
-            score = max(0.0, score * 0.5 - 0.10)
+            score = max(0.0, score * 0.5 - REP_REJECT_FLOOR)
+
         # Transitions (docs/09 5.3). ``revoked`` is terminal for accrual;
         # reinstatement is admin-only and not this module's job.
         new_standing = standing
         if standing == "revoked":
             pass
         elif standing == "good":
-            if score < REP_GOOD:
+            # A single failed probe forces probation regardless of score
+            # (docs/09 §5.3). A machine with months of clean work has enough
+            # headroom that the multiplier alone would leave it in good
+            # standing, which is exactly the machine this rule is for.
+            if score < REP_GOOD or failed or minorities:
                 new_standing = "probation"
         elif standing == "probation":
-            if score < REP_REVOKE:
+            probation_since = _iso(now - timedelta(days=PROBATION_RECOVERY_DAYS))
+            recent_fail = spotcheck.failures_since(conn, machine_id, probation_since)
+            if score < REP_REVOKE or recent_fail:
+                # A second failure while on probation is terminal (docs/09 §5.3).
                 new_standing = "revoked"
             elif score >= REP_GOOD:
-                # clean PROBATION_RECOVERY_DAYS window: no rejection in it.
-                since = _iso(now - timedelta(days=PROBATION_RECOVERY_DAYS))
+                # A clean PROBATION_RECOVERY_DAYS window: no rejection in it,
+                # and -- docs/09 §5.3 -- at least one *passed* probe. That
+                # second clause is why recovery cannot be waited out in silence:
+                # a machine that stops working stops being able to earn its way
+                # back, which is the point.
                 dirty = conn.execute(
                     """SELECT 1 FROM submissions s
                          JOIN tasks t ON t.id = s.task_id AND t.worker_id = ?
                         WHERE s.accepted = 0 AND s.received_at >= ? LIMIT 1""",
-                    (machine_id, since),
+                    (machine_id, probation_since),
                 ).fetchone()
-                if dirty is None:
+                recovered_passes, _ = spotcheck.outcomes_for(
+                    conn, machine_id, probation_since)
+                if dirty is None and recovered_passes:
                     new_standing = "good"
         conn.execute(
             "UPDATE workers SET reputation = ?, standing = ? WHERE id = ?",
@@ -535,7 +603,11 @@ def evaluate_reputation(conn: sqlite3.Connection, now: datetime | None = None) -
     now = now or utcnow()
     ids = conn.execute(
         """SELECT DISTINCT t.worker_id FROM submissions s
-           JOIN tasks t ON t.id = s.task_id WHERE t.worker_id IS NOT NULL"""
+           JOIN tasks t ON t.id = s.task_id WHERE t.worker_id IS NOT NULL
+           UNION
+           SELECT DISTINCT t.worker_id FROM spot_check_issues i
+           JOIN tasks t ON t.id = i.task_id
+          WHERE t.worker_id IS NOT NULL AND i.outcome IN ('passed', 'failed')"""
     ).fetchall()
     for r in ids:
         recompute_reputation(conn, r["worker_id"], now)

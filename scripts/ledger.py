@@ -30,7 +30,7 @@ import argparse
 import sys
 from datetime import datetime, timezone
 
-from ganymede.coordinator import fairness, identity, ledger
+from ganymede.coordinator import fairness, identity, ledger, spotcheck
 from ganymede.coordinator.db import connect
 
 
@@ -47,6 +47,9 @@ def run(db_path: str, probation_monthly_cap_hours: float, settings=None) -> dict
         settled = ledger.settle_windows(
             conn, probation_monthly_cap_hours=probation_monthly_cap_hours, now=now
         )
+        # Before reputation, not after: a probe whose task never came back must
+        # be retired before the scorer counts it as anything.
+        voided = spotcheck.void_stale(conn, now)
         evaluated = ledger.evaluate_reputation(conn, now)
         sessions_gc = identity.gc_expired_sessions(conn)
         shares = fairness.recompute_shares(conn, now)
@@ -61,6 +64,7 @@ def run(db_path: str, probation_monthly_cap_hours: float, settings=None) -> dict
         "reputations_evaluated": evaluated,
         "sessions_gc": sessions_gc,
         "shares_recomputed": len(shares),
+        "probes_voided": voided,
         "preempted": preempted,
     }
 

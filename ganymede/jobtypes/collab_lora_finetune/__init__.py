@@ -105,9 +105,13 @@ class CollabLoraFinetune:
         return validate.gate_submission(conn, store, task_id, expected, now)
 
     # -- reduce (ex-closer._close_claimed_round) --------------------------
-    def reduce_close(self, conn, store, run_id, round_idx, reason, now, norm_k, cap):
+    def reduce_close(self, conn, store, run_id, round_idx, reason, now, norm_k, cap,
+                     rep_weighted=False):
+        # ``rep_weighted`` is a defaulted keyword, which is what keeps this
+        # additive against docs/10 §3's frozen reduce signature: a type that
+        # never heard of docs/13 §6 keeps its existing call.
         return reduce._close_claimed_round(conn, store, run_id, round_idx, reason,
-                                           now, norm_k, cap)
+                                           now, norm_k, cap, rep_weighted)
 
     # -- inputs_for (docs/10 §1) ----------------------------------------
     def inputs_for(self, task, store):

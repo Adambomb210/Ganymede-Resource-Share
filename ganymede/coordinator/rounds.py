@@ -233,19 +233,25 @@ def abandon(conn: sqlite3.Connection, task_id: str, worker_id: str) -> str:
     A preempted task clears ``worker_id`` and ``preempt_mode`` on the way out.
     Leaving the marker set would preempt whichever machine picked the shard up
     next, on the strength of a decision made about a different machine.
+
+    Both reads happen **inside** the transaction. Deciding which of the three
+    this is takes two SELECTs, and ``POST /v1/jobs/{id}/cancel`` writes under
+    ``immediate()`` -- so reading outside leaves a window where a job cancel
+    lands between them and the task ends up ``preempted`` (non-terminal) on a
+    job that is now terminal. Nothing would ever clear it.
     """
-    job_cancelled = conn.execute(
-        """SELECT 1 FROM tasks t JOIN jobs j ON j.id = t.job_id
-            WHERE t.id = ? AND j.status = 'cancelled'""",
-        (task_id,),
-    ).fetchone() is not None
-    if job_cancelled:
-        status = "cancelled"
-    elif cancel_outstanding(conn, task_id):
-        status = "preempted"
-    else:
-        status = "abandoned"
     with immediate(conn):
+        job_cancelled = conn.execute(
+            """SELECT 1 FROM tasks t JOIN jobs j ON j.id = t.job_id
+                WHERE t.id = ? AND j.status = 'cancelled'""",
+            (task_id,),
+        ).fetchone() is not None
+        if job_cancelled:
+            status = "cancelled"
+        elif cancel_outstanding(conn, task_id):
+            status = "preempted"
+        else:
+            status = "abandoned"
         if status == "preempted":
             conn.execute(
                 """UPDATE tasks SET status = 'preempted', lease_expires_at = NULL,

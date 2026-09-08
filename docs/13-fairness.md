@@ -581,6 +581,73 @@ two penalties for one fault.
 
 ---
 
+---
+
+## Status — built
+
+All five slices are in, behind their defaults. The code:
+
+| Slice | Where |
+| --- | --- |
+| §1 share accounting | `coordinator/fairness.py`, migration 008, the ledger sweep |
+| §2 fair-share | `fairness.effective_rank` in `app._selectable_jobs`'s sort key |
+| §3 quotas | `fairness.quota_refusal` in the claim walk; `budget_exhausted` at enqueue |
+| §4 preemption | `tasks.preempt_mode`, `rounds.cancel_outstanding`, `POST /v1/admin/tasks/{id}/preempt`, `fairness.autopreempt` |
+| §5 spot-checks | `coordinator/spotcheck.py`, issued in `_claim_static_task`, judged on submit |
+| §5.5 reputation inputs | `ledger.recompute_reputation` — all three of `09` §5.1's inputs now live |
+| §6 weighted merge | `aggregate.dense_weights(..., reputation=)`, threaded through `reduce_close` |
+
+### Five deviations from the design above
+
+Recorded here rather than only in commit messages, because a deviation nobody
+can find is a lie in the doc.
+
+1. **A redundancy disagreement penalises the whole group, not the minority.**
+   §5.5's table says "minority", and the code cannot identify one. The
+   comparator is `sample_agreement`, which answers *did they agree* and not
+   *who was right*; `10` leaves minority identification open. Guessing would
+   apply a hard penalty to whichever machine happened to be listed first in an
+   audit event. Penalising every member is the conservative reading and it
+   matches what redundancy already does — nobody in a disagreeing group is
+   credited until it resolves. The moment a comparator can name a minority, this
+   should narrow to it.
+
+2. **Automatic preemption's constants are reasoned, not measured.** §4.6 already
+   says this; repeating it here because it is the one place "off by default" is
+   covering for something real rather than being careful. `AUTOPREEMPT_STARVE_MIN`
+   and `AUTOPREEMPT_RANK_MARGIN` want a fleet with contention.
+
+3. **No in-tree job runs a spot-check end to end.** §5 needs a deterministic
+   type, which means `batch_inference`, which has no live jobs yet — its first
+   real run is Phase E. The mechanism is unit-tested against a fixed rng and a
+   seeded store; it has never been exercised by a worker.
+
+4. **A voided probe is retired on the sweep, not at the moment its task dies.**
+   §5.3 did not say when. `spotcheck.void_stale` runs before
+   `evaluate_reputation` on the same sweep, so a probe whose machine vanished is
+   never counted as anything — but between the task expiring and the next sweep
+   the row sits at `outcome IS NULL`. Nothing reads it in that state; the
+   reputation query filters `passed` / `failed`.
+
+5. **`reduce_close` gained a defaulted keyword.** `10` §3 freezes the reduce
+   signature; `rep_weighted=False` is additive, so a type that never heard of §6
+   keeps its existing call. Called out because "frozen" and "we added a
+   parameter" want to be seen together.
+
+### What is off, and what turning it on costs
+
+- `GANYMEDE_FAIRSHARE_SPREAD=10` — one sparse rank slot of authority. Needs the
+  ledger sweep running, or every share reads zero and the queue does not move.
+- A `submitter_quotas` row — per submitter, no flag, immediate.
+- `GANYMEDE_AUTOPREEMPT=1` — see deviation 2.
+- `GANYMEDE_SPOTCHECK_RATE=0.05` — needs a deterministic type with accepted work
+  on the same job; below that it silently issues nothing, which is correct and
+  looks identical to being off.
+- `GANYMEDE_REPUTATION_WEIGHTED_AGG=1` — moves the loss. Not before a fleet whose
+  reputations have diverged, and not without re-running the golden trace.
+
+---
+
 ## Frozen here
 
 - Share is **leased task-seconds**, exponentially decayed at a 24-hour half life,

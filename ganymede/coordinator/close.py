@@ -67,6 +67,7 @@ def close_round(
     now = now or rounds.utcnow()
     norm_k = getattr(settings, "norm_reject_k", DEFAULT_NORM_REJECT_K)
     cap = getattr(settings, "dominance_cap", DEFAULT_DOMINANCE_CAP)
+    rep_weighted = bool(getattr(settings, "reputation_weighted_agg", False))
 
     # Claim the close atomically. Reading the status and then writing it in a
     # separate statement leaves a window where two callers both see 'open' and
@@ -85,7 +86,7 @@ def close_round(
 
     try:
         return resolve(_JOB_TYPE).reduce_close(
-            conn, store, run_id, round_idx, reason, now, norm_k, cap
+            conn, store, run_id, round_idx, reason, now, norm_k, cap, rep_weighted
         )
     except Exception:
         # Give the round back. Everything between claiming 'closing' and the
@@ -252,8 +253,17 @@ def _advance_parallel_job(
     if hasattr(jt, "shape_claim"):  # pragma: no cover - defensive
         return None
 
+    # Known-answer probes are excluded from both the completion gate and the
+    # ``attempt_group`` comparison below (docs/13 §5.4). A *failed* probe would
+    # otherwise wedge the job forever -- it never passes, so the job is never
+    # done -- and a passed one would join a group it was never part of. The
+    # probe's work is still real and still credited to the machine that did it;
+    # it just does not get a vote on whether the job is finished, because the
+    # shard it duplicates already cast that vote.
     tasks = conn.execute(
-        "SELECT * FROM tasks WHERE job_id = ?", (job_id,)
+        "SELECT * FROM tasks WHERE job_id = ? "
+        "AND id NOT IN (SELECT task_id FROM spot_check_issues)",
+        (job_id,),
     ).fetchall()
     if not tasks:
         return None

@@ -10,11 +10,14 @@ submissions.reject_reason, rounds.result_adapter_ref, runs.outer_momentum_ref).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import torch
 from safetensors.torch import load as _safetensors_load
 from safetensors.torch import save as _safetensors_save
+
+log = logging.getLogger("ganymede.jobtypes.collab_lora_finetune.aggregate")
 
 # Stable reject reason slugs. These are persisted to the DB and shown to
 # workers, so they must not change once shipped.
@@ -202,6 +205,7 @@ def dense_weights(
     steps: list[int],
     keys: list[str],
     cap: float | None = 2.0,
+    reputation: list[float] | None = None,
 ) -> list[dict[str, float]]:
     """Per-tensor weights for the dense (non-MoE) case: every tensor of a
     given worker gets the SAME scalar share of total steps. The per-tensor
@@ -209,12 +213,45 @@ def dense_weights(
     per-expert routed-token weights (architecture 5.4) without changing this
     function's signature or combine()'s -- it costs nothing today and saves
     an API break later.
+
+    ``reputation`` is docs/13 §6: each worker's contribution is scaled by how
+    much the coordinator trusts the machine that made it, *before* the
+    dominance cap and the renormalisation, both of which then run unchanged. The
+    cap still means what it meant -- no worker carries more than ``cap`` x the
+    median contribution -- it is just measuring a contribution that now accounts
+    for trust.
+
+    Exactly inert under a **uniform** reputation vector, which matters more than
+    it sounds: every machine enrols at ``REP_ENROLL``, so a cohort that has all
+    enrolled and none diverged has a constant vector, and a constant factor
+    cancels in the normalisation below. That is the property that makes this a
+    reweighting rather than a rescaling, and there is a test for it.
     """
-    total = sum(steps)
+    raw: list[float] = [float(x) for x in steps]
+    if reputation is not None:
+        if len(reputation) != len(steps):
+            raise ValueError(
+                f"reputation has {len(reputation)} entries for {len(steps)} workers")
+        weighted = [s * max(0.0, r) for s, r in zip(raw, reputation)]
+        # A cohort in which every machine has a reputation of 0.0 would
+        # otherwise sum to zero and take the round down with a ValueError. That
+        # is reachable -- ``recompute_reputation`` floors at 0.0 -- and killing
+        # the round is the wrong answer to it: an aggregation nobody trusts is
+        # still better than no aggregation, and the machines are already being
+        # excluded from accrual by their standing. Fall back to unweighted and
+        # say so in the log.
+        if sum(weighted) > 0:
+            raw = weighted
+        else:
+            log.warning(
+                "every worker in this cohort has reputation 0; "
+                "falling back to unweighted aggregation")
+
+    total = sum(raw)
     if total == 0:
         raise ValueError("sum(steps) == 0: no worker reported any steps")
 
-    shares = [s / total for s in steps]
+    shares = [s / total for s in raw]
     n = len(shares)
 
     # With fewer than 3 workers the cap is meaningless: with 2 workers the
