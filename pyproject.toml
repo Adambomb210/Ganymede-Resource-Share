@@ -48,6 +48,7 @@ ganymede-status = "scripts.status:main"
 ganymede-backup = "scripts.backup:main"
 ganymede-restore = "scripts.restore:main"
 ganymede-eligibility = "ganymede.coordinator.eligibility:main"
+ganymede-imagescan = "scripts.imagescan:main"
 
 [tool.setuptools.packages.find]
 include = ["ganymede*"]

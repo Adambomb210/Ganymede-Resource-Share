@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import re
 import sqlite3
 import uuid
 from datetime import timedelta
@@ -21,7 +22,7 @@ from pydantic import BaseModel, Field
 
 from ganymede.coordinator import budget as budget_mod
 from ganymede.coordinator import constraints as constraints_mod
-from ganymede.coordinator import eligibility, identity, ledger
+from ganymede.coordinator import eligibility, identity, images as images_mod, ledger
 from ganymede.coordinator import close, events, rounds
 from ganymede.coordinator.migrations import SYSTEM_OWNER_ID
 from ganymede.coordinator.auth import (
@@ -35,11 +36,16 @@ from ganymede.coordinator.auth import (
 )
 from ganymede.coordinator.config import Settings
 from ganymede.coordinator.db import connect, immediate, init_schema
-from ganymede.coordinator.store import Store, adapter_key
+from ganymede.coordinator.store import Store, adapter_key, image_key
 from ganymede.jobtypes import REGISTRY, resolve
 from ganymede.jobtypes.base import TaskSpec
 
 API_VERSION = "v1"
+
+# A ``docker save`` archive's SHA-256, with or without the ``sha256:`` prefix.
+# The coordinator never re-hashes the body (it never sees it) -- this only keeps
+# an unusable value out of the row the worker will later verify against.
+_DIGEST_RE = re.compile(r"^(sha256:)?[0-9a-f]{64}$")
 
 
 # --------------------------------------------------------------------------
@@ -117,6 +123,24 @@ class EnrollRequest(BaseModel):
 class ClaimEnrollmentRequest(BaseModel):
     enroll_token: str
     compute_profile: ComputeProfile
+
+
+class ImageUploadRequest(BaseModel):
+    """docs/11 §1.1. ``digest`` is the SHA-256 of the ``docker save`` archive --
+    the one value a worker can recompute from the bytes it pulls, unlike the OCI
+    manifest digest. The coordinator stores it and never re-hashes the body; it
+    never sees the body."""
+
+    repo_tag: str
+    digest: str
+    size_bytes: int
+
+
+class ImageScanDecisionRequest(BaseModel):
+    """Admin disposition of a scan verdict (docs/06, from docs/11)."""
+
+    disposition: str
+    note: str | None = None
 
 
 class SubmitterDecisionRequest(BaseModel):
@@ -1174,6 +1198,181 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         ).fetchall()
         return {"runs": [dict(r) for r in runs], "jobs": [dict(j) for j in jobs]}
 
+    # ---------------- image pipeline (docs/06, docs/11 §1) ----------------
+
+    def _image_for_caller(conn: sqlite3.Connection, image_id: str,
+                          user: Contributor):
+        row = conn.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
+        if row is None or (row["submitter_id"] != user.id and not user.is_admin):
+            raise HTTPException(status_code=404, detail="not found")
+        return row
+
+    def _image_view(row: sqlite3.Row) -> dict:
+        detail = row["scan_detail_json"]
+        return {
+            "image_id": row["id"],
+            "submitter_id": row["submitter_id"],
+            "digest": row["digest"],
+            "size_bytes": row["size_bytes"],
+            "object_ref": row["object_ref"],
+            "uploaded_at": row["uploaded_at"],
+            "finalized_at": row["finalized_at"],
+            "scan_status": row["scan_status"],
+            "scanned_at": row["scanned_at"],
+            "scan_detail": json.loads(detail) if detail else None,
+        }
+
+    @app.post(f"/{API_VERSION}/images/upload-url")
+    def images_upload_url(
+        body: ImageUploadRequest, conn: ConnDep,
+        user: Annotated[Contributor, Depends(require_submitter)],
+    ) -> dict:
+        """Mint the row and a presigned PUT (docs/11 §1.1). The row is not
+        worker-visible until ``/finalize``: ``finalized_at IS NULL`` is the only
+        thing between an upload in flight and one that could be scheduled."""
+        digest = body.digest.strip().lower()
+        if not _DIGEST_RE.match(digest):
+            raise HTTPException(
+                status_code=422, detail="digest must be a sha256 hex digest")
+        if body.size_bytes <= 0:
+            raise HTTPException(status_code=422, detail="size_bytes must be positive")
+        if body.size_bytes > settings.image_max_bytes:
+            raise HTTPException(
+                status_code=422,
+                detail=f"size_bytes exceeds the {settings.image_max_bytes} byte cap",
+            )
+        image_id = uuid.uuid4().hex
+        key = image_key(image_id)
+        # Bind the signature to the declared length so the store itself refuses
+        # an oversized body. finalize re-checks with a HEAD regardless -- a
+        # store that ignores the signed header must not be the only guard.
+        url, _expires = store.presign_put(key, content_length=body.size_bytes)
+        with immediate(conn):
+            conn.execute(
+                """INSERT INTO images
+                     (id, submitter_id, digest, size_bytes, object_ref,
+                      uploaded_at, scan_status, finalized_at, scanned_at,
+                      scan_detail_json)
+                   VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL)""",
+                (image_id, user.id, digest, body.size_bytes, key,
+                 rounds._iso(rounds.utcnow())),
+            )
+        return {
+            "image_id": image_id,
+            "url": url,
+            "digest_required": digest,
+            "repo_tag": body.repo_tag,
+            "max_bytes": settings.image_max_bytes,
+        }
+
+    @app.post(f"/{API_VERSION}/images/{{image_id}}/finalize")
+    def images_finalize(
+        image_id: str, conn: ConnDep,
+        user: Annotated[Contributor, Depends(require_submitter)],
+    ) -> dict:
+        """Make the row worker-visible and queue the scan (docs/11 §1.1).
+
+        The body is never read here -- the coordinator asks the store what
+        actually landed. A missing object or one above the cap is a 422 and the
+        row stays un-finalized, so the honest failure (an interrupted upload) and
+        the dishonest one (a body larger than the signature allowed) end in the
+        same place: nothing schedulable.
+        """
+        row = _image_for_caller(conn, image_id, user)
+        if row["finalized_at"] is not None:
+            raise HTTPException(status_code=409, detail="image is already finalized")
+        head = store.head(row["object_ref"])
+        if head is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"no object at {row['object_ref']}; upload it first")
+        size = int(head.get("size") or 0)
+        if size > settings.image_max_bytes:
+            raise HTTPException(
+                status_code=422,
+                detail=f"uploaded object is {size} bytes, over the "
+                       f"{settings.image_max_bytes} byte cap")
+        with immediate(conn):
+            conn.execute(
+                "UPDATE images SET finalized_at = ?, size_bytes = ?, "
+                "scan_status = 'pending', scanned_at = NULL, "
+                "scan_detail_json = NULL WHERE id = ?",
+                (rounds._iso(rounds.utcnow()), size, image_id),
+            )
+        return {"image_id": image_id, "scan_status": "pending", "size_bytes": size}
+
+    @app.get(f"/{API_VERSION}/images")
+    def images_list(
+        conn: ConnDep, user: Annotated[Contributor, Depends(require_submitter)],
+    ) -> dict:
+        """The caller's uploads (docs/06). An admin sees every submitter's."""
+        if user.is_admin:
+            rows = conn.execute(
+                "SELECT * FROM images ORDER BY uploaded_at DESC").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM images WHERE submitter_id = ? ORDER BY uploaded_at DESC",
+                (user.id,),
+            ).fetchall()
+        return {"images": [_image_view(r) for r in rows]}
+
+    @app.get(f"/{API_VERSION}/images/{{image_id}}")
+    def images_get(
+        image_id: str, conn: ConnDep,
+        user: Annotated[Contributor, Depends(require_submitter)],
+    ) -> dict:
+        return _image_view(_image_for_caller(conn, image_id, user))
+
+    @app.post(f"/{API_VERSION}/admin/images/{{image_id}}/scan")
+    def admin_image_scan(
+        image_id: str, body: ImageScanDecisionRequest, conn: ConnDep,
+        admin: Annotated[Contributor, Depends(require_admin)],
+    ) -> dict:
+        """Disposition a ``flagged`` image, or force a re-scan (docs/11 Spine
+        deviations). The human decision is recorded *beside* the machine's,
+        never over it: the scan's own findings stay in ``scan_detail_json`` under
+        ``checks``, and the disposition lands next to them with who and why."""
+        if body.disposition not in ("clean", "flagged", "rescan"):
+            raise HTTPException(
+                status_code=422,
+                detail="disposition must be 'clean', 'flagged' or 'rescan'")
+        row = conn.execute(
+            "SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="not found")
+
+        detail = json.loads(row["scan_detail_json"]) if row["scan_detail_json"] else {}
+        now = rounds._iso(rounds.utcnow())
+        if body.disposition == "rescan":
+            with immediate(conn):
+                conn.execute(
+                    "UPDATE images SET scan_status = 'pending', scanned_at = NULL, "
+                    "scan_detail_json = NULL WHERE id = ?", (image_id,))
+            status = "pending"
+        else:
+            detail["disposition"] = {
+                "status": body.disposition, "by": admin.id, "at": now,
+                "note": body.note,
+            }
+            with immediate(conn):
+                conn.execute(
+                    "UPDATE images SET scan_status = ?, scan_detail_json = ? "
+                    "WHERE id = ?",
+                    (body.disposition, json.dumps(detail), image_id))
+            status = body.disposition
+        with immediate(conn):
+            conn.execute(
+                "INSERT INTO audit (at, contributor_id, worker_id, event, detail_json) "
+                "VALUES (?, ?, NULL, 'image_scan_disposition', ?)",
+                (now, admin.id,
+                 json.dumps({"image_id": image_id, "disposition": body.disposition,
+                             "note": body.note})),
+            )
+        # A disposition changes what the queue can hand out, which is what
+        # this event means; the envelope carries job ids, not image ids.
+        events.hub.publish("queue.change")
+        return {"image_id": image_id, "scan_status": status}
+
     # ---------------- job submission & management (docs/06) ----------------
 
     def _job_for_caller(conn: sqlite3.Connection, job_id: str, user: Contributor):
@@ -1223,6 +1422,17 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         # binding lives.
         spec = dict(body.spec) if isinstance(body.spec, dict) else {}
         spec["sdk"] = {"job_type": jt.name, "version": jt.version}
+
+        # A pin the submitter does not own, or that does not exist, is a 422
+        # here rather than a job that can never be leased (docs/11 §1.2: many
+        # jobs may pin one image, but only the uploader's own).
+        if body.image_id is not None:
+            img = conn.execute(
+                "SELECT submitter_id FROM images WHERE id = ?", (body.image_id,)
+            ).fetchone()
+            if img is None or (img["submitter_id"] != user.id and not user.is_admin):
+                raise HTTPException(
+                    status_code=422, detail=f"unknown image: {body.image_id}")
 
         job_id = uuid.uuid4().hex
         now = rounds._iso(rounds.utcnow())
@@ -1440,6 +1650,18 @@ def _job_view(row: sqlite3.Row) -> dict:
     }
 
 
+def _image_schedulable(row: sqlite3.Row) -> bool:
+    """docs/11 §1.4. A built-in carries no image and is always schedulable; a
+    submitter job needs a finalized, ``clean`` image. A ``job.image_id`` that
+    resolves to no row at all is treated as not schedulable rather than as a
+    built-in -- a dangling reference is a bug, and failing closed on it costs an
+    operator one puzzled look instead of running unscanned code."""
+    if row["image_id"] is None:
+        return True
+    return (row["image_scan_status"] == "clean"
+            and row["image_finalized_at"] is not None)
+
+
 def _selectable_jobs(conn: sqlite3.Connection, pinned_job_id: str | None,
                      cached_models: list[str]) -> list[sqlite3.Row]:
     """Walk the admin-ordered queue (docs/07 §1).
@@ -1461,11 +1683,22 @@ def _selectable_jobs(conn: sqlite3.Connection, pinned_job_id: str | None,
     rows = conn.execute(
         """SELECT j.id, j.job_type, j.priority_rank, j.created_at,
                   j.constraints_json, j.image_id, j.spec_json,
-                  r.id AS run_id, r.base_model
+                  r.id AS run_id, r.base_model,
+                  i.scan_status AS image_scan_status,
+                  i.finalized_at AS image_finalized_at
            FROM jobs j
            LEFT JOIN runs r ON r.job_id = j.id
+           LEFT JOIN images i ON i.id = j.image_id
            WHERE j.status IN ('queued', 'running')"""
     ).fetchall()
+    # docs/11 §1.4: a job pinned to an image that is not ``clean`` is not
+    # selectable -- ``pending`` because the scan has not run, ``flagged``
+    # because a human has not looked. A filter, not a sort term: the sort key
+    # below is the seam a future fair-share replaces (docs/07 §4), and an
+    # unscannable image must never be merely *unlikely* to be picked.
+    # ``image_id IS NULL`` is the first-party built-in path (docs/11 §4) and
+    # passes untouched.
+    rows = [r for r in rows if _image_schedulable(r)]
     cached = set(cached_models or [])
 
     def key(row: sqlite3.Row):

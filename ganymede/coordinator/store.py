@@ -68,6 +68,13 @@ def base_adapter_key(run_id: str, round_idx: int) -> str:
     return f"runs/{run_id}/rounds/{round_idx:05d}/base.safetensors"
 
 
+def image_key(image_id: str) -> str:
+    """Key for an uploaded container image archive (docs/11 §1.1). Flat and
+    id-addressed: an ``images`` row is immutable once finalized, so a rebuild is
+    a new id and never an overwrite of these bytes."""
+    return f"images/{image_id}.tar"
+
+
 def momentum_key(run_id: str) -> str:
     """Key for the outer-momentum state (DiLoCo combine mode, 5.2)."""
     return f"runs/{run_id}/momentum.safetensors"
@@ -113,20 +120,31 @@ class Store:
 
     # -- presigning -------------------------------------------------------
 
-    def presign_put(self, key: str, expires_in: int | None = None) -> tuple[str, datetime]:
-        return self._presign("put_object", key, expires_in)
+    def presign_put(self, key: str, expires_in: int | None = None,
+                    content_length: int | None = None) -> tuple[str, datetime]:
+        """``content_length`` binds the signature to a body of exactly that many
+        bytes (docs/11 §1.1's ceiling on an image upload). It is signed, so a
+        client cannot raise it -- but a store that ignores the signed header
+        must not be the only guard, which is why finalize re-checks with a HEAD.
+        """
+        return self._presign("put_object", key, expires_in,
+                             content_length=content_length)
 
     def presign_get(self, key: str, expires_in: int | None = None) -> tuple[str, datetime]:
         return self._presign("get_object", key, expires_in)
 
     def _presign(
-        self, client_method: str, key: str, expires_in: int | None
+        self, client_method: str, key: str, expires_in: int | None,
+        content_length: int | None = None,
     ) -> tuple[str, datetime]:
         ttl = expires_in if expires_in is not None else self.cfg.presign_expiry_sec
+        params: dict[str, Any] = {"Bucket": self.cfg.bucket, "Key": key}
+        if content_length is not None:
+            params["ContentLength"] = content_length
         try:
             url = self._client.generate_presigned_url(
                 client_method,
-                Params={"Bucket": self.cfg.bucket, "Key": key},
+                Params=params,
                 ExpiresIn=ttl,
             )
         except ClientError as exc:

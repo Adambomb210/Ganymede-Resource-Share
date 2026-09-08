@@ -250,3 +250,46 @@ used exactly as frozen. The following are additive:
 - **`worker_eligibility` refusal reason** `no_container_runtime` — anticipated by `05`
   ("refusal reasons now include constraint misses"); named here so the scheduler doc
   and this one agree on the string.
+
+---
+
+## §1 status — the pipeline and the gate, built
+
+`ganymede/coordinator/images.py`, the `/v1/images/*` endpoints, and
+`ganymede-imagescan`. What landed:
+
+| §1 | State |
+|---|---|
+| `upload-url` → presigned PUT, `images` row not worker-visible | **built.** The signature is bound to the declared content length, and `finalize` re-checks with a `HEAD` — a store that ignores the signed header still cannot produce a finalized row above the cap |
+| `finalize` → `scan_status='pending'`, scan enqueued | **built.** The queue *is* the `images` table (`pending` + a `finalized_at`), not a second table that could disagree with it |
+| The four checks — manifest sanity, base provenance, secrets, entrypoint | **built**, with the decompression-bomb guard enforced while streaming |
+| A non-`clean` image cannot be scheduled (§1.4) | **built**, and asserted through the claim endpoint rather than the selector |
+| Admin disposition / re-scan | **built** (`POST /v1/admin/images/{id}/scan`), audited, and recorded *beside* the scan's own findings rather than over them |
+| Retention GC (§1.2) | **deferred.** Nothing references an image but a job, and no job outlives its rows yet. It lands with the §2 worker-side work, where the same sweep has more to do |
+
+### Two deviations, both narrower than the design
+
+**The scan runs in-process, not in a throwaway container.** §1.3 specifies a
+confined container because the scan unpacks untrusted layers. What stands in for
+it today is that *nothing is ever unpacked*: no archive path is ever joined to a
+filesystem path, every member is read through a shared byte budget, and a
+tripped budget is a `flagged` verdict rather than an exception. That makes the
+bomb guard load-bearing rather than advisory, which is why it is enforced on the
+**decompressed** side of the gzip stream — a compressed size is bounded by the
+upload cap already and tells you nothing about what comes out. The container is
+still the stronger boundary and still the target; it is a change of one call
+site, and the checks do not move with it.
+
+**The archive is read whole rather than streamed from the store.** `get_bytes`
+today, which is fine at the sizes being scanned and wrong at the 10 GiB cap. The
+scan itself takes a stream and never seeks backwards, so this is a `Store`
+change when it matters, not a scan change.
+
+### One thing worth knowing before §2
+
+**With no `GANYMEDE_VETTED_BASE_DIFF_IDS` configured, every image is flagged.**
+That is the fail-closed reading of §1.3 rather than an oversight: with no vetted
+set there is no such thing as a recognised base, and the alternative — passing
+everything until someone remembers to configure it — is the failure mode this
+check exists to prevent. The operator either lists the vetted `diff_id`s or
+dispositions by hand, and both are visible.

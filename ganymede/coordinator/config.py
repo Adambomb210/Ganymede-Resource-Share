@@ -26,6 +26,13 @@ def _env_float(name: str, default: float) -> float:
     return float(os.environ.get(name, default))
 
 
+def _env_list(name: str) -> tuple[str, ...]:
+    """Comma-separated env value -> tuple. Unset and empty both mean "none
+    configured", which for the vetted base set is fail-closed (images.py)."""
+    raw = os.environ.get(name, "")
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -135,6 +142,19 @@ class Settings:
     # Ledger (docs/09 "Constants"): the hard ceiling on provisioned hours while
     # on probation (fraud brake, not billing exactitude).
     probation_monthly_cap_hours: float = 40.0
+    # --- Image pipeline (docs/11 §1). ---
+    # Ceiling on one uploaded archive. Bound at presign time so the object
+    # store refuses an oversized body itself, and re-checked at finalize
+    # against a HEAD -- a store that ignores the signed length still cannot
+    # produce a finalized row above the cap.
+    image_max_bytes: int = 10 * 1024**3
+    # An image outlives its last referencing job by this long (§1.2 retention).
+    image_keep_days: int = 30
+    image_scan_max_layers: int = 128
+    image_scan_max_uncompressed_bytes: int = 64 * 1024**3
+    # Vetted bottom-of-stack ``diff_id``s. Empty means every image is flagged
+    # for a human -- the fail-closed default, not an oversight (images.py).
+    image_vetted_base_diff_ids: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -162,4 +182,11 @@ class Settings:
             probation_monthly_cap_hours=_env_float(
                 "GANYMEDE_PROBATION_MONTHLY_CAP_HOURS", 40.0
             ),
+            image_max_bytes=_env_int("GANYMEDE_IMAGE_MAX_BYTES", 10 * 1024**3),
+            image_keep_days=_env_int("GANYMEDE_IMAGE_KEEP_DAYS", 30),
+            image_scan_max_layers=_env_int("GANYMEDE_IMAGE_MAX_LAYERS", 128),
+            image_scan_max_uncompressed_bytes=_env_int(
+                "GANYMEDE_IMAGE_MAX_UNCOMPRESSED_BYTES", 64 * 1024**3
+            ),
+            image_vetted_base_diff_ids=_env_list("GANYMEDE_VETTED_BASE_DIFF_IDS"),
         )

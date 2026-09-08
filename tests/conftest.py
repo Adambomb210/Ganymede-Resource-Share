@@ -34,6 +34,7 @@ class FakeStore:
 
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
+        self.signed_lengths: dict[str, int | None] = {}
         self.cfg = StorageConfig(
             endpoint_url="http://storage.test:9000", bucket="ganymede",
             region="us-east-1", access_key="k", secret_key="s",
@@ -47,7 +48,12 @@ class FakeStore:
             seconds=expires_in or self.cfg.presign_expiry_sec
         )
 
-    def presign_put(self, key: str, expires_in: int | None = None):
+    def presign_put(self, key: str, expires_in: int | None = None,
+                    content_length: int | None = None):
+        # Recorded rather than enforced: the real signature binds the length
+        # (docs/11 §1.1) and a test asserts the coordinator passes it, but the
+        # store is not the guard that finalize relies on.
+        self.signed_lengths[key] = content_length
         return f"{self.cfg.endpoint_url}/{self.cfg.bucket}/{key}?sig=put", self._expiry(expires_in)
 
     def presign_get(self, key: str, expires_in: int | None = None):
