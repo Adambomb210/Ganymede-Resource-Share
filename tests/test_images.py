@@ -215,8 +215,38 @@ def test_too_many_layers_is_flagged():
     layers = [_tar_bytes({f"f{i}": b"x"}) for i in range(5)]
     result = _scan(docker_archive(layers=layers), max_layers=3)
     assert result.status == "flagged"
-    assert "exceeds the 3 layers cap" in _checks(result)["manifest_sanity"].detail.replace(
-        "layers exceeds the 3", "exceeds the 3 layers")
+    assert _checks(result)["manifest_sanity"].detail == (
+        "5 layers exceeds the 3 layer cap")
+
+
+@pytest.mark.parametrize("manifest", [
+    [{"Config": 123, "Layers": "not-a-list"}],
+    [{"Config": "cfg.json", "Layers": [{"nested": "object"}]}],
+    {"not": "even a list"},
+    [[]],
+])
+def test_hostile_manifest_types_are_a_verdict_not_a_raise(manifest):
+    """A well-formed tar carrying malformed JSON must not raise. The sweep
+    scans a batch, so an archive that breaks the scanner would otherwise take
+    every other pending image down with it -- and it is exactly the archive a
+    human should be looking at."""
+    members = {
+        "layer0/layer.tar": _tar_bytes({"app/main.py": b"x"}),
+        "cfg.json": _config(),
+        "manifest.json": json.dumps(manifest).encode(),
+    }
+    result = _scan(_tar_bytes(members))
+    assert result.status == "flagged"
+
+
+def test_a_config_that_is_not_an_object_is_a_verdict_not_a_raise():
+    members = {
+        "cfg.json": b'"a string, not an object"',
+        "manifest.json": json.dumps(
+            [{"Config": "cfg.json", "Layers": []}]).encode(),
+    }
+    result = _scan(_tar_bytes(members))
+    assert result.status == "flagged"
 
 
 def test_absolute_paths_are_reported():
@@ -327,6 +357,28 @@ def test_upload_url_rejects_a_non_digest(client, make_submitter):
     assert r.status_code == 422
 
 
+def test_the_presigned_put_carries_the_length_ceiling():
+    """The upload ceiling rides on the signature, so it has to be *in* the
+    signature. boto3 signs offline, so this needs no MinIO -- what it cannot
+    show is that a given store enforces the signed header, which is why
+    finalize re-checks with a HEAD and is the guard that actually holds."""
+    from urllib.parse import parse_qs, urlparse
+
+    from ganymede.coordinator.config import StorageConfig
+    from ganymede.coordinator.store import Store
+
+    real = Store(StorageConfig(endpoint_url="http://storage.test:9000",
+                               bucket="ganymede", region="us-east-1",
+                               access_key="k", secret_key="s"))
+    url, _ = real.presign_put(image_key("img1"), content_length=4096)
+    signed = parse_qs(urlparse(url).query)["X-Amz-SignedHeaders"][0]
+    assert "content-length" in signed
+
+    plain, _ = real.presign_put("runs/x/base.safetensors")
+    assert "content-length" not in parse_qs(
+        urlparse(plain).query)["X-Amz-SignedHeaders"][0]
+
+
 def test_upload_url_rejects_an_oversized_declaration(client, make_submitter, settings):
     _, key = make_submitter()
     r = client.post("/v1/images/upload-url", headers=_hdr(key),
@@ -334,6 +386,13 @@ def test_upload_url_rejects_an_oversized_declaration(client, make_submitter, set
                           "size_bytes": settings.image_max_bytes + 1})
     assert r.status_code == 422
     assert "cap" in r.json()["detail"]
+
+
+def test_the_coordinator_signs_the_declared_length(client, store, make_submitter):
+    _, key = make_submitter()
+    payload = docker_archive()
+    image_id = _upload(client, key, payload, store, finalize=False)
+    assert store.signed_lengths[image_key(image_id)] == len(payload)
 
 
 def test_a_row_is_not_worker_visible_until_finalize(client, conn, store, make_submitter):

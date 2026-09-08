@@ -273,6 +273,9 @@ class _Walk:
     members: int = 0
     uncompressed: int = 0
     trip: str | None = None
+    # Set by _resolve_config when the archive reads but its manifest does not
+    # hold the shape docs/11 §1.3 calls "valid Docker / OCI schema".
+    manifest_problem: str | None = None
 
 
 def _walk(stream: BinaryIO, limits: ScanLimits) -> _Walk:
@@ -404,10 +407,21 @@ def _resolve_config(walk: _Walk) -> tuple[dict | None, str, list[str]]:
         entries = _decode(manifest)
         if isinstance(entries, list) and entries and isinstance(entries[0], dict):
             first = entries[0]
+            # Field types are the author's to get wrong, and getting them
+            # wrong is a schema failure rather than something to coerce past:
+            # ``Config`` names a member, ``Layers`` names a list of members.
             cfg_name = first.get("Config")
-            cfg = _decode(walk.small_blobs.get(cfg_name, b"")) if cfg_name else None
-            layers = [str(x) for x in first.get("Layers") or []]
-            return (cfg if isinstance(cfg, dict) else None), "docker-archive", layers
+            if not isinstance(cfg_name, str):
+                walk.manifest_problem = "manifest.json Config is not a member path"
+                return None, "docker-archive", []
+            raw_layers = first.get("Layers") or []
+            if not isinstance(raw_layers, list) or not all(
+                    isinstance(x, str) for x in raw_layers):
+                walk.manifest_problem = "manifest.json Layers is not a list of paths"
+                return None, "docker-archive", []
+            cfg = _decode(walk.small_blobs.get(cfg_name, b""))
+            return (cfg if isinstance(cfg, dict) else None), "docker-archive", raw_layers
+        walk.manifest_problem = "manifest.json is not a list of image entries"
         return None, "docker-archive", []
 
     index = walk.small_blobs.get("index.json")
@@ -431,6 +445,8 @@ def _check_manifest(walk: _Walk, cfg: dict | None, fmt: str, layers: list[str],
                     limits: ScanLimits) -> Check:
     if walk.trip:
         return Check("manifest_sanity", False, walk.trip)
+    if walk.manifest_problem:
+        return Check("manifest_sanity", False, walk.manifest_problem)
     if cfg is None:
         return Check(
             "manifest_sanity", False,
@@ -445,7 +461,8 @@ def _check_manifest(walk: _Walk, cfg: dict | None, fmt: str, layers: list[str],
     layer_count = len(layers) or len(walk.layer_paths)
     if layer_count > limits.max_layers:
         return Check("manifest_sanity", False,
-                     f"{layer_count} layers exceeds the {limits.max_layers} cap")
+                     f"{layer_count} layers exceeds the {limits.max_layers} "
+                     "layer cap")
     if walk.unsafe_paths:
         return Check("manifest_sanity", False,
                      "archive contains absolute or traversing paths",
@@ -456,8 +473,9 @@ def _check_manifest(walk: _Walk, cfg: dict | None, fmt: str, layers: list[str],
 
 
 def _check_base(cfg: dict | None, limits: ScanLimits) -> Check:
-    diff_ids = ((cfg or {}).get("rootfs") or {}).get("diff_ids") or []
-    if not diff_ids:
+    rootfs = (cfg or {}).get("rootfs")
+    diff_ids = rootfs.get("diff_ids") if isinstance(rootfs, dict) else None
+    if not isinstance(diff_ids, list) or not diff_ids:
         return Check("base_provenance", False,
                      "image config carries no rootfs.diff_ids")
     bottom = str(diff_ids[0])
@@ -481,9 +499,12 @@ def _check_secrets(walk: _Walk) -> Check:
 
 
 def _check_entrypoint(cfg: dict | None) -> Check:
-    inner = (cfg or {}).get("config") or {}
+    inner = (cfg or {}).get("config")
+    inner = inner if isinstance(inner, dict) else {}
     entry = inner.get("Entrypoint") or []
     cmd = inner.get("Cmd") or []
+    entry = entry if isinstance(entry, list) else [entry]
+    cmd = cmd if isinstance(cmd, list) else [cmd]
     if not entry and not cmd:
         return Check("entrypoint", False, "neither ENTRYPOINT nor CMD is set")
     user = str(inner.get("User") or "").strip()
@@ -498,16 +519,29 @@ def _check_entrypoint(cfg: dict | None) -> Check:
 
 
 def scan_archive(stream: BinaryIO, limits: ScanLimits | None = None) -> ScanResult:
-    """Run the four §1.3 checks over one ``docker save`` archive stream."""
+    """Run the four §1.3 checks over one ``docker save`` archive stream.
+
+    Total: every path out of here is a verdict. The checks below read JSON an
+    author controls, and the sweep scans a batch -- so an unexpected raise on
+    one archive would take the other pending images down with it. An archive
+    that breaks the scanner is exactly an archive a human should look at.
+    """
     limits = limits or ScanLimits()
-    walk = _walk(stream, limits)
-    cfg, fmt, layers = _resolve_config(walk)
-    return ScanResult([
-        _check_manifest(walk, cfg, fmt, layers, limits),
-        _check_base(cfg, limits),
-        _check_secrets(walk),
-        _check_entrypoint(cfg),
-    ])
+    try:
+        walk = _walk(stream, limits)
+        cfg, fmt, layers = _resolve_config(walk)
+        return ScanResult([
+            _check_manifest(walk, cfg, fmt, layers, limits),
+            _check_base(cfg, limits),
+            _check_secrets(walk),
+            _check_entrypoint(cfg),
+        ])
+    except Exception as exc:  # noqa: BLE001 -- deliberate; see the docstring
+        return ScanResult([
+            Check("manifest_sanity", False,
+                  f"the scan could not read this archive: "
+                  f"{type(exc).__name__}: {exc}")
+        ])
 
 
 # --------------------------------------------------------------------------

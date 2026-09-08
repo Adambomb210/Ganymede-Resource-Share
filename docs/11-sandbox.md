@@ -260,7 +260,7 @@ used exactly as frozen. The following are additive:
 
 | §1 | State |
 |---|---|
-| `upload-url` → presigned PUT, `images` row not worker-visible | **built.** The signature is bound to the declared content length, and `finalize` re-checks with a `HEAD` — a store that ignores the signed header still cannot produce a finalized row above the cap |
+| `upload-url` → presigned PUT, `images` row not worker-visible | **built.** The declared length is signed into the URL (asserted on the `X-Amz-SignedHeaders` of a real signature); whether a given store *enforces* a signed content-length is not something the suite shows, so the guard that actually holds is `finalize`'s `HEAD` — which is why an oversized or missing body leaves the row un-finalized rather than schedulable |
 | `finalize` → `scan_status='pending'`, scan enqueued | **built.** The queue *is* the `images` table (`pending` + a `finalized_at`), not a second table that could disagree with it |
 | The four checks — manifest sanity, base provenance, secrets, entrypoint | **built**, with the decompression-bomb guard enforced while streaming |
 | A non-`clean` image cannot be scheduled (§1.4) | **built**, and asserted through the claim endpoint rather than the selector |
