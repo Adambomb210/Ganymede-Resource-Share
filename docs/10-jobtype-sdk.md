@@ -357,5 +357,6 @@ seven-method behaviour and its submitter-declared shard index with row counts.
 
 **Open:** image-backed third-party type loading and its coordinator-side sandbox
 (sandbox doc); the redundant-execution comparator's exact sampling and the
-probation thresholds (anti-fraud, Phase D); `InputRefs.params` exact keys per
+probation thresholds (anti-fraud — **`13-fairness.md`** §5.5, which reuses this
+type's own `sample_agreement` rather than defining a second comparator); `InputRefs.params` exact keys per
 future type; `batch_inference` decode options beyond greedy.

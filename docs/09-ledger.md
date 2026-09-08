@@ -230,7 +230,9 @@ inputs and what it drives. It is a cached rollup, recomputed on a schedule from
    until it resolves.
 3. **Spot-check outcomes** — known-answer tasks issued indistinguishably from
    real work (Phase D, invariant 2). A wrong answer is the largest single
-   penalty.
+   penalty. Designed in **`13-fairness.md`** §5: the known answer is an
+   already-accepted shard re-issued to a different machine, which is how
+   "indistinguishable" is met — it is real work.
 
 ### 5.2 Dynamics
 

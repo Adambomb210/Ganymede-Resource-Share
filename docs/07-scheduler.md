@@ -308,8 +308,10 @@ This paragraph is the whole note — named, not designed.
 
 - Probe capture of `os` and any further predicate-nameable profile fields —
   identity + sandbox docs, against `05`'s `hardware_fingerprint_json`.
-- The fair-share formula and its share-accounting table — Phase D.
-- Preemption and the task-scoped `cancel` — Phase D.
+- The fair-share formula and its share-accounting table — **`13-fairness.md`**
+  §1-§2. The seam named in §4 above is where it lands: the sort key, as a
+  term, never a filter.
+- Preemption and the task-scoped `cancel` — **`13-fairness.md`** §4.
 - `GET /v1/admin/queue` exact response body — web-UI doc.
 - How an embarrassingly-parallel type's `plan` distinguishes `IDLE` from `done` —
   job-type SDK doc.
