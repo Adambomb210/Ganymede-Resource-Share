@@ -562,8 +562,17 @@ is not. Two tests, and they check different things:
    cancels in the normalisation. `weights(steps, rep=[c]*n) == weights(steps)`
    to floating-point equality. This is the test that says the *formula* is a
    reweighting and not a rescaling.
-2. **The golden trace runs with the feature off and is byte-identical.** This is
-   the test that says the *plumbing* did not disturb the default path.
+2. **The default path is untouched with the feature off** — `reduce` passes
+   `reputation=None`, and `None` is asserted identical to not passing the
+   argument at all.
+
+   The obvious third test is the golden trace, and it cannot be written: `04`
+   ("the golden trace doesn't exist yet") records that it has never been
+   captured, because capturing it needs the M4b hardware. So the standing
+   entry criterion for turning this flag on is **capture the trace first, then
+   turn it on and re-run it** — not "the tests pass". Two unit tests about a
+   weight vector are not evidence about a loss curve, and this section would be
+   overclaiming if it implied otherwise.
 
 The interesting case — mixed reputations across a real cohort — is not something
 a unit test can validate. It changes the answer, on purpose, and whether it
@@ -644,7 +653,9 @@ can find is a lie in the doc.
   on the same job; below that it silently issues nothing, which is correct and
   looks identical to being off.
 - `GANYMEDE_REPUTATION_WEIGHTED_AGG=1` — moves the loss. Not before a fleet whose
-  reputations have diverged, and not without re-running the golden trace.
+  reputations have diverged, and not before the golden trace exists to re-run
+  (`04`: it has not been captured yet). This is the one flag with a hardware
+  prerequisite rather than just a fleet-size one.
 
 ---
 
