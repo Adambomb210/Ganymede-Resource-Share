@@ -9,8 +9,10 @@ on import here.
 combine relocated verbatim behind the ``JobType`` seam (Phase A).
 ``batch_inference`` (docs/10 §4) is the second, first-party type -- no base
 adapter, no ``reduce``, no round -- the proof the seam is not welded to LoRA.
-Both are in-tree, ``jobs.image_id`` ``NULL``, versioned by the coordinator
-release.
+``contained_batch`` (docs/10 §7) is the third, and the one that runs a body
+Ganymede did not write: ``jobs.image_id`` is **required** for it and ``NULL``
+for the other two. All three are in-tree and versioned by the coordinator
+release; what varies is whose code runs inside them.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from ganymede.jobtypes.base import (
 )
 from ganymede.jobtypes.batch_inference import BatchInference
 from ganymede.jobtypes.collab_lora_finetune import CollabLoraFinetune
+from ganymede.jobtypes.contained_batch import ContainedBatch
 
 __all__ = [
     "REGISTRY",
@@ -43,6 +46,7 @@ __all__ = [
 REGISTRY: dict[str, type] = {
     CollabLoraFinetune.name: CollabLoraFinetune,
     BatchInference.name: BatchInference,
+    ContainedBatch.name: ContainedBatch,
 }
 
 

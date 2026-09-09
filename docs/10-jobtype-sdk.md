@@ -398,6 +398,120 @@ rather than at a call site where it could be forgotten.
 
 ---
 
+## 7. `contained_batch` — the third type (Phase E)
+
+docs/04 asked for "one more genuinely different type ... to confirm the SDK
+isn't just training with two spellings." `batch_inference` was weak evidence:
+it still loads a model, still runs on a GPU, still submits an artifact to a
+presigned key. This one runs **a body Ganymede did not write**, in a container,
+with no network — and it is the first caller `sandbox.JobContainer` has ever
+had.
+
+### What generalised, and what did not
+
+**Nothing structural had to change.** `plan` / `inputs_for` / `validate` /
+`credit` are the shapes `batch_inference` already used, and `ContainedResult`
+deliberately reuses `InferResult`'s field set so the worker's existing
+`_submit_shard` carries it unchanged. The seven-method protocol did not grow a
+member and neither did the submit path. That is the actual answer to docs/04's
+question, and it is worth stating that it was *cheap*: had a third type needed
+a fourth submit path, that would have been the finding.
+
+**One thing could not be inherited: the assumption of determinism.** Two
+coordinator mechanisms compare two machines' outputs for equality —
+`attempt_group` redundancy (§4) and docs/13 §5's spot-checks. Both are claims
+about a body's reproducibility, and neither can be made about a submitter's
+image: a job that samples, threads, or stamps a timestamp is honest and
+disagrees with itself. So this type refuses both, in two places, on purpose:
+
+- `plan.validate_spec` **rejects `spec.redundancy`** at `POST /v1/jobs`, rather
+  than ignoring it at plan time. A submitter who asked for redundancy and
+  silently did not get it is owed the error.
+- `validate` attaches **no `compare_digest`**. The digest is still reported in
+  the submission's metrics, where it is a fingerprint for a human rather than
+  evidence against a machine.
+
+### The container contract
+
+Published here because an image is built against it, so these strings are an
+interface, not an implementation detail. The worker stages, the container
+computes, the worker collects — the container does no object-store I/O of its
+own (docs/11 §2.3), which is what lets `--network none` be unconditional.
+
+| Path | Direction | Contents |
+|---|---|---|
+| `/scratch/in/input.jsonl` | in | the shard's rows, one JSON object per line |
+| `/scratch/in/params.json` | in | `task_id`, `job_id`, `shard_ref`, `shard_rows`, `output_schema`, and the submitter's own opaque `params` |
+| `/scratch/out/output.jsonl` | out | **one row per input row**, conforming to `spec.output_schema`, ids unique |
+
+`GANYMEDE_SCRATCH` and `GANYMEDE_MAX_RUNTIME_SEC` are in the environment.
+**Exit 0 means success**; any other code is the job's failure, and exiting 0
+without writing `output.jsonl` is also a failure — a container that ran, said
+it succeeded, and produced nothing has not done the task.
+
+### The soft/hard kill stops being a distinction without a difference
+
+docs/11 §3 defines `soft` as SIGTERM plus a grace period to checkpoint in, and
+`hard` as SIGKILL. For every previous type the two collapsed — there was no
+container to signal and nothing to checkpoint — and docs/11 recorded that as a
+deviation. This is the submitter code the distinction was written for: `soft`
+is `docker stop --time <grace>`, `hard` is `docker kill`. The worker's
+`should_stop` asks `cancelled()` **before** `should_drop()` for the reason
+§6 gives, and here getting that order wrong would not merely lose a
+distinction — it would SIGKILL a job that had been promised a grace period.
+
+### Three failures that look alike and are not
+
+All three abandon; only one backs off; **none may re-raise**, because
+`run_round`'s last handler abandons *and re-raises*, which ends the worker.
+
+| Raised | Means | Handling |
+|---|---|---|
+| `ContainedFailure` | the submitter's code exited non-zero | abandon; bounded by `close.MAX_TASK_ATTEMPTS`, because a worker is not what should decide a submitter's code is broken |
+| `DigestMismatch` | the archive's bytes were wrong in flight | abandon, `image_digest_mismatch`, re-queue — the next worker may pull them intact, so **no** backoff |
+| `SandboxError` | *this host* could not run it (no runtime, dead daemon) | abandon **and back off**, the same shape as the `CoordinatorError` handler and for the same reason |
+
+`SandboxError` subclasses `RuntimeError`, so it must be caught before the
+generic handler. It was not, in the first version of this body: a machine whose
+Docker daemon stopped would have exited permanently and quietly — M4a's exact
+failure, arriving by a new route.
+
+### Proven against a real daemon — and what that cost
+
+`tests/test_contained_live.py` builds a real image, `docker save`s it, and puts
+it through the real `run()`: real pull, real digest check, real `docker load`,
+real container, real bind mount, real `/scratch` contract. It skips rather than
+fails where no daemon is reachable, since docs/11 §4 refuses such a machine
+submitter jobs anyway.
+
+The confinement is asserted **from inside the container**, which is the only
+place the claim means anything: `run_argv` carrying `--network none` is a string
+in a list, `wget` failing is the property. The entrypoint probes and reports its
+own environment, and the test asserts `net=blocked`, `root=ro`, `uid=1000`.
+Flipping `--network none` to `bridge` makes it fail — the container reaches
+1.1.1.1 — so the assertion is load-bearing rather than decorative.
+
+**It found a real bug on its first run, and a bad one.** `docker load` prints
+`Loaded image ID: sha256:...` only for an archive with **no repo tags**; a
+tagged archive prints `Loaded image: name:tag`. `load_image` parsed only the
+first — so it raised `SandboxError` on every archive docs/11 §1.1's upload path
+can produce, since that path takes a `docker save` payload and requires a
+`repo_tag`. The contained path could never have run a genuine submission.
+
+Worth being precise about why nothing caught it: `test_sandbox.py` covers
+`load_image` properly, but its fake runner returns the string the parser already
+expects. A fake cannot disagree with the parser about what the real tool prints,
+so that whole class of defect is invisible to it no matter how thorough the
+test is. This is the same shape as §4's finding — the `FakeWorker` that made
+`batch_inference` look green for a whole phase — arriving one layer down.
+
+The fix resolves the tag through `inspect` immediately after the load that
+re-pointed it, and still *runs* the id. The property `load_image` exists to
+protect — a submitter's archive must not choose which bytes execute — is intact:
+the tag is used once, to learn an id, never to run one.
+
+---
+
 ## Spine deviations
 
 1. **`TaskSpec` widened.** `05` lists it under "reused verbatim." This doc adds
@@ -422,6 +536,31 @@ rather than at a call site where it could be forgotten.
    taken: `10`'s seven-method table is frozen, and widening a frozen protocol on
    a sample size of one commits the shape before the second type has a vote.
    Phase E's *other* job class is what should force it, if anything does.
+5. **Spot-check eligibility became a type property, and had to.** docs/13 §5.2
+   says a type opts in to known-answer probes "by being deterministic", and
+   calls that "a property of the type, not a configuration". The implementation
+   had no gate at all: probes are issued from the static-task reserve path, and
+   `batch_inference` was the only type on it, which made *static* an accurate
+   proxy for *deterministic* by accident. `contained_batch` is static too, so
+   the proxy stopped holding — and `spotcheck.judge` reaches for
+   `batch_inference`'s comparator regardless of the job's own type, so an honest
+   machine on a non-deterministic job would have been convicted by it, with
+   docs/09 §5.1's largest single penalty. `JobType.spot_checkable` (default
+   **off**) is now read by `maybe_issue`. Gating issuance rather than making
+   `judge` polymorphic is the smaller change and it makes that hardcoded
+   comparator correct *by construction*: nothing but `batch_inference` is ever
+   judged. The tension docs/13 §5.2 did not anticipate — that a *generic*
+   containerised type's determinism is a property of the submitter's image, so
+   per-job rather than per-type — is real, and deferred: this type says no at
+   the type level, full stop.
+
+6. **`requires_image` likewise.** docs/11 §4's "first-party types carry
+   `image_id IS NULL`, submitter types always carry one" was prose describing
+   what gets submitted; `POST /v1/jobs` accepts an `image_id` on any job type
+   and enforced neither half. It is now a class attribute the worker's
+   `can_honor` reads in both directions — an in-tree type is refused *with* an
+   image, a contained type *without* one.
+
 4. **Dispatcher owns embarrassingly-parallel completion.** `05`'s `is_complete`
    takes no `conn`; a `reduce → None` type cannot answer completion itself. The
    rule lives in the generic close path. `is_complete` stays authoritative only

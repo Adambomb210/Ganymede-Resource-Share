@@ -456,6 +456,24 @@ and this is a property of the type, not a configuration — the coordinator look
 for `shape_claim` (a dynamic, per-machine-sized type is not a candidate) and for
 the type's own comparator.
 
+**Amendment (Phase E): the opt-in is explicit, `JobType.spot_checkable`,
+default off.** As first built there was no gate: probes are issued from the
+static-task reserve path and `batch_inference` was the only type on it, which
+made *static* an accurate proxy for *deterministic* by accident.
+`contained_batch` (`10` §7) is static too and runs a submitter's image, so the
+proxy stopped holding — and `judge` reaches for `batch_inference`'s comparator
+regardless of the job's own type, so an honest machine on a job that samples,
+threads or stamps a timestamp would have been convicted by it, with `09` §5.1's
+largest single penalty. Gating issuance rather than making `judge` polymorphic
+is the smaller change, and it makes that hardcoded comparator correct *by
+construction*: nothing but `batch_inference` is ever judged.
+
+One tension this section did not anticipate, recorded rather than resolved: for
+a *generic* containerised type, determinism is a property of the submitter's
+image and therefore per-**job**, not per-type. A per-job opt-in is deferred;
+`contained_batch` says no at the type level, full stop, which keeps this
+section's rule intact and costs nothing yet.
+
 ### 5.3 Issue and judge
 
 ```sql

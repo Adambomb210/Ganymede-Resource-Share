@@ -77,6 +77,9 @@ DECLINE_MEMORY = "insufficient_memory"
 DECLINE_JOBTYPE_VERSION = "job_type_version_unsupported"
 DECLINE_JOBTYPE = "job_type_unsupported"
 DECLINE_CONTAINED = "contained_execution_unsupported"
+DECLINE_IMAGE_REQUIRED = "image_required"
+DECLINE_NO_RUNTIME = "no_container_runtime"
+DECLINE_IMAGE_DIGEST = "image_digest_mismatch"
 
 # What a payload with no ``job_type`` means. Every claim has carried one since
 # docs/10 §1's dispatcher; the default is for a task row planned before it.
@@ -85,7 +88,9 @@ DEFAULT_JOB_TYPE = "collab_lora_finetune"
 # The types this build has a *worker body* for. Distinct from the coordinator's
 # REGISTRY, which is the types it can plan and validate -- a worker can be older
 # than the coordinator, and `can_honor` is where that gap is supposed to surface.
-RUNNABLE_JOB_TYPES = frozenset({"collab_lora_finetune", "batch_inference"})
+RUNNABLE_JOB_TYPES = frozenset(
+    {"collab_lora_finetune", "batch_inference", "contained_batch"}
+)
 
 
 @dataclass
@@ -232,6 +237,23 @@ class Heartbeater:
                 log.warning("heartbeat failed for %s: %s", self.task_id, exc)
 
 
+def _requires_image(job_type: str) -> bool:
+    """Does this job type run a submitter image? (docs/11 §4.)
+
+    Read off the registered class rather than kept as a set in this module, so
+    the type and the worker cannot drift: a new contained type that forgot to
+    tell the worker would otherwise be run unconfined by an in-tree body, which
+    is exactly the failure ``DECLINE_CONTAINED`` exists to prevent.
+
+    Fail-closed on an unknown type: no image. Such a type is refused a few lines
+    further down anyway, and answering "yes" here would turn that clear refusal
+    into a confusing one about images.
+    """
+    from ganymede.jobtypes import REGISTRY
+
+    return bool(getattr(REGISTRY.get(job_type), "requires_image", False))
+
+
 @dataclass
 class Worker:
     config: WorkerConfig
@@ -348,24 +370,43 @@ class Worker:
             except Exception:  # noqa: BLE001 - never let the check itself abort a claim
                 pass
 
-        # A task that names an image wants its body run *inside* that image
-        # (docs/11 §2). No body here does that: `sandbox.JobContainer` is built
-        # and unit-tested, and nothing in this loop calls it -- the contained
-        # path arrives with Phase E's second job class. Running an in-tree body
-        # for such a task would not fail, which is the problem: submitter code
-        # would run with exactly the confinement the image exists to provide,
-        # absent, and nothing would say so.
+        # docs/11 §4's split, enforced in both directions. It used to be one
+        # refusal -- *any* image was declined, because no body could run one --
+        # and `contained_batch` is the body that changed that. What did not
+        # change is why the check exists: an in-tree body handed an image would
+        # run the task to completion, successfully, with exactly the confinement
+        # the image exists to provide absent and nothing saying so.
         #
-        # Reachable rather than theoretical: `POST /v1/jobs` accepts an
-        # `image_id` on any job type, the claim walk serves such a job to any
-        # worker reporting a container runtime, and the payload's
-        # `required_image` -- the field checked above -- is unrelated and null.
-        # docs/11 §4's "every first-party type carries image_id IS NULL" is a
-        # statement about what is submitted, not something enforced.
-        if task.get("image_ref"):
+        # Reachable rather than theoretical in both directions: `POST /v1/jobs`
+        # accepts an `image_id` on any job type, and the payload's
+        # `required_image` -- the field checked above -- is a different field
+        # and unrelated. docs/11 §4's "every first-party type carries
+        # image_id IS NULL" describes what gets submitted; it enforces nothing.
+        job_type = task.get("job_type") or DEFAULT_JOB_TYPE
+        wants_image = _requires_image(job_type)
+        if task.get("image_ref") and not wants_image:
             return False, (
                 f"{DECLINE_CONTAINED}: task pins image {task['image_ref']!r} and "
-                "this build has no contained body to run it in"
+                f"{job_type!r} has no contained body to run it in"
+            )
+        if wants_image and not task.get("image_ref"):
+            # The inverse, and the more dangerous one. A contained type with no
+            # image has nothing to run; the failure without this check is not a
+            # crash but an empty output that `validate` rejects on row count --
+            # an attempt spent, and a reason that names the wrong thing.
+            return False, (
+                f"{DECLINE_IMAGE_REQUIRED}: {job_type!r} runs a submitter image "
+                "and this task names none"
+            )
+        if wants_image and not self.profile.get("container_runtime"):
+            # The coordinator refuses this at claim (`no_container_runtime`,
+            # docs/11 §4) off the profile this worker registered. Step 5 is
+            # where a *stale* profile surfaces -- a runtime that has since gone
+            # away, a rebuilt image, a daemon that stopped -- which is the case
+            # every other check here exists for.
+            return False, (
+                f"{DECLINE_NO_RUNTIME}: {job_type!r} needs a container runtime "
+                "and this machine reports none"
             )
 
         # A type this build cannot *run*. The version check above catches a
@@ -374,7 +415,6 @@ class Worker:
         # where an unrunnable payload used to become a KeyError on
         # ``base_adapter_url`` -- and, because ``run_round`` re-raises, a dead
         # worker on the first claim of the wrong type.
-        job_type = task.get("job_type") or DEFAULT_JOB_TYPE
         if job_type not in RUNNABLE_JOB_TYPES:
             return False, f"{DECLINE_JOBTYPE}: no worker body for {job_type!r}"
 
@@ -410,7 +450,10 @@ class Worker:
         have had to learn it again.
         """
         job_type = task.get("job_type") or DEFAULT_JOB_TYPE
-        body = self._run_shard if job_type == "batch_inference" else self._run_train_round
+        body = {
+            "batch_inference": self._run_shard,
+            "contained_batch": self._run_contained,
+        }.get(job_type, self._run_train_round)
 
         task_id = task["task_id"]
         beat = Heartbeater(
@@ -615,6 +658,137 @@ class Worker:
 
         if result.rows == 0:
             log.warning("task %s: no rows produced, abandoning", task_id)
+            self._abandon(task_id)
+            return None
+
+        return self._submit_shard(task_id, result, started)
+
+    def _run_contained(self, task: dict[str, Any], beat: "Heartbeater",
+                       started: float) -> dict[str, Any] | None:
+        """``contained_batch``: one shard, inside the submitter's image (docs/11 §2).
+
+        Structurally ``_run_shard`` -- same stop protocol, same "no stop ever
+        submits" rule, same ``_submit_shard``. Three things differ, and all
+        three come from the body being code Ganymede did not write:
+
+        * **The soft/hard distinction is finally real.** For a built-in the two
+          collapse to "stop and give the shard back" (docs/11 §3); here ``soft``
+          is a SIGTERM and a grace period the job can checkpoint in, and
+          ``hard`` is SIGKILL. This is the submitter code that distinction was
+          written for.
+        * **Three failures that look alike and are not.** ``ContainedFailure``
+          is the submitter's code exiting non-zero; ``SandboxError`` is this
+          host being unable to run it at all; ``DigestMismatch`` is bad bytes
+          in flight. All three abandon, and only the middle one backs off --
+          and none of them may re-raise, because ``run_round``'s last handler
+          abandons *and re-raises*, which would end the worker.
+        * **The container outlives an exception in here.** ``run`` wraps the
+          whole body in ``try/finally: job.cleanup()``, so there is nothing for
+          this method to reap -- which is why it does not try.
+        """
+        from ganymede.jobtypes import resolve
+        from ganymede.jobtypes.base import InputRefs
+        from ganymede.jobtypes.contained_batch.run import (
+            ContainedCancelled,
+            ContainedFailure,
+            ContainedTask,
+        )
+        from ganymede.worker import sandbox
+
+        task_id = task["task_id"]
+        jt = resolve("contained_batch")
+        parsed = ContainedTask.from_payload(task)
+        inputs = InputRefs(artifacts=task.get("artifacts") or {},
+                           params=task.get("params") or {})
+
+        def on_step(rows_done: int, _loss: float) -> None:
+            # Rows the container has flushed to /scratch/out so far. Liveness
+            # does not depend on this -- the Heartbeater is a thread on its own
+            # timer -- so a job that buffers reports zero without going stale.
+            beat.record(rows_done)
+
+        stopped: list[str] = []
+
+        def should_stop() -> str | None:
+            # Cancel first, for the reason `_run_shard` gives at length:
+            # ``should_drop()`` is true whenever a cancel is latched, so asking
+            # it first folds every soft cancel into hard. Here that would not
+            # merely lose a distinction -- it would SIGKILL a job that was
+            # promised a grace period to checkpoint in.
+            signal: str | None = beat.cancelled()
+            if signal:
+                pass
+            elif beat.should_drop():
+                signal = "hard"
+            elif self.control.should_stop() or self.control.should_pause():
+                signal = "hard"
+            if signal:
+                stopped.append(signal)
+            return signal
+
+        # Order matters: every one of these is a ``RuntimeError`` subclass, and
+        # ``SandboxError`` in particular *must* be caught before the bare
+        # handler below. Uncaught it reaches ``run_round``'s ``except
+        # Exception``, which abandons and **re-raises** -- so a stopped Docker
+        # daemon or one bad archive would take the worker down permanently.
+        # That is precisely the failure M4a's handlers were written to prevent,
+        # arriving by a new route.
+        try:
+            result = jt.run(parsed, inputs, on_step, should_stop)
+        except ContainedCancelled:
+            # A stop we asked for. The ``stopped`` block below decides what it
+            # means for the lease.
+            result = None
+        except ContainedFailure as exc:
+            # The image ran and exited non-zero: the submitter's code is wrong,
+            # not this machine. Abandoning re-queues the shard, which for a
+            # broken image burns one host after another on the same crash --
+            # bounded by ``close.MAX_TASK_ATTEMPTS``, because a worker is not
+            # the thing that should be deciding a submitter's code is broken.
+            log.error("task %s: %s -- abandoning", task_id, exc)
+            self._abandon(task_id)
+            return None
+        except sandbox.DigestMismatch as exc:
+            # docs/11 §2.3: abandon, reason ``image_digest_mismatch``, re-queue.
+            # Not a verdict on the job and not on this host -- the bytes in
+            # flight were wrong and the next worker may pull them intact -- so
+            # this one does *not* back off.
+            log.error("task %s: %s -- abandoning, %s",
+                      task_id, exc, DECLINE_IMAGE_DIGEST)
+            self._abandon(task_id)
+            return None
+        except sandbox.SandboxError as exc:
+            # This machine could not run it: no runtime, a daemon that went
+            # away, a scratch dir it cannot write. Same shape as the
+            # ``CoordinatorError`` handler in ``run_round`` and for the same
+            # reason -- claiming again immediately would take a fresh lease and
+            # fail at the same place, burning a contributor's machine for as
+            # long as the condition lasts.
+            log.error("task %s: %s -- abandoning and backing off", task_id, exc)
+            self._abandon(task_id)
+            self._idle(IDLE_SLEEP_SEC)
+            return None
+        except RuntimeError:
+            if not stopped:
+                raise
+            result = None
+
+        if stopped:
+            rows = getattr(result, "rows", 0)
+            if beat.cancelled():
+                log.info("task %s: %s cancel, abandoning after %d row(s)",
+                         task_id, beat.cancelled(), rows)
+                self._abandon(task_id)
+                return None
+            if beat.should_drop():
+                log.info("task %s: work dropped after %d row(s)", task_id, rows)
+                return None
+            log.info("task %s: stopping, abandoning after %d row(s)", task_id, rows)
+            self._abandon(task_id)
+            return None
+
+        if result.rows == 0:
+            log.warning("task %s: container produced no rows, abandoning", task_id)
             self._abandon(task_id)
             return None
 

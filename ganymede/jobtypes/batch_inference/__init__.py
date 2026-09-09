@@ -35,6 +35,16 @@ class BatchInference:
     name = "batch_inference"
     version = 1
 
+    # docs/13 §5.2: the type opts in to known-answer probes by being
+    # deterministic, and this one is -- a redundancy job must decode greedily
+    # (``plan.validate_spec``). It is the only type that opts in, which is what
+    # makes ``spotcheck.judge`` reaching for *this* type's comparator correct
+    # rather than an accident of it having been the only static type.
+    spot_checkable = True
+    # First-party and in-tree: ``jobs.image_id`` is NULL and there is no
+    # contained body to run one in (docs/11 §4).
+    requires_image = False
+
     # -- spec validation (docs/06 "POST /v1/jobs") ------------------------
     def validate_spec(self, spec) -> None:
         plan.validate_spec(spec)

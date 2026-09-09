@@ -14,6 +14,7 @@ import threading
 import pytest
 
 from ganymede.worker import loop as loop_mod
+from ganymede.worker import sandbox as sandbox_mod
 from ganymede.worker.client import CoordinatorError, LeaseLost, RoundClosed
 from ganymede.worker.control import ControlFiles
 from ganymede.worker.loop import Heartbeater, Worker, WorkerConfig
@@ -935,6 +936,192 @@ def test_a_task_that_pins_an_image_is_declined_by_either_body(tmp_path):
         assert not honored
         assert loop_mod.DECLINE_CONTAINED in reason
         assert "img1" in reason
+
+
+# --------------------------------------------------------------------------
+# contained_batch (docs/10 §7, docs/11 §4)
+# --------------------------------------------------------------------------
+
+CONTAINED_TASK = {
+    **{k: v for k, v in TASK.items() if k not in ("base_adapter_url",)},
+    "task_id": "c1",
+    "job_type": "contained_batch",
+    "run_id": None,
+    "round_idx": None,
+    "image_ref": "img1",
+    "image_digest": "sha256:" + "ab" * 32,
+    "image_pull_url": "http://store/img1",
+    "artifacts": {"shard": "http://store/shard"},
+    "params": {"shard_ref": "in/0", "shard_rows": 2,
+               "output_key": "out/j1/c1.jsonl", "output_schema": {"id": "str"},
+               "output_put_url": "http://store/put", "params": {}},
+}
+
+
+def test_a_contained_task_is_honored_when_the_machine_has_a_runtime(tmp_path):
+    worker = make_worker(tmp_path)
+    worker.profile["container_runtime"] = "docker"
+    assert worker.can_honor(CONTAINED_TASK) == (True, None)
+
+
+def test_a_contained_task_without_an_image_is_declined(tmp_path):
+    """The inverse of the refusal below, and the more dangerous direction. A
+    contained type with no image has nothing to run, and the failure without
+    this check is not a crash but an empty output that ``validate`` rejects on
+    row count -- an attempt spent, and a reason naming the wrong thing."""
+    worker = make_worker(tmp_path)
+    worker.profile["container_runtime"] = "docker"
+    honored, reason = worker.can_honor({**CONTAINED_TASK, "image_ref": None})
+    assert not honored
+    assert loop_mod.DECLINE_IMAGE_REQUIRED in reason
+
+
+def test_a_contained_task_is_declined_by_a_machine_with_no_runtime(tmp_path):
+    """The coordinator refuses this at claim off the profile this worker
+    registered (docs/11 §4). Step 5 is where a *stale* profile surfaces -- a
+    daemon that stopped since registration -- which is the case every other
+    check here exists for."""
+    worker = make_worker(tmp_path)
+    worker.profile["container_runtime"] = None
+    honored, reason = worker.can_honor(CONTAINED_TASK)
+    assert not honored
+    assert loop_mod.DECLINE_NO_RUNTIME in reason
+
+
+def test_an_in_tree_type_still_refuses_an_image(tmp_path):
+    """docs/11 §4's other direction, which ``contained_batch`` must not have
+    loosened. ``POST /v1/jobs`` accepts an ``image_id`` on any job type, and an
+    in-tree body handed one would run the task to completion, successfully,
+    with exactly the confinement the image exists to provide absent."""
+    worker = make_worker(tmp_path)
+    worker.profile["container_runtime"] = "docker"
+    for task in (BATCH_TASK, TASK):
+        honored, reason = worker.can_honor({**task, "image_ref": "img1"})
+        assert not honored
+        assert loop_mod.DECLINE_CONTAINED in reason
+
+
+@pytest.fixture
+def stub_contained(monkeypatch):
+    """Replaces ``contained_batch``'s ``run``; the loop's decisions are what is
+    under test here, and the body itself is covered in test_contained_batch."""
+    from ganymede.jobtypes.contained_batch import run as cb_run
+
+    class Result:
+        def __init__(self, rows=2):
+            self.rows = rows
+            self.digest = "d" * 64
+            self.output_ref = "out/j1/c1.jsonl"
+            self.seconds = 1.0
+            self.exit_code = 0
+            self.metrics = {"rows": rows}
+
+    state = {"result": Result(), "raises": None, "signals": []}
+
+    def fake_run(task, inputs, on_step=None, should_stop=None, **kw):
+        if should_stop is not None:
+            sig = should_stop()
+            if sig:
+                state["signals"].append(sig)
+                raise cb_run.ContainedCancelled(sig)
+        if state["raises"] is not None:
+            raise state["raises"]
+        if on_step:
+            on_step(state["result"].rows, 0.0)
+        return state["result"]
+
+    monkeypatch.setattr(cb_run, "run", fake_run)
+    return state
+
+
+def _contained_worker(tmp_path, client, **kw):
+    worker = make_worker(tmp_path, client=client, once=True, **kw)
+    worker.profile["container_runtime"] = "docker"
+    monkey_idle(worker)
+    return worker
+
+
+def test_a_contained_shard_is_submitted_through_the_same_path_as_a_batch_one(
+    tmp_path, stub_contained
+):
+    """``ContainedResult`` reuses ``InferResult``'s field set so ``_submit_shard``
+    carries it unchanged -- the cheapest real evidence the seam generalises. If
+    a third type had needed a fourth submit path, that would have been the
+    finding."""
+    client = StubClient(tasks=[CONTAINED_TASK])
+    worker = _contained_worker(tmp_path, client)
+    assert worker.run() == 0
+
+    assert [c[0] for c in client.calls] == [
+        "register", "claim", "upload_url", "submit"]
+    submit = [c for c in client.calls if c[0] == "submit"][0]
+    assert submit[1] == "c1" and submit[2] == 2
+    # The key is the coordinator's derivation, never params["output_key"].
+    assert submit[3]["digest"] == "d" * 64
+    assert not any(c[0] == "upload" for c in client.calls), "uploaded twice"
+
+
+@pytest.mark.parametrize("mode", ["soft", "hard"])
+def test_a_cancelled_contained_task_abandons_and_never_submits(
+    tmp_path, stub_contained, monkeypatch, mode
+):
+    """And the mode reaches the type unchanged. For every previous type soft and
+    hard collapsed (docs/11 §3); folding them here would SIGKILL a job that was
+    promised a grace period to checkpoint in."""
+    client = StubClient(tasks=[CONTAINED_TASK])
+    worker = _contained_worker(tmp_path, client)
+    _latch(monkeypatch, cancel_mode=mode)
+
+    assert worker.run() == 0
+    assert stub_contained["signals"] == [mode]
+    assert ("abandon", "c1") in client.calls
+    assert not any(c[0] == "submit" for c in client.calls)
+
+
+def test_a_broken_image_abandons_the_task_and_keeps_the_worker(
+    tmp_path, stub_contained
+):
+    """The submitter's code exited non-zero. That is a verdict on the job, not
+    on this machine, and it must not end the worker."""
+    from ganymede.jobtypes.contained_batch.run import ContainedFailure
+
+    client = StubClient(tasks=[CONTAINED_TASK])
+    worker = _contained_worker(tmp_path, client)
+    stub_contained["raises"] = ContainedFailure(3)
+
+    assert worker.run() == 0
+    assert ("abandon", "c1") in client.calls
+    assert not any(c[0] == "submit" for c in client.calls)
+
+
+def test_a_dead_docker_daemon_does_not_kill_the_worker(tmp_path, stub_contained):
+    """``SandboxError`` is a ``RuntimeError`` subclass, so without an explicit
+    handler it reaches ``run_round``'s ``except Exception`` -- which abandons
+    **and re-raises**. A machine whose daemon stopped would exit permanently and
+    quietly, which is exactly the M4a failure the handlers were written to
+    prevent, arriving by a new route."""
+    client = StubClient(tasks=[CONTAINED_TASK])
+    worker = _contained_worker(tmp_path, client)
+    stub_contained["raises"] = sandbox_mod.SandboxError("daemon is not running")
+
+    assert worker.run() == 0
+    assert ("abandon", "c1") in client.calls
+
+
+def test_a_bad_archive_abandons_without_backing_off(tmp_path, stub_contained):
+    """docs/11 §2.3: abandon, reason ``image_digest_mismatch``, re-queue. Not a
+    verdict on the job and not on this host -- the bytes in flight were wrong
+    and the next worker may pull them intact -- so unlike a dead daemon this one
+    does not back off."""
+    client = StubClient(tasks=[CONTAINED_TASK])
+    worker = _contained_worker(tmp_path, client)
+    idled = []
+    worker._idle = lambda s=0: idled.append(s)
+    stub_contained["raises"] = sandbox_mod.DigestMismatch("archive hashed x")
+
+    assert worker.run() == 0
+    assert ("abandon", "c1") in client.calls
+    assert idled == [], "a bad archive is not a reason to stop claiming"
 
 
 def test_a_payload_with_no_job_type_is_still_trained(tmp_path, stub_trainer):

@@ -148,6 +148,9 @@ def detect_runtime(runner=None, runtime_bin: str | None = None) -> str | None:
 
 
 _LOADED_ID = re.compile(r"sha256:[0-9a-f]{64}")
+# `Loaded image: name:tag` -- what a *tagged* archive reports, which is every
+# archive docs/11 §1.1's upload path can produce.
+_LOADED_TAG = re.compile(r"Loaded image:\s*(\S+)")
 
 
 @dataclass
@@ -215,6 +218,23 @@ class JobContainer:
         which can collide with an image already on the machine -- running by tag
         would let a submitter's archive decide which bytes execute. The id is
         content-addressed and cannot.
+
+        **``docker load`` prints one of two things**, and which one depends on
+        the archive rather than on us:
+
+        * ``Loaded image ID: sha256:...`` -- an archive with no repo tags;
+        * ``Loaded image: name:tag``      -- an archive that has them.
+
+        Only the first was handled, which meant this raised on every archive a
+        submitter could realistically produce: docs/11 §1.1 takes a
+        ``docker save`` payload and ``upload-url`` requires a ``repo_tag``, so
+        real archives are always the tagged kind. Found the first time this ran
+        against a real daemon; no test with an injectable runner could see it,
+        because the fake returned the output the parser already expected.
+
+        Resolving the tag through ``inspect`` keeps the property intact. The
+        tag is used once, immediately after the load that just re-pointed it at
+        these bytes, and only to *learn* the id; what is run is still the id.
         """
         result = self._run(
             [self.config.runtime_bin, "load", "-i", str(archive)],
@@ -222,13 +242,34 @@ class JobContainer:
         )
         if result.returncode != 0:
             raise SandboxError(f"image load failed: {result.stderr.strip()}")
-        match = _LOADED_ID.search(result.stdout or "")
-        if match is None:
+        stdout = result.stdout or ""
+
+        match = _LOADED_ID.search(stdout)
+        if match is not None:
+            self.image_id = match.group(0)
+            return self.image_id
+
+        tag_match = _LOADED_TAG.search(stdout)
+        if tag_match is None:
             raise SandboxError(
-                f"image load reported no image id: {(result.stdout or '').strip()}"
+                f"image load reported no image id: {stdout.strip()}"
             )
-        self.image_id = match.group(0)
+        self.image_id = self._resolve_tag(tag_match.group(1).strip())
         return self.image_id
+
+    def _resolve_tag(self, tag: str) -> str:
+        """The id the tag points at, right after the load that set it."""
+        result = self._run(
+            [self.config.runtime_bin, "inspect", "--format", "{{.Id}}", tag],
+            timeout=RUNTIME_TIMEOUT_SEC,
+        )
+        digest = (result.stdout or "").strip()
+        if result.returncode != 0 or not _LOADED_ID.fullmatch(digest):
+            raise SandboxError(
+                f"loaded image {tag!r} but could not resolve it to an id: "
+                f"{(result.stderr or result.stdout or '').strip()}"
+            )
+        return digest
 
     # -- run (§2.2, §2.3, §2.4) -------------------------------------------
 

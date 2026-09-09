@@ -44,12 +44,41 @@ def make_submitter(conn, make_contributor):
 # --------------------------------------------------------------------------
 
 
-def test_registry_holds_both_first_party_types():
-    assert set(REGISTRY) == {"collab_lora_finetune", "batch_inference"}
+def test_registry_holds_the_first_party_types():
+    assert set(REGISTRY) == {"collab_lora_finetune", "batch_inference",
+                             "contained_batch"}
     for name, cls in REGISTRY.items():
         inst = cls()
         assert inst.name == name
         assert isinstance(inst.version, int) and inst.version >= 1
+
+
+def test_every_type_answers_the_two_questions_that_gate_it():
+    """``spot_checkable`` and ``requires_image`` are read off the class by code
+    that is not the type -- ``spotcheck.maybe_issue`` and ``Worker.can_honor``
+    -- and both fail closed on a missing attribute. Fail-closed is right, and
+    it also means a type that simply forgot to answer looks identical to one
+    that answered "no". Asserted explicitly so the forgetting is visible."""
+    for name, cls in REGISTRY.items():
+        assert isinstance(getattr(cls, "spot_checkable", None), bool), name
+        assert isinstance(getattr(cls, "requires_image", None), bool), name
+
+
+def test_only_a_deterministic_type_opts_in_to_spot_checks():
+    """docs/13 §5.2. A probe compares one answer against an already-accepted
+    one and docs/09 §5.1 rates a failure the largest single penalty in the
+    system, so the set that opts in is worth pinning: training is stochastic,
+    and a submitter's image is not something the coordinator can make any
+    determinism claim about at all."""
+    opted_in = {n for n, c in REGISTRY.items() if c.spot_checkable}
+    assert opted_in == {"batch_inference"}
+
+
+def test_only_the_contained_type_requires_an_image():
+    """docs/11 §4's split. The other direction matters as much: a first-party
+    type must *not* require one, because there is no confined body to run it
+    in and an in-tree body would run submitter code unconfined."""
+    assert {n for n, c in REGISTRY.items() if c.requires_image} == {"contained_batch"}
 
 
 def test_resolve_returns_a_fresh_instance_each_call():

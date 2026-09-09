@@ -337,23 +337,88 @@ only for submitter code, which gets a SIGTERM and a grace period to checkpoint.
 Worth stating because someone will otherwise expect `hard` to SIGKILL a training
 worker mid-step.
 
-### What has no consumer yet
+### The consumer arrived: `contained_batch`
 
-No in-tree job type takes the §2 path: `collab_lora_finetune` and the
-first-party `batch_inference` both carry `image_id IS NULL`. So the confinement
-machinery is built and unit-tested against an injectable runner, and the first
-end-to-end contained job arrives with Phase E's second job class. The pieces
-that *are* live today are the ones on the built-in path — the cancel transport,
-the `cancelled` task status, and the claim gate.
+`ganymede/jobtypes/contained_batch/` (docs/10 §7) is the first caller
+`JobContainer` has ever had. It stages `/scratch/in` from a presigned GET, pulls
+and **hashes** the archive before `docker load`, starts the container detached,
+supervises it, and reads `/scratch/out` back. The worker dispatches it as a
+third body beside the two in-tree ones, and it reuses the existing submit path
+unchanged.
 
-**And the worker now refuses one, rather than running it unconfined.** §4's
-"every first-party type carries `image_id IS NULL`" is a statement about what
-gets submitted, not something enforced: `POST /v1/jobs` accepts an `image_id` on
-any job type, and the claim walk serves such a job to any worker reporting a
-container runtime. Neither worker body reads `image_ref` — so an in-tree body
-would have run that job to completion, successfully, with exactly the
-confinement the image exists to provide absent and nothing saying so. Phase E
-made that reachable in practice by giving `batch_inference` a body at all, so
-`can_honor` now declines a task that names an image
-(`contained_execution_unsupported`), at step 5 where the reason is reported.
-The refusal comes out the moment a real contained body lands.
+Three things this doc had specified and nothing had exercised are now live:
+
+- **The soft/hard distinction is real.** Below, this doc records that the two
+  collapse for first-party built-ins because there is no container to signal.
+  That deviation now has an exception: `soft` is `stop --time <grace>` and
+  `hard` is `kill`, and the worker asks `cancelled()` before `should_drop()`
+  precisely so a soft cancel is not silently promoted — which here would
+  SIGKILL a job promised a grace period to checkpoint in.
+- **§2.3's digest-before-load ordering**, on a real path rather than a unit
+  test: an archive that fails its check is never parsed by anything, and the
+  image is run by id — which is where the `docker load` output bug below
+  surfaced, since getting an id out of a *tagged* archive turned out not to
+  work at all.
+- **§4's split, enforced rather than described.** See below.
+
+**Now exercised against a real daemon.** `tests/test_contained_live.py` builds
+an image, `docker save`s it, and runs it through the real path — pull, digest
+check, `docker load`, container, bind mount, `/scratch` contract. It skips where
+no daemon is reachable, since §4 refuses such a machine submitter jobs anyway.
+
+§2.2–§2.4 are asserted **from inside the container**, which is the only place
+they mean anything: the entrypoint probes its own environment and the test reads
+`net=blocked`, `root=ro`, `uid=1000` back out of the output. Flipping
+`--network none` to `bridge` makes that fail, so it is a real check.
+
+**And it found a real bug immediately.** `docker load` prints
+`Loaded image ID: sha256:...` only for an untagged archive; a tagged one prints
+`Loaded image: name:tag`. `load_image` parsed only the first, so it raised on
+every archive §1.1's upload path can produce — that path takes a `docker save`
+payload and requires a `repo_tag`. No test with an injectable runner could see
+it: a fake returns the string the parser expects, so a parser that is wrong
+about the real tool's output looks correct forever. `load_image` now handles
+both forms, resolving a tag through `inspect` immediately after the load that
+set it — and still runs the **id**, so the property that a submitter's archive
+must not choose which bytes execute is unchanged.
+
+**A daemon that is merely stopped silently shrinks the suite.** Worth knowing
+because it is invisible: `test_store.py`'s MinIO fixture and
+`test_worker_concurrency.py`'s whole M4a fleet are gated on `docker info`
+succeeding, so a dev box with Docker Desktop installed but not running reports
+**20 skipped** and a green suite. Starting it takes the same tree to 896 passed,
+0 skipped. Two consequences: read the skip count, not just the pass count; and
+run only one pytest process at a time, because `test_store.py` starts *and
+removes* a shared, named container (`ganymede-test-minio`) and a second run will
+pull the store out from under the first. The symptom of getting that wrong is a
+`WinError 10061` against `storage-test.local:9410` and a fleet that closes one
+round instead of two — which is the storage-blip handler working, not failing.
+
+What is still unproven is narrower: this ran on Docker Desktop's Linux engine on
+Windows. `--storage-opt size=` is still off by default (§2.2), the socket proxy
+of §2.1 is still not deployed, and no GPU was requested — the live test passes
+`gpus=None`, because asking for one would make it fail on any box without the
+container toolkit rather than testing anything about confinement.
+
+**And §4 is now enforced in both directions, rather than described.** "Every
+first-party type carries `image_id IS NULL`" was a statement about what gets
+submitted: `POST /v1/jobs` accepts an `image_id` on any job type, and the claim
+walk serves such a job to any worker reporting a container runtime. No in-tree
+body reads `image_ref`, so one would have run that job to completion,
+successfully, with exactly the confinement the image exists to provide absent
+and nothing saying so.
+
+`JobType.requires_image` is now the fact, and `can_honor` reads it three ways:
+
+| Case | Refusal |
+|---|---|
+| an in-tree type handed an image | `contained_execution_unsupported` |
+| a contained type with no image | `image_required` |
+| a contained type on a machine reporting no runtime | `no_container_runtime` |
+
+The third is belt-and-braces — the coordinator refuses it at claim off the
+registered profile — but step 5 is where a *stale* profile surfaces, which is
+what every other check there exists for. The middle one is the dangerous
+direction: its failure without the check is not a crash but an empty output that
+`validate` rejects on row count, spending an attempt and naming the wrong
+thing.

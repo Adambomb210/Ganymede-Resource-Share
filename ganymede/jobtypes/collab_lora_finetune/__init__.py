@@ -33,6 +33,13 @@ class CollabLoraFinetune:
     name = "collab_lora_finetune"
     version = 1
 
+    # Training is stochastic: two honest machines produce different adapters,
+    # which is why docs/05 gates on a norm and a divergence metric rather than
+    # equality. A known-answer probe has no meaning here (docs/13 §5.2).
+    spot_checkable = False
+    # First-party and in-tree (docs/11 §4).
+    requires_image = False
+
     # -- spec validation (docs/06 "POST /v1/jobs": the job type validates spec) --
     def validate_spec(self, spec) -> None:
         """Shape-check a ``POST /v1/jobs`` body's ``spec``. Raises ``ValueError``.

@@ -133,6 +133,48 @@ class _Settings:
 # ==========================================================================
 
 
+def test_a_type_that_does_not_opt_in_is_never_probed(conn, store, owner, job, worker):
+    """docs/13 §5.2, and the hole ``contained_batch`` opened.
+
+    Probes are issued from the static-task reserve path, and until a third type
+    existed ``batch_inference`` was the only type on it -- which made "static"
+    an accurate proxy for "deterministic" *by accident*. ``contained_batch`` is
+    static too and runs an image the coordinator did not build, so the proxy
+    stopped holding: an honest machine on a job that samples, threads or stamps
+    a timestamp would have been convicted, and ``judge`` would have reached that
+    verdict through ``batch_inference``'s comparator regardless of the job's own
+    type. docs/09 §5.1 rates a failed probe the largest single penalty there is.
+
+    Gating issuance rather than making ``judge`` polymorphic is the smaller fix,
+    and it makes that hardcoded comparator correct *by construction*: nothing
+    but ``batch_inference`` is ever judged.
+    """
+    conn.execute(
+        """INSERT INTO jobs (id, owner_id, job_type, spec_json, status,
+                             priority_rank, constraints_json, created_at)
+           VALUES ('j2', ?, 'contained_batch', '{}', 'running', 10, '{}', ?)""",
+        (owner, rounds._iso(rounds.utcnow())),
+    )
+    conn.commit()
+    contained = conn.execute("SELECT * FROM jobs WHERE id = 'j2'").fetchone()
+
+    # A source exists and the rate is 1.0, so the *only* thing that can stop a
+    # probe here is the type gate. (``job`` builds the j1 row ``_accepted_task``
+    # hangs its task off; the update below moves it to the contained job.)
+    _accepted_task(conn, store, "t-src", worker("src"), ROWS)
+    conn.execute("UPDATE tasks SET job_id = 'j2' WHERE id = 't-src'")
+    conn.commit()
+
+    assert spotcheck.maybe_issue(conn, contained, worker("probe"), _Settings()) is None
+
+
+def test_the_deterministic_type_still_is_probed(conn, store, job, worker):
+    """The other half: the gate must not have turned the feature off. This is
+    the same call as above against the type that opts in."""
+    _accepted_task(conn, store, "t-src", worker("src"), ROWS)
+    assert spotcheck.maybe_issue(conn, job, worker("probe"), _Settings()) is not None
+
+
 def test_the_default_rate_never_issues_a_probe(conn, store, job, worker):
     """Off is off. ``spotcheck_rate`` defaults to 0.0 and the roll is skipped
     entirely rather than rolled against zero."""

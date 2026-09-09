@@ -17,11 +17,15 @@ rates it a hard hit rather than the maximum. A probe compares one new answer
 against one **already-accepted** one. There is no question about which side is
 wrong, and that asymmetry is why a failure is the largest single penalty.
 
-Only deterministic types. "Known answer" is meaningless for
+Only deterministic types, and they opt in explicitly via
+``JobType.spot_checkable`` (default off). "Known answer" is meaningless for
 ``collab_lora_finetune``: training is stochastic, two honest machines produce
 different adapters, and that is the entire reason docs/05 has a norm gate and a
-divergence metric instead of an equality check. A type opts in by being
-deterministic -- today that is ``batch_inference``, which decodes greedily.
+divergence metric instead of an equality check. It is equally meaningless for
+``contained_batch``, whose body is an image the coordinator did not build.
+Today the only type that opts in is ``batch_inference``, which decodes greedily
+-- which is what makes ``judge``'s use of that type's comparator correct rather
+than merely convenient.
 
 Off unless ``settings.spotcheck_rate``, which defaults to 0.0.
 """
@@ -53,6 +57,33 @@ def is_probe(conn: sqlite3.Connection, task_id: str) -> bool:
     return conn.execute(
         "SELECT 1 FROM spot_check_issues WHERE task_id = ?", (task_id,)
     ).fetchone() is not None
+
+
+def _spot_checkable(job_type: str) -> bool:
+    """Does this type opt in to known-answer probes? (docs/13 §5.2.)
+
+    Fail-closed: a type that says nothing is not probed. The polarity matters
+    because of what a probe costs when it is wrong -- docs/09 §5.1 rates a
+    failed one the largest single penalty in the system, so the safe default
+    for an unknown type is to leave it alone.
+
+    Until ``contained_batch`` there was no gate here at all, and none was
+    needed: probes are issued from the static-task reserve path, and
+    ``batch_inference`` was the only type on it. That made "static" an accurate
+    proxy for "deterministic" by accident. ``contained_batch`` is static too
+    and runs a submitter's image, so the proxy stopped holding: an honest
+    machine on a job that samples, threads or stamps a timestamp would have
+    been convicted, and ``judge`` would have reached that verdict through
+    ``batch_inference``'s comparator regardless of the job's own type.
+
+    Gating issuance rather than making ``judge`` polymorphic is the smaller
+    fix, and it makes that hardcoded import correct *by construction* rather
+    than by coincidence: nothing but ``batch_inference`` is ever judged.
+    """
+    from ganymede.jobtypes import REGISTRY
+
+    cls = REGISTRY.get(job_type)
+    return bool(getattr(cls, "spot_checkable", False))
 
 
 def _source_for(conn: sqlite3.Connection, job_id: str,
@@ -90,6 +121,8 @@ def maybe_issue(conn: sqlite3.Connection, job: sqlite3.Row, worker_id: str,
     """
     rate = float(getattr(settings, "spotcheck_rate", 0.0) or 0.0)
     if rate <= 0.0:
+        return None
+    if not _spot_checkable(job["job_type"]):
         return None
     rng = rng or random
     if rng.random() >= rate:

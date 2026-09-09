@@ -320,8 +320,49 @@ because it drives the coordinator with a fake worker. Four defects; the two in
 the type itself — an unpresigned shard and a right-padded batch — were
 invisible to every test that injected its rows instead of fetching them.
 
-Still open here: the third type — `308` above offers two shapes (dataset
-processing, or generic containerised batch) and picks neither.
+**Second half built — Phase E is done.** The third type is
+`contained_batch` (`10` §7): the generic containerised shape, chosen over
+dataset processing because it is the only one of the two that gives `11` §2's
+sandbox a consumer — a dataset-processing type is another in-tree body and
+would have left `JobContainer` as unused as it was.
+
+The answer to "is the SDK just training with two spellings" is **no, and
+cheaply**: `plan` / `inputs_for` / `validate` / `credit` kept their shapes, the
+seven-method protocol did not grow a member, and `ContainedResult` reuses
+`InferResult`'s field set so the existing submit path carried it unchanged. Had
+a third type needed a fourth submit path, that would have been the finding.
+
+What the third type *did* surface is that two coordinator mechanisms had been
+assuming a property no submitter image can guarantee:
+
+- **A spot-check would have convicted honest machines.** `13` §5.2 says a type
+  opts in "by being deterministic", but nothing implemented that: probes are
+  issued from the static-task reserve path, and `batch_inference` was the only
+  type on it, so *static* was an accurate proxy for *deterministic* by
+  accident. `contained_batch` is static too, and `spotcheck.judge` reaches for
+  `batch_inference`'s comparator regardless of job type — so a job that samples
+  or stamps a timestamp would have failed a probe, at `09` §5.1's largest
+  single penalty. `JobType.spot_checkable`, default off, now gates issuance.
+- **`11` §4's image split enforced nothing.** It described what gets submitted;
+  `POST /v1/jobs` accepts an `image_id` on any job type. `requires_image` is now
+  a fact `can_honor` reads in both directions.
+
+And two bugs of my own:
+
+- `SandboxError` subclasses `RuntimeError`, so the first version of the
+  contained body let it reach `run_round`'s last handler — which abandons *and
+  re-raises*. A machine whose Docker daemon stopped would have exited
+  permanently and quietly. M4a's exact failure mode arriving by a new route,
+  which is a good argument for the handler-ownership split `10` §6 made rather
+  than against it.
+- **`load_image` could not read a tagged archive**, which is every archive `11`
+  §1.1's upload path produces. Found the first time the body ran against a real
+  daemon — and the reason it survived review is the interesting part: the
+  confinement's unit tests drive an injectable runner, and a fake returns the
+  string the parser already expects. A fake cannot disagree with the parser
+  about what the real tool prints. That is the same shape as the `FakeWorker`
+  finding one phase earlier, one layer down, and it is why
+  `tests/test_contained_live.py` now exists.
 
 **Correction to an earlier draft of this paragraph**, which said the sandbox and
 spot-checks were *both* waiting on it. Only the sandbox is. `11` §2's
