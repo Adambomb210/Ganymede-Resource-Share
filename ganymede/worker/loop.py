@@ -75,6 +75,16 @@ DECLINE_PRECISION = "precision_unsupported"
 DECLINE_IMAGE = "image_mismatch"
 DECLINE_MEMORY = "insufficient_memory"
 DECLINE_JOBTYPE_VERSION = "job_type_version_unsupported"
+DECLINE_JOBTYPE = "job_type_unsupported"
+
+# What a payload with no ``job_type`` means. Every claim has carried one since
+# docs/10 §1's dispatcher; the default is for a task row planned before it.
+DEFAULT_JOB_TYPE = "collab_lora_finetune"
+
+# The types this build has a *worker body* for. Distinct from the coordinator's
+# REGISTRY, which is the types it can plan and validate -- a worker can be older
+# than the coordinator, and `can_honor` is where that gap is supposed to surface.
+RUNNABLE_JOB_TYPES = frozenset({"collab_lora_finetune", "batch_inference"})
 
 
 @dataclass
@@ -330,6 +340,16 @@ class Worker:
             except Exception:  # noqa: BLE001 - never let the check itself abort a claim
                 pass
 
+        # A type this build cannot *run*. The version check above catches a
+        # newer SDK for a type we know; this catches a type we do not know at
+        # all. Both must land here rather than inside ``run_round``, which is
+        # where an unrunnable payload used to become a KeyError on
+        # ``base_adapter_url`` -- and, because ``run_round`` re-raises, a dead
+        # worker on the first claim of the wrong type.
+        job_type = task.get("job_type") or DEFAULT_JOB_TYPE
+        if job_type not in RUNNABLE_JOB_TYPES:
+            return False, f"{DECLINE_JOBTYPE}: no worker body for {job_type!r}"
+
         precision = task.get("base_precision")
         if precision and precision not in self.profile.get("supports", []):
             # Silently training at a different precision would break 5.2's
@@ -341,9 +361,18 @@ class Worker:
     # ---------------- step 8: one round ----------------
 
     def run_round(self, task: dict[str, Any]) -> dict[str, Any] | None:
-        """Train and submit one task. Returns the submit response, or None if
-        the work was dropped (round closed, lease lost, or told to stop)."""
-        from ganymede.trainer.train import Task, run_task
+        """Run and submit one task. Returns the submit response, or None if the
+        work was dropped (round closed, lease lost, or told to stop).
+
+        Dispatch on the payload's ``job_type`` (docs/10 §1). The heartbeat and
+        the exception policy are shared and live here; what differs per type is
+        the body between them. That split is deliberate rather than tidy: the
+        handlers below encode M4a's lesson that a storage blip must cost the
+        round and not the worker, and a second body written beside them would
+        have had to learn it again.
+        """
+        job_type = task.get("job_type") or DEFAULT_JOB_TYPE
+        body = self._run_shard if job_type == "batch_inference" else self._run_train_round
 
         task_id = task["task_id"]
         beat = Heartbeater(
@@ -353,58 +382,7 @@ class Worker:
         started = time.monotonic()
 
         try:
-            download_started = time.monotonic()
-            base_adapter = self.client.download(task["base_adapter_url"])
-            download_sec = time.monotonic() - download_started
-            log.info("task %s: %d bytes of base adapter in %.1fs",
-                     task_id, len(base_adapter), download_sec)
-
-            parsed = Task.from_payload(task)
-            self.cached_base_models.add(parsed.base_model)
-
-            def on_step(step: int, loss: float) -> None:
-                beat.record(step + 1, loss)
-
-            def should_stop() -> bool:
-                return beat.should_drop() or self.control.should_stop() \
-                    or self.control.should_pause()
-
-            result = run_task(parsed, base_adapter, on_step=on_step, should_stop=should_stop)
-
-            if beat.cancelled():
-                # docs/11 §3 step 3. For a *built-in* job type there is no job
-                # container, so soft and hard collapse into the same action:
-                # stop the loop and give the shard back. The distinction only
-                # exists for submitter code, which gets a SIGTERM and a grace
-                # period to checkpoint (sandbox.JobContainer.cancel) -- nothing
-                # here is trapping anything.
-                #
-                # The abandon is what turns the lease into `cancelled` rather
-                # than `abandoned` on the coordinator's side, which is what
-                # keeps an operator's cancel off this machine's record.
-                log.info("task %s: %s cancel, abandoning after %d steps",
-                         task_id, beat.cancelled(), result.steps)
-                self._abandon(task_id)
-                return None
-
-            if beat.should_drop():
-                log.info("task %s: work dropped after %d steps", task_id, result.steps)
-                return None
-
-            if self.control.should_stop() or self.control.should_pause():
-                # 4.4: abandon rather than race to save and upload. Docker's
-                # default stop grace is 10 s and a half-uploaded artifact is
-                # worse than none -- abandoning releases the shard immediately.
-                log.info("task %s: stopping, abandoning after %d steps", task_id, result.steps)
-                self._abandon(task_id)
-                return None
-
-            if result.steps == 0:
-                log.warning("task %s: no steps completed, abandoning", task_id)
-                self._abandon(task_id)
-                return None
-
-            return self._submit(task_id, result, download_sec, started)
+            return body(task, beat, started)
 
         except (RoundClosed, LeaseLost) as exc:
             log.info("task %s: %s", task_id, exc)
@@ -440,6 +418,202 @@ class Worker:
             raise
         finally:
             beat.stop()
+
+    # ---------------- the bodies ----------------
+
+    def _run_train_round(self, task: dict[str, Any], beat: "Heartbeater",
+                         started: float) -> dict[str, Any] | None:
+        """``collab_lora_finetune``: download the base adapter, train, upload."""
+        from ganymede.trainer.train import Task, run_task
+
+        task_id = task["task_id"]
+        download_started = time.monotonic()
+        base_adapter = self.client.download(task["base_adapter_url"])
+        download_sec = time.monotonic() - download_started
+        log.info("task %s: %d bytes of base adapter in %.1fs",
+                 task_id, len(base_adapter), download_sec)
+
+        parsed = Task.from_payload(task)
+        self.cached_base_models.add(parsed.base_model)
+
+        def on_step(step: int, loss: float) -> None:
+            beat.record(step + 1, loss)
+
+        def should_stop() -> bool:
+            return beat.should_drop() or self.control.should_stop() \
+                or self.control.should_pause()
+
+        result = run_task(parsed, base_adapter, on_step=on_step, should_stop=should_stop)
+
+        if beat.cancelled():
+            # docs/11 §3 step 3. For a *built-in* job type there is no job
+            # container, so soft and hard collapse into the same action:
+            # stop the loop and give the shard back. The distinction only
+            # exists for submitter code, which gets a SIGTERM and a grace
+            # period to checkpoint (sandbox.JobContainer.cancel) -- nothing
+            # here is trapping anything.
+            #
+            # The abandon is what turns the lease into `cancelled` rather
+            # than `abandoned` on the coordinator's side, which is what
+            # keeps an operator's cancel off this machine's record.
+            log.info("task %s: %s cancel, abandoning after %d steps",
+                     task_id, beat.cancelled(), result.steps)
+            self._abandon(task_id)
+            return None
+
+        if beat.should_drop():
+            log.info("task %s: work dropped after %d steps", task_id, result.steps)
+            return None
+
+        if self.control.should_stop() or self.control.should_pause():
+            # 4.4: abandon rather than race to save and upload. Docker's
+            # default stop grace is 10 s and a half-uploaded artifact is
+            # worse than none -- abandoning releases the shard immediately.
+            log.info("task %s: stopping, abandoning after %d steps", task_id, result.steps)
+            self._abandon(task_id)
+            return None
+
+        if result.steps == 0:
+            log.warning("task %s: no steps completed, abandoning", task_id)
+            self._abandon(task_id)
+            return None
+
+        return self._submit(task_id, result, download_sec, started)
+
+    def _run_shard(self, task: dict[str, Any], beat: "Heartbeater",
+                   started: float) -> dict[str, Any] | None:
+        """``batch_inference``: one shard (docs/10 §4).
+
+        No base adapter to download and no round to lose. ``run`` uploads its
+        own output to the presigned PUT the claim carried, so the submit below
+        is a *reference* to an object that already exists.
+        """
+        from ganymede.jobtypes import resolve
+        from ganymede.jobtypes.base import InputRefs
+        from ganymede.jobtypes.batch_inference.run import InferTask
+
+        task_id = task["task_id"]
+        # ``resolve``, not ``REGISTRY[...]``: the registry holds classes and the
+        # protocol is defined on instances. ``can_honor`` reads ``.version``
+        # straight off the class, which is why that one can index it directly.
+        jt = resolve("batch_inference")
+        parsed = InferTask.from_payload(task)
+        inputs = InputRefs(artifacts=task.get("artifacts") or {},
+                           params=task.get("params") or {})
+
+        def on_step(rows_done: int, _loss: float) -> None:
+            # docs/10 §4's ``on_step(rows_done, 0.0)``. Rows are this type's
+            # step unit, and the heartbeat carries progress rather than a unit,
+            # so the coordinator's staleness check works unchanged.
+            beat.record(rows_done)
+
+        # docs/10 §4 asks for ``"soft" | "hard" | None`` where the trainer's
+        # callback is a bare bool -- and a bool is not a lossless stand-in: it
+        # maps to "hard", so wiring one here would silently delete the soft
+        # path that ``run`` implements. Each signal is recorded as it is
+        # returned, which is also how the ``except`` below separates an abort
+        # we asked for from a genuine failure.
+        stopped: list[str] = []
+
+        def should_stop() -> str | None:
+            # Cancel is asked FIRST, and the order is load-bearing:
+            # ``should_drop()`` is true whenever ``cancel_mode`` is set, so
+            # asking it first would fold every soft cancel into "hard" and
+            # delete the soft path silently. The training body checks in this
+            # same order for the same reason.
+            signal: str | None = beat.cancelled()
+            if signal:
+                # The operator's own mode, passed through. For a first-party
+                # built-in the two collapse to "stop and give the shard back"
+                # (docs/11 §3) -- there is no container to signal and nothing
+                # to checkpoint. Soft differs only in letting the batch in
+                # flight finish rather than tearing it mid-generate.
+                pass
+            elif beat.should_drop():
+                # The round closed or the lease is gone: the output would land
+                # nowhere. Stop now rather than finish a batch nobody wants.
+                signal = "hard"
+            elif self.control.should_stop() or self.control.should_pause():
+                # 4.4, as the trainer does it: the machine is going away, quite
+                # possibly inside a 10 s stop grace. Do not finish a batch.
+                signal = "hard"
+            if signal:
+                stopped.append(signal)
+            return signal
+
+        try:
+            result = jt.run(parsed, inputs, on_step, should_stop)
+        except RuntimeError:
+            # ``run`` raises on a hard stop. That is an abort we asked for iff
+            # we asked for it; anything else is a real failure and must reach
+            # the handler in ``run_round``.
+            if not stopped:
+                raise
+            result = None
+
+        if stopped:
+            # Every stop ends the same way, and *not* with a submit. A soft
+            # stop flushes a partial to the presigned PUT (docs/10 §4), and a
+            # short object fails ``validate``'s row-count gate -- so submitting
+            # one would spend an attempt to be told no. The partial itself is
+            # harmless: the next attempt at this shard writes the same key.
+            rows = getattr(result, "rows", 0)
+            if beat.cancelled():
+                # Asked before ``should_drop`` for the reason above, and the
+                # abandon matters: it is what turns the lease into `cancelled`
+                # rather than `expired` on the coordinator's side, which keeps
+                # an operator's cancel off this machine's record (docs/13 §4).
+                log.info("task %s: %s cancel, abandoning after %d row(s)",
+                         task_id, beat.cancelled(), rows)
+                self._abandon(task_id)
+                return None
+            if beat.should_drop():
+                # The lease is already gone; there is nothing to give back.
+                log.info("task %s: work dropped after %d row(s)", task_id, rows)
+                return None
+            log.info("task %s: stopping, abandoning after %d row(s)", task_id, rows)
+            self._abandon(task_id)
+            return None
+
+        if result.rows == 0:
+            log.warning("task %s: no rows produced, abandoning", task_id)
+            self._abandon(task_id)
+            return None
+
+        return self._submit_shard(task_id, result, started)
+
+    def _submit_shard(self, task_id: str, result, started: float) -> dict[str, Any]:
+        """Reference an output ``run`` has already uploaded.
+
+        ``upload-url`` is still called, and its ``url`` still ignored: the key
+        is the coordinator's *derivation* of the one place a submission for this
+        task may land, and submitting ``params["output_key"]`` on faith is the
+        thing the made-up-key guard exists to refuse. Asking for the slot and
+        using only its key is how a worker stays on the right side of that
+        without uploading the shard twice.
+        """
+        slot = self.client.upload_url(task_id)
+
+        metrics = dict(result.metrics)
+        metrics.update({
+            # The attempt-group comparator (docs/10 §4). Without it every
+            # redundant group reads as a disagreement -- silently, since a
+            # missing digest is an empty string and two empties still differ
+            # from a real one. The one field here that is not diagnostics.
+            "digest": result.digest,
+            "rows": result.rows,
+            "seconds": result.seconds,
+            "wall_sec": round(time.monotonic() - started, 2),
+            "backend": self.profile["backend"],
+        })
+
+        response = self.client.submit(
+            task_id, slot["key"], result.rows, tokens_seen=0, metrics=metrics,
+        )
+        log.info("task %s: submitted %d rows, accepted=%s%s",
+                 task_id, result.rows, response.get("accepted"),
+                 f" ({response['reject_reason']})" if response.get("reject_reason") else "")
+        return response
 
     def _submit(self, task_id: str, result, download_sec: float, started: float) -> dict[str, Any]:
         slot = self.client.upload_url(task_id)
@@ -539,7 +713,14 @@ class Worker:
             # because it closed underneath us was still a round this worker
             # took part in, and counting only successes would have `--max-rounds`
             # quietly mean "until N rounds happen to go your way".
-            self.rounds_worked.add((task["run_id"], int(task["round_idx"])))
+            if task.get("run_id") is not None and task.get("round_idx") is not None:
+                self.rounds_worked.add((task["run_id"], int(task["round_idx"])))
+            else:
+                # A roundless type (docs/10 §5): batch_inference has no rounds,
+                # so there is no coarser unit than the task and --max-rounds
+                # counts shards. Keyed by task_id, which keeps the set a set --
+                # ``int(None)`` was the second way a batch claim killed a worker.
+                self.rounds_worked.add((task["task_id"], -1))
 
             if self.config.once:
                 return 0

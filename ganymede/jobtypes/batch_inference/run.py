@@ -123,6 +123,16 @@ def parse_jsonl(raw: bytes) -> list[dict[str, Any]]:
     return out
 
 
+def _hf_id(model_ref: str) -> str:
+    """``hf://org/name`` -> ``org/name``.
+
+    ``inputs_for`` passes an ``hf://`` ref through untouched, on the grounds
+    that the worker pulls it from the Hub itself -- and ``from_pretrained`` has
+    never heard of the scheme. Stripped here, at the one place that loads.
+    """
+    return model_ref[len("hf://"):] if model_ref.startswith("hf://") else model_ref
+
+
 def _chunks(seq: Sequence[Any], size: int):
     for start in range(0, len(seq), size):
         yield seq[start : start + size]
@@ -172,10 +182,19 @@ def run(
 
     device = device or model_mod.pick_device()
     if tokenizer is None:
-        tokenizer = model_mod.load_tokenizer(task.model_ref)
+        tokenizer = model_mod.load_tokenizer(_hf_id(task.model_ref))
     if model is None:
-        model = model_mod.load_base(task.model_ref, "fp32", device=device)
+        model = model_mod.load_base(_hf_id(task.model_ref), "fp32", device=device)
     model.eval()
+
+    # Generation pads on the LEFT. A decoder-only model continues from the last
+    # position, so right-padding a batch makes every short prompt generate from
+    # after its own padding -- the row count still comes out right and the
+    # digest is still stable, which is exactly why this can ship broken and
+    # look fine. It also makes the ``g[in_len:]`` slice below correct for every
+    # row rather than only the longest, because left padding puts all the
+    # prompts' ends at the same index.
+    tokenizer.padding_side = "left"
 
     max_new_tokens = int(task.decode.get("max_new_tokens", 256))
     do_sample = task.decode.get("mode") != "greedy"

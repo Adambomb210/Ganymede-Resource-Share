@@ -8,6 +8,7 @@ loop can be wrong in ways that cost a round rather than crash.
 
 from __future__ import annotations
 
+import json
 import threading
 
 import pytest
@@ -614,3 +615,230 @@ def test_an_unexpected_error_still_stops_the_worker(tmp_path, stub_trainer):
 
     with pytest.raises(ValueError, match="genuinely wrong"):
         worker.run()
+
+
+# --------------------------------------------------------------------------
+# batch_inference: the second body (docs/10 §4, Phase E)
+#
+# Until Phase E this loop *was* the training body. A ``batch_inference`` claim
+# reached ``task["base_adapter_url"]``, raised KeyError, and -- because
+# ``run_round`` re-raises after abandoning -- took the worker down on the first
+# one. The coordinator had been able to plan, serve, validate and close these
+# jobs since Phase A's move; nothing on this side could run one, and the whole
+# ``test_batch_inference`` suite was green throughout, because it drives the
+# coordinator with a FakeWorker. That gap is what these tests are for.
+# --------------------------------------------------------------------------
+
+
+BATCH_TASK = {
+    "task_id": "b1", "job_id": "j1", "job_type": "batch_inference",
+    "run_id": None, "round_idx": None,
+    "image_ref": None, "image_digest": None, "image_pull_url": None,
+    "input_ref": json.dumps({
+        "shard_ref": "shards/0", "shard_rows": 4, "model_ref": "hf://tiny",
+        "prompt_template": "{input}", "decode": {"mode": "greedy", "max_new_tokens": 8},
+        "output_schema": {"id": "str", "output": "str"},
+        "output_key": "out/j1/b1.jsonl",
+    }),
+    "attempt_group": None,
+    "artifacts": {"model": "hf://tiny", "shard": "http://storage/get?sig=shard"},
+    "params": {
+        "shard_ref": "shards/0", "shard_rows": 4,
+        "output_put_url": "http://storage/put?sig=out", "output_key": "out/j1/b1.jsonl",
+        "decode": {"mode": "greedy", "max_new_tokens": 8},
+        "prompt_template": "{input}", "output_schema": {"id": "str", "output": "str"},
+    },
+    "sdk": {"job_type": "batch_inference", "version": 1},
+    "max_runtime_sec": 600, "lease_expires_at": None,
+    "heartbeat_interval_sec": 5, "required_image": None,
+}
+
+
+@pytest.fixture
+def stub_infer(monkeypatch):
+    """Replaces the type's ``run``. What is under test is the loop's decisions;
+    the real body has its own suite in ``test_batch_inference``."""
+    from ganymede.jobtypes.batch_inference import run as run_mod
+
+    state = {"rows": 4, "should_stop": None, "signals": [], "calls": 0}
+
+    def fake_run(task, inputs, on_step=None, should_stop=None, **kwargs):
+        state["calls"] += 1
+        state["task"] = task
+        state["inputs"] = inputs
+        state["should_stop"] = should_stop
+        signal = should_stop() if should_stop else None
+        state["signals"].append(signal)
+        if on_step:
+            on_step(state["rows"], 0.0)
+        if signal == "hard":
+            # What the real body does: abort with nothing uploaded.
+            raise RuntimeError("batch_inference run aborted by a hard stop")
+        rows = 1 if signal == "soft" else state["rows"]
+        return run_mod.InferResult(
+            rows=rows, output_ref="out/j1/b1.jsonl", digest="d" * 64,
+            seconds=1.5, metrics={"rows": rows},
+        )
+
+    monkeypatch.setattr(run_mod, "run", fake_run)
+    return state
+
+
+def _latch(monkeypatch, **attrs):
+    """Start the heartbeat with state already latched.
+
+    ``heartbeat_body`` alone would not do it: the thread sleeps a full interval
+    before its first beat, and the body asks ``should_stop`` immediately. What a
+    cancel *arrives* as is covered by the Heartbeats section above; what these
+    tests are about is the loop's reaction to it having arrived."""
+    original = loop_mod.Heartbeater.start
+
+    def start_latched(self):
+        for name, value in attrs.items():
+            setattr(self, name, value)
+        return original(self)
+
+    monkeypatch.setattr(loop_mod.Heartbeater, "start", start_latched)
+
+
+def test_a_batch_task_no_longer_kills_the_worker(tmp_path, stub_infer):
+    """The regression. Before the dispatch existed this raised KeyError on
+    ``base_adapter_url`` after abandoning the lease, and ``run()`` re-raised."""
+    client = StubClient()
+    worker = make_worker(tmp_path, client=client)
+    response = worker.run_round(BATCH_TASK)
+
+    assert response == {"accepted": True}
+    assert "abandon" not in client.kinds()
+
+
+def test_the_worker_submits_the_derived_key_and_never_uploads_twice(tmp_path, stub_infer):
+    """``run`` already PUT the output to the presigned URL the claim carried, so
+    the loop asks for the upload slot and uses only its *key* -- the
+    coordinator's derivation of the one place a submission may land. Submitting
+    ``params["output_key"]`` on faith is what the made-up-key guard refuses."""
+    client = StubClient()
+    worker = make_worker(tmp_path, client=client)
+    worker.run_round(BATCH_TASK)
+
+    assert client.kinds().count("upload_url") == 1
+    assert "upload" not in client.kinds()
+    submit = next(c for c in client.calls if c[0] == "submit")
+    assert submit[1] == "b1"
+    assert submit[2] == 4  # rows are this type's "steps" on the wire
+
+
+def test_the_submission_carries_the_digest(tmp_path, stub_infer):
+    """The one metric here that is not diagnostics: ``compare_digest`` is what
+    the coordinator's attempt-group agreement is computed from. Drop it and
+    every redundant group reads as a disagreement -- silently, because a missing
+    digest arrives as an empty string and two empties still differ from a real
+    one."""
+    client = StubClient()
+    make_worker(tmp_path, client=client).run_round(BATCH_TASK)
+
+    metrics = next(c for c in client.calls if c[0] == "submit")[3]
+    assert metrics["digest"] == "d" * 64
+    assert metrics["rows"] == 4
+    # ``_infer_result_for`` on the coordinator reads exactly this key back.
+    assert metrics["seconds"] == 1.5
+
+
+def test_a_soft_cancel_abandons_rather_than_submitting_a_partial(
+        tmp_path, stub_infer, monkeypatch):
+    """A soft stop flushes what it has (docs/10 §4), which is fewer rows than
+    the shard declared -- and ``validate`` rejects on the row count. Submitting
+    one would spend an attempt to be told no.
+
+    The ``signals`` assertion is the load-bearing half: ``should_drop()`` is
+    true whenever a cancel is latched, so asking it before ``cancelled()``
+    would fold this into "hard" and delete the soft path without failing
+    anything else here."""
+    _latch(monkeypatch, cancel_mode="soft")
+    client = StubClient()
+    worker = make_worker(tmp_path, client=client)
+    worker.run_round(BATCH_TASK)
+
+    assert stub_infer["signals"] == ["soft"], "a bool callback would have said 'hard'"
+    assert "submit" not in client.kinds()
+    assert "abandon" in client.kinds()
+
+
+def test_a_hard_cancel_abandons_without_crashing_the_worker(
+        tmp_path, stub_infer, monkeypatch):
+    """``run`` raises on a hard stop. That is an abort we asked for, and it must
+    not reach ``run_round``'s ``except Exception``, which re-raises."""
+    _latch(monkeypatch, cancel_mode="hard")
+    client = StubClient()
+    worker = make_worker(tmp_path, client=client)
+
+    assert worker.run_round(BATCH_TASK) is None
+    assert stub_infer["signals"] == ["hard"]
+    assert "submit" not in client.kinds()
+    assert "abandon" in client.kinds()
+
+
+def test_a_run_that_fails_on_its_own_still_reaches_the_handler(tmp_path, monkeypatch):
+    """The other half of the same ``except RuntimeError``. Nothing asked this
+    run to stop, so the abort is a real failure and must not be swallowed."""
+    from ganymede.jobtypes.batch_inference import run as run_mod
+
+    def explodes(task, inputs, on_step=None, should_stop=None, **kwargs):
+        raise RuntimeError("the model would not load")
+
+    monkeypatch.setattr(run_mod, "run", explodes)
+    client = StubClient()
+    with pytest.raises(RuntimeError, match="would not load"):
+        make_worker(tmp_path, client=client).run_round(BATCH_TASK)
+    assert "abandon" in client.kinds()
+
+
+def test_a_dropped_lease_neither_submits_nor_abandons(tmp_path, stub_infer, monkeypatch):
+    """The lease is already gone; there is nothing to give back."""
+    _latch(monkeypatch, lease_lost=True)
+    client = StubClient()
+    assert make_worker(tmp_path, client=client).run_round(BATCH_TASK) is None
+    assert "submit" not in client.kinds()
+    assert "abandon" not in client.kinds()
+
+
+def test_zero_rows_is_abandoned_rather_than_submitted(tmp_path, stub_infer):
+    stub_infer["rows"] = 0
+    client = StubClient()
+    assert make_worker(tmp_path, client=client).run_round(BATCH_TASK) is None
+    assert "submit" not in client.kinds()
+    assert "abandon" in client.kinds()
+
+
+def test_an_unknown_job_type_is_declined_rather_than_run(tmp_path):
+    """A worker can be older than the coordinator. A type this build has no body
+    for must be refused at step 5, where the reason is reported -- not
+    discovered inside ``run_round``, which is where it used to become a
+    KeyError."""
+    worker = make_worker(tmp_path)
+    honored, reason = worker.can_honor({**BATCH_TASK, "job_type": "dataset_map"})
+    assert not honored
+    assert loop_mod.DECLINE_JOBTYPE in reason
+    assert "dataset_map" in reason
+
+
+def test_a_payload_with_no_job_type_is_still_trained(tmp_path, stub_trainer):
+    """A task row planned before docs/10 §1's dispatcher carries no job_type.
+    It is collab_lora_finetune, and the default must not decline it."""
+    worker = make_worker(tmp_path)
+    assert worker.can_honor({k: v for k, v in TASK.items() if k != "job_type"}) == (True, None)
+    assert worker.run_round(TASK)["accepted"] is True
+
+
+def test_max_rounds_counts_shards_for_a_roundless_type(tmp_path, stub_infer):
+    """batch_inference has no rounds (docs/10 §5), so there is no unit coarser
+    than the task. ``int(task["round_idx"])`` on a None was the second way a
+    batch claim killed a worker -- after ``run_round``, in ``run`` itself."""
+    tasks = [{**BATCH_TASK, "task_id": f"b{i}"} for i in range(3)]
+    client = StubClient(tasks=tasks)
+    worker = make_worker(tmp_path, client=client, max_rounds=2)
+    monkey_idle(worker)
+
+    assert worker.run() == 0
+    assert worker.rounds_done == 2
+    assert worker.tasks_done == 2

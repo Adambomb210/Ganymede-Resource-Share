@@ -157,7 +157,7 @@ def test_inputs_for_names_the_model_and_an_output_put_no_base_adapter(store):
     task_spec = bi_plan.plan(_job_row(spec), conn=None)[0]
     task_row = {"input_ref_json": task_spec.input_ref}
     refs = BatchInference().inputs_for(task_row, store)
-    assert set(refs.artifacts) == {"model"}
+    assert set(refs.artifacts) == {"model", "shard"}
     assert "base_adapter" not in refs.artifacts
     assert refs.params["shard_ref"] == "shard/0"
     assert "output_put_url" in refs.params and "sig=put" in refs.params["output_put_url"]
@@ -686,3 +686,329 @@ def test_qwen_0_6b_cpu_end_to_end():
     assert len(out) == 4
     assert all(set(r) == {"id", "output"} for r in out)
     assert res.digest == canonical_digest(out)
+
+
+# ==========================================================================
+# The shard has to be fetchable (Phase E)
+# ==========================================================================
+
+
+def test_inputs_for_presigns_the_shard(store):
+    """``params["shard_ref"]`` keeps the submitter's literal ref -- it is what
+    a log or a support question quotes -- and the fetchable URL goes in
+    ``artifacts``, which is what ``InputRefs`` says artifacts are.
+
+    This was the gap that made the type unrunnable off a real store. ``run``
+    was written against exactly this shape and ``inputs_for`` never supplied
+    it, so a real worker urlopen()'d the literal string ``"shard/0"``. Nothing
+    caught it: every test above injects ``rows=`` and skips the download."""
+    task_spec = bi_plan.plan(_job_row(_spec([{"ref": "shard/0", "rows": 5}])), conn=None)[0]
+    refs = BatchInference().inputs_for({"input_ref_json": task_spec.input_ref}, store)
+
+    assert refs.params["shard_ref"] == "shard/0"
+    assert refs.artifacts["shard"].endswith("/shard/0?sig=get")
+
+
+@pytest.mark.parametrize("ref", [
+    "https://data.example/shards/0.jsonl",
+    "http://data.example/shards/0.jsonl",
+])
+def test_a_shard_already_addressable_is_passed_through(store, ref):
+    """A submitter whose data is not in our bucket names a URL. Presigning it
+    against our own store would produce a key that does not exist."""
+    task_spec = bi_plan.plan(_job_row(_spec([{"ref": ref, "rows": 5}])), conn=None)[0]
+    refs = BatchInference().inputs_for({"input_ref_json": task_spec.input_ref}, store)
+    assert refs.artifacts["shard"] == ref
+
+
+def test_run_downloads_the_shard_from_the_artifacts_url(tiny_lm, monkeypatch):
+    """The path a real worker takes: no ``rows=`` injection, so ``run`` has to
+    resolve the shard itself from what ``inputs_for`` handed it."""
+    from ganymede.jobtypes.batch_inference import run as run_mod
+
+    mdl, tok = tiny_lm
+    spec = _spec([{"ref": "shard/0", "rows": 3}])
+    task_spec = bi_plan.plan(_job_row(spec), conn=None)[0]
+    it = _infer_task(spec, task_spec)
+
+    fetched: list[str] = []
+    payload = b"\n".join(
+        json.dumps({"id": f"r{i}", "input": f"w{i} w{i + 1}"}).encode() for i in range(3)
+    )
+
+    def fake_urlopen(url, *a, **kw):
+        fetched.append(url if isinstance(url, str) else url.full_url)
+
+        class _R:
+            def read(self_inner):
+                return payload
+
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *exc):
+                return False
+
+        return _R()
+
+    monkeypatch.setattr(run_mod.urllib.request, "urlopen", fake_urlopen)
+    res = BatchInference().run(
+        it, _Inputs({"model": "hf://x", "shard": "http://storage/x?sig=get"},
+                    {"shard_ref": "shard/0"}),
+        model=mdl, tokenizer=tok, device=CPU, upload=lambda b: None,
+    )
+    assert fetched == ["http://storage/x?sig=get"]
+    assert res.rows == 3
+
+
+def test_the_digest_does_not_depend_on_the_worker_s_batch_size(tiny_lm):
+    """``batch_size`` is a worker-side knob, and redundancy compares digests
+    across *different machines*. So a batch of eight and a batch of two have to
+    agree, or an agreement gate is measuring the fleet's configuration.
+
+    They did not. Generation pads on the left; the body padded on the right,
+    which makes every short prompt continue from after its own padding -- so
+    the output depended on which rows a batch happened to contain. The row
+    count and the digest's *stability* were both unaffected, which is exactly
+    why this could ship looking fine (transformers even warns about it, into a
+    log nothing reads)."""
+    mdl, tok = tiny_lm
+    spec = _spec([{"ref": "s0", "rows": 6}])
+    task_spec = bi_plan.plan(_job_row(spec), conn=None)[0]
+    it = _infer_task(spec, task_spec)
+    # Deliberately ragged: with equal-length prompts the bug is invisible.
+    rows = [{"id": f"r{i}", "input": " ".join(f"w{j}" for j in range(i + 1))}
+            for i in range(6)]
+
+    digests = {
+        n: BatchInference().run(it, _Inputs(), rows=rows, model=mdl, tokenizer=tok,
+                                device=CPU, upload=lambda b: None, batch_size=n).digest
+        for n in (1, 2, 6)
+    }
+    assert len(set(digests.values())) == 1, digests
+
+
+def test_an_hf_ref_is_stripped_before_it_reaches_from_pretrained():
+    """``inputs_for`` passes an ``hf://`` ref through on the grounds that the
+    worker pulls it from the Hub itself -- and ``from_pretrained`` has never
+    heard of the scheme."""
+    from ganymede.jobtypes.batch_inference.run import _hf_id
+
+    assert _hf_id("hf://Qwen/Qwen3-0.6B") == "Qwen/Qwen3-0.6B"
+    assert _hf_id("Qwen/Qwen3-0.6B") == "Qwen/Qwen3-0.6B"
+    assert _hf_id("/local/path/to/model") == "/local/path/to/model"
+
+
+# ==========================================================================
+# The real worker (Phase E)
+#
+# Everything above this line either drives the *coordinator* with a FakeWorker
+# or calls the type's functions directly. Neither sees ``ganymede/worker/loop.py``,
+# which is where a batch claim used to raise KeyError on ``base_adapter_url``
+# and kill the worker on the spot. The whole suite was green through all of it.
+#
+# So: the real ``Worker``, the real ``_run_shard``, the real ``run``, real
+# urllib against a real socket for the shard download and the output PUT, and
+# the real coordinator gates on the way back. What is stubbed is the transport
+# to the coordinator (a TestClient rather than uvicorn) and the model, which is
+# the tiny local Qwen3 -- both of which have their own coverage elsewhere.
+# ==========================================================================
+
+
+@pytest.fixture
+def served_store(store, monkeypatch):
+    """``store``, with presigned URLs that a real urllib can actually fetch.
+
+    FakeStore hands out ``http://storage.test:9000/...``, which is fine for
+    every test that writes bytes into the dict by hand and exactly no use to a
+    worker that does the transfer itself."""
+    import threading
+    from datetime import datetime, timedelta, timezone
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import unquote, urlparse
+
+    class Handler(BaseHTTPRequestHandler):
+        def _key(self):
+            return unquote(urlparse(self.path).path.lstrip("/"))
+
+        def do_GET(self):
+            blob = store.objects.get(self._key())
+            if blob is None:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(blob)))
+            self.end_headers()
+            self.wfile.write(blob)
+
+        def do_PUT(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            store.objects[self._key()] = self.rfile.read(n)
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    later = datetime.now(timezone.utc) + timedelta(hours=1)
+    monkeypatch.setattr(store, "presign_get",
+                        lambda key, expires_in=None: (f"{base}/{key}", later))
+    monkeypatch.setattr(store, "presign_put",
+                        lambda key, expires_in=None, content_length=None:
+                        (f"{base}/{key}", later))
+    try:
+        yield store
+    finally:
+        srv.shutdown()
+
+
+class _LoopbackClient:
+    """The ``CoordinatorClient`` surface a Worker uses, over a TestClient."""
+
+    def __init__(self, client, key):
+        self.c = client
+        self.h = {"Authorization": f"Bearer {key}"}
+        self.calls: list[str] = []
+
+    def register(self, profile, image_tag=None):
+        self.calls.append("register")
+        r = self.c.post("/v1/workers/register", headers=self.h,
+                        json={"compute_profile": profile})
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    def claim(self, worker_id, **kwargs):
+        self.calls.append("claim")
+        r = self.c.post("/v1/tasks/claim", headers=self.h, json={"worker_id": worker_id})
+        if r.status_code == 204:
+            return None, 1
+        assert r.status_code == 200, r.text
+        return r.json(), 0
+
+    def heartbeat(self, task_id, steps, loss=None):
+        self.calls.append("heartbeat")
+        r = self.c.post(f"/v1/tasks/{task_id}/heartbeat", headers=self.h,
+                        json={"steps_completed": steps})
+        return r.json() if r.content else {}
+
+    def upload_url(self, task_id):
+        self.calls.append("upload_url")
+        r = self.c.post(f"/v1/tasks/{task_id}/upload-url", headers=self.h)
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    def upload(self, url, data, content_type="application/octet-stream"):
+        raise AssertionError("the batch body must not upload: run() already did")
+
+    def download(self, url):
+        raise AssertionError("a batch task has nothing for the loop to download")
+
+    def submit(self, task_id, key, steps, tokens_seen=0, metrics=None):
+        self.calls.append("submit")
+        r = self.c.post(f"/v1/tasks/{task_id}/submit", headers=self.h,
+                        json={"artifact_key": key, "steps_completed": steps,
+                              "tokens_seen": tokens_seen, "metrics": metrics or {}})
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    def abandon(self, task_id):
+        self.calls.append("abandon")
+        return self.c.post(f"/v1/tasks/{task_id}/abandon", headers=self.h).json()
+
+
+def _real_worker(client, key, tmp_path, **cfg):
+    from ganymede.worker.control import ControlFiles
+    from ganymede.worker.loop import Worker, WorkerConfig
+
+    return Worker(
+        config=WorkerConfig(coordinator_url="http://c", key=key, once=True, **cfg),
+        client=_LoopbackClient(client, key),
+        control=ControlFiles(tmp_path, install_signal_handlers=False),
+        profile={"backend": "cpu", "device_name": "cpu:test",
+                 "supports": ["fp32"], "probe": {}, "vram_mb": 8000},
+    )
+
+
+def test_a_real_worker_carries_a_batch_shard_end_to_end(
+    client, served_store, conn, make_contributor, make_submitter, tiny_model_dir, tmp_path
+):
+    _, skey = make_submitter()
+    _, wkey = make_contributor(name="real-worker-owner")
+
+    rows = [{"id": f"r{i}", "input": " ".join(f"w{j}" for j in range(i + 1))}
+            for i in range(4)]
+    served_store.put_bytes(
+        "shards/0.jsonl",
+        b"\n".join(json.dumps(r).encode() for r in rows),
+    )
+
+    spec = _spec([{"ref": "shards/0.jsonl", "rows": 4}])
+    spec["model_ref"] = str(tiny_model_dir)
+    jid = _enqueue_batch(client, skey, spec)
+
+    worker = _real_worker(client, wkey, tmp_path)
+    assert worker.run() == 0
+
+    assert worker.client.calls == ["register", "claim", "upload_url", "submit"]
+
+    task = conn.execute("SELECT * FROM tasks WHERE job_id = ?", (jid,)).fetchone()
+    assert task["status"] == "submitted"
+    assert conn.execute(
+        "SELECT status FROM jobs WHERE id = ?", (jid,)
+    ).fetchone()["status"] == "done"
+
+    # The output the worker PUT, read back through the coordinator's own key.
+    out = json.loads(conn.execute(
+        "SELECT input_ref_json FROM tasks WHERE id = ?", (task["id"],)
+    ).fetchone()["input_ref_json"])["output_key"]
+    written = [json.loads(line) for line in
+               served_store.get_bytes(out).decode().splitlines() if line.strip()]
+    assert [r["id"] for r in written] == [r["id"] for r in rows]
+    assert all(set(r) == {"id", "output"} for r in written)
+
+    # The digest the worker computed is the one the coordinator kept, which is
+    # what an attempt group is later compared on.
+    from ganymede.jobtypes.batch_inference.run import canonical_digest
+
+    sub = conn.execute(
+        "SELECT * FROM submissions WHERE task_id = ?", (task["id"],)
+    ).fetchone()
+    assert sub["accepted"] == 1 and sub["reject_reason"] is None
+    assert sub["steps_completed"] == 4  # rows are this type's steps on the wire
+    assert json.loads(sub["metrics_json"])["compare_digest"] == canonical_digest(written)
+
+    # And the trusted work signal, which only a type with ``credit`` records
+    # (docs/09 §4): banked at zero weighted hours, carrying the WorkUnits
+    # scalar. Nothing above this line would have noticed if it never landed.
+    work = conn.execute(
+        "SELECT * FROM credit_events WHERE kind = \'work\'"
+    ).fetchall()
+    assert len(work) == 1
+    assert work[0]["raw_seconds"] == 4 and work[0]["weighted_hours"] == 0.0
+
+
+def test_a_real_worker_declines_nothing_and_takes_no_lease_when_the_job_is_done(
+    client, served_store, conn, make_contributor, make_submitter, tiny_model_dir, tmp_path
+):
+    """The second poll. A worker that finished the only shard must idle, not
+    take a lease it cannot use -- and `--once` must still exit 0."""
+    _, skey = make_submitter()
+    _, wkey = make_contributor(name="second-poll")
+    served_store.put_bytes("shards/0.jsonl", json.dumps({"id": "r0", "input": "w1"}).encode())
+    spec = _spec([{"ref": "shards/0.jsonl", "rows": 1}])
+    spec["model_ref"] = str(tiny_model_dir)
+    _enqueue_batch(client, skey, spec)
+
+    assert _real_worker(client, wkey, tmp_path).run() == 0
+
+    second = _real_worker(client, wkey, tmp_path)
+    second._idle = lambda seconds=0: None
+    assert second.run() == 0
+    assert second.client.calls == ["register", "claim"]
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM tasks WHERE status = 'leased'"
+    ).fetchone()["n"] == 0
