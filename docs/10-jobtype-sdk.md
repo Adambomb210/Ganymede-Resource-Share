@@ -315,6 +315,62 @@ Endpoints:
 
 ---
 
+## 6. The worker body (Phase E)
+
+§4 specifies `run`. It does not say who *calls* it, and until Phase E nobody
+did: `worker/loop.py`'s `run_round` **was** the training body. A
+`batch_inference` claim reached `task["base_adapter_url"]`, raised `KeyError`,
+and — `run_round` re-raises after abandoning — killed the worker on its first
+one. `can_honor` returned `True` on the way in. Everything on the coordinator's
+side of the seam had worked since Phase A.
+
+The shape now:
+
+- **`run_round` dispatches on `job_type`** and owns the two things that are
+  policy rather than type: the heartbeat, and the exception handling. The
+  bodies (`_run_train_round`, `_run_shard`) sit under it. Those handlers carry
+  M4a's rule that a storage blip costs the round and not the worker, and the
+  split is what keeps a second body from having to rediscover it.
+- **`can_honor` declines an unknown `job_type`** (`job_type_unsupported`),
+  beside the existing `job_type_version_unsupported`. A worker can be older
+  than the coordinator; step 5 is where that is supposed to surface, with a
+  reason a contributor can read.
+- **A stop is `"soft" | "hard" | None`**, and `cancelled()` is asked **before**
+  `should_drop()` — `should_drop()` is true whenever a cancel is latched, so
+  the obvious order folds every soft cancel into hard and deletes the soft path
+  without failing anything.
+- **No stop ever submits.** A soft flush is shorter than `shard_rows` and
+  `validate` rejects on the row count (§4), so submitting one would spend an
+  attempt to be told no. The partial is harmless — the next attempt writes the
+  same key.
+- **The submit references an object that already exists.** `run` did the PUT.
+  The loop still calls `upload-url`, for the **key** only: that key is the
+  coordinator's derivation of the one place a submission for this task may
+  land, and `params["output_key"]` taken on faith is what the made-up-key guard
+  refuses. It carries `metrics["digest"]`, the one field there that is not
+  diagnostics — it becomes `compare_digest`, and without it every redundant
+  group reads as a disagreement.
+- **`--max-rounds` counts shards** for a roundless type. There is no unit
+  coarser than the task (§5), and `int(task["round_idx"])` on a `NULL` was the
+  second place a batch claim killed a worker.
+
+### Two gaps only a real transfer could find
+
+`inputs_for` **never presigned the shard**. `run` was written against
+`artifacts["shard"]` and nothing supplied it, so a real worker `urlopen()`'d the
+literal string `"shard/0"`. Every test injected `rows=` and skipped the
+download. The presigning rule is deliberately *not* `_model_get_url`'s: a bare
+`org/name` is a Hub repo id for a model and an object-store key for a shard.
+
+**Generation pads left; the body padded right.** Every short prompt continued
+from after its own padding. The row count and the digest's *stability* were both
+unaffected — which is exactly why it could ship looking correct — but the output
+then depended on which rows a batch happened to contain, and `batch_size` is a
+worker-side knob. Redundancy was comparing the fleet's configuration rather than
+its answers. Now asserted: one digest across batch sizes 1, 2 and 6.
+
+---
+
 ## Spine deviations
 
 1. **`TaskSpec` widened.** `05` lists it under "reused verbatim." This doc adds
@@ -333,7 +389,13 @@ Endpoints:
    the M4b inertness gate depends on. Widening `plan` / `heartbeat` signatures
    instead would be the larger change. Presented as one seam with two entry
    points, not two features.
-3. **Dispatcher owns embarrassingly-parallel completion.** `05`'s `is_complete`
+3. **The worker branches per type; the protocol did not grow a method.** The
+   obvious generalization is a `submission_for(result)` on the type, so
+   `_submit` stops caring whether a result has `adapter_bytes` or `rows`. Not
+   taken: `10`'s seven-method table is frozen, and widening a frozen protocol on
+   a sample size of one commits the shape before the second type has a vote.
+   Phase E's *other* job class is what should force it, if anything does.
+4. **Dispatcher owns embarrassingly-parallel completion.** `05`'s `is_complete`
    takes no `conn`; a `reduce → None` type cannot answer completion itself. The
    rule lives in the generic close path. `is_complete` stays authoritative only
    for types that return a `ReduceState`.
@@ -354,6 +416,11 @@ spec-shape latitude `05` grants the type; `jobs` gets no new column.
 `job_type_version_unsupported` refusal; the Phase A move map, the two seams, and
 the inertness checklist as Phase A's entry criterion; `batch_inference`'s
 seven-method behaviour and its submitter-declared shard index with row counts.
+
+**Also frozen (Phase E):** the worker-side dispatch on `job_type`, the
+`"soft" | "hard" | None` stop callback and its cancel-before-drop order, "a stop
+never submits," and `artifacts["shard"]` as the fetchable shard handle beside
+the literal `params["shard_ref"]`.
 
 **Open:** image-backed third-party type loading and its coordinator-side sandbox
 (sandbox doc); the redundant-execution comparator's exact sampling and the

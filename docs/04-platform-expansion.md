@@ -310,6 +310,19 @@ its own `validate`, no `reduce`, shard-level credit. Then one more genuinely
 different type (dataset processing, or generic containerised batch) to confirm
 the SDK isn't just "training with two spellings."
 
+**First half built.** A real worker runs a real shard: `10` §6 is the worker
+body, and `test_a_real_worker_carries_a_batch_shard_end_to_end` drives the
+actual `Worker` against the actual coordinator over an actual socket. What that
+closed was not a missing feature but an untested seam — the coordinator had
+been able to plan, serve, validate and close these jobs since Phase A, the
+worker had never been able to run one, and the suite was green the whole time
+because it drives the coordinator with a fake worker. Four defects; the two in
+the type itself — an unpresigned shard and a right-padded batch — were
+invisible to every test that injected its rows instead of fetching them.
+
+Still open here: the second type, which is what `11` §2's sandbox and `13` §5's
+spot-checks are both waiting on for their first end-to-end consumer.
+
 ---
 
 ## Decisions taken
