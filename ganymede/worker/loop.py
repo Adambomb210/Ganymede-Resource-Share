@@ -76,6 +76,7 @@ DECLINE_IMAGE = "image_mismatch"
 DECLINE_MEMORY = "insufficient_memory"
 DECLINE_JOBTYPE_VERSION = "job_type_version_unsupported"
 DECLINE_JOBTYPE = "job_type_unsupported"
+DECLINE_CONTAINED = "contained_execution_unsupported"
 
 # What a payload with no ``job_type`` means. Every claim has carried one since
 # docs/10 §1's dispatcher; the default is for a task row planned before it.
@@ -339,6 +340,26 @@ class Worker:
                     )
             except Exception:  # noqa: BLE001 - never let the check itself abort a claim
                 pass
+
+        # A task that names an image wants its body run *inside* that image
+        # (docs/11 §2). No body here does that: `sandbox.JobContainer` is built
+        # and unit-tested, and nothing in this loop calls it -- the contained
+        # path arrives with Phase E's second job class. Running an in-tree body
+        # for such a task would not fail, which is the problem: submitter code
+        # would run with exactly the confinement the image exists to provide,
+        # absent, and nothing would say so.
+        #
+        # Reachable rather than theoretical: `POST /v1/jobs` accepts an
+        # `image_id` on any job type, the claim walk serves such a job to any
+        # worker reporting a container runtime, and the payload's
+        # `required_image` -- the field checked above -- is unrelated and null.
+        # docs/11 §4's "every first-party type carries image_id IS NULL" is a
+        # statement about what is submitted, not something enforced.
+        if task.get("image_ref"):
+            return False, (
+                f"{DECLINE_CONTAINED}: task pins image {task['image_ref']!r} and "
+                "this build has no contained body to run it in"
+            )
 
         # A type this build cannot *run*. The version check above catches a
         # newer SDK for a type we know; this catches a type we do not know at

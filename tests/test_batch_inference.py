@@ -950,6 +950,17 @@ def test_a_real_worker_carries_a_batch_shard_end_to_end(
     spec["model_ref"] = str(tiny_model_dir)
     jid = _enqueue_batch(client, skey, spec)
 
+    # ``served_store`` patches the store *instance*, so this only works because
+    # the ``client`` fixture is built from the same object. Pinned here rather
+    # than assumed: if that ever stops holding, the presigned URLs revert to
+    # unfetchable and this test fails as a confusing 404 inside urllib instead
+    # of saying what actually broke.
+    refs = BatchInference().inputs_for(
+        conn.execute("SELECT * FROM tasks WHERE job_id = ?", (jid,)).fetchone(),
+        served_store,
+    )
+    assert refs.artifacts["shard"].startswith("http://127.0.0.1")
+
     worker = _real_worker(client, wkey, tmp_path)
     assert worker.run() == 0
 

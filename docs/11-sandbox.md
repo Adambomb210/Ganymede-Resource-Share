@@ -345,3 +345,15 @@ machinery is built and unit-tested against an injectable runner, and the first
 end-to-end contained job arrives with Phase E's second job class. The pieces
 that *are* live today are the ones on the built-in path — the cancel transport,
 the `cancelled` task status, and the claim gate.
+
+**And the worker now refuses one, rather than running it unconfined.** §4's
+"every first-party type carries `image_id IS NULL`" is a statement about what
+gets submitted, not something enforced: `POST /v1/jobs` accepts an `image_id` on
+any job type, and the claim walk serves such a job to any worker reporting a
+container runtime. Neither worker body reads `image_ref` — so an in-tree body
+would have run that job to completion, successfully, with exactly the
+confinement the image exists to provide absent and nothing saying so. Phase E
+made that reachable in practice by giving `batch_inference` a body at all, so
+`can_honor` now declines a task that names an image
+(`contained_execution_unsupported`), at step 5 where the reason is reported.
+The refusal comes out the moment a real contained body lands.

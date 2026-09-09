@@ -822,6 +822,26 @@ def test_an_unknown_job_type_is_declined_rather_than_run(tmp_path):
     assert "dataset_map" in reason
 
 
+def test_a_task_that_pins_an_image_is_declined_by_either_body(tmp_path):
+    """A task naming an image wants its body run *inside* it (docs/11 §2), and
+    no body in this build does that -- ``sandbox.JobContainer`` is built and
+    nothing here calls it. Running the in-tree body instead would not fail,
+    which is the problem: the confinement the image exists to provide would be
+    silently absent.
+
+    Not theoretical. ``POST /v1/jobs`` accepts an ``image_id`` on any job type,
+    the claim walk serves such a job to any worker reporting a container
+    runtime, and ``required_image`` -- the field the check above looks at -- is
+    a different field and null on that payload."""
+    worker = make_worker(tmp_path)
+    for task in (BATCH_TASK, TASK):
+        honored, reason = worker.can_honor({**task, "image_ref": "img1",
+                                            "image_pull_url": "http://s/img"})
+        assert not honored
+        assert loop_mod.DECLINE_CONTAINED in reason
+        assert "img1" in reason
+
+
 def test_a_payload_with_no_job_type_is_still_trained(tmp_path, stub_trainer):
     """A task row planned before docs/10 §1's dispatcher carries no job_type.
     It is collab_lora_finetune, and the default must not decline it."""
