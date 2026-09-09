@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -347,17 +347,42 @@ def test_a_finished_task_frees_the_concurrency_slot(conn, owner):
 
 def test_the_budget_is_undecayed_and_a_month_is_a_calendar_month(conn, owner):
     """docs/13 §3.3. Decay belongs to fairness, which is about recency; a budget
-    has to match what a human gets adding the month up by hand."""
+    has to match what a human gets adding the month up by hand.
+
+    ``now`` is pinned rather than taken from the clock. The first version keyed
+    off ``utcnow().day > 8``, which meant the assertion silently did not run for
+    the first eight days of every month -- and then failed on the ninth, when
+    "eight days and two hours ago" landed exactly on the 1st at 00:00 and the
+    lease fell out of the month it was meant to be inside. A test about calendar
+    boundaries should not be placed relative to today's."""
     a, _ = owner("a")
     _job(conn, "ja", a, 10)
+    # Mid-month, so eight days back is comfortably inside the same month.
+    now = datetime(2026, 3, 20, 12, 0, tzinfo=timezone.utc)
     # Two hours, eight days ago -- decayed almost to nothing, but still spent.
     _task(conn, "t1", "ja", "submitted",
-          leased_at=_iso_ago(days=8, hours=2), ended=_iso_ago(days=8))
-    hours = fairness.month_hours(conn, a)
-    if rounds.utcnow().day > 8:  # both stamps inside this calendar month
-        assert hours == pytest.approx(2.0, rel=1e-3)
-        # And the *share* of the same lease has decayed by 2^-8.
-        assert fairness.recompute_shares(conn)[a] < 7200 * 0.01
+          leased_at=rounds._iso(now - timedelta(days=8, hours=2)),
+          ended=rounds._iso(now - timedelta(days=8)))
+
+    assert fairness.month_hours(conn, a, now=now) == pytest.approx(2.0, rel=1e-3)
+    # The same lease, to fair-share: nothing at all. Eight days is past
+    # SHARE_LOOKBACK_DAYS, so it is not decayed to near-zero, it is not there --
+    # which is the cleanest statement of the split. Recency is fairness's
+    # business; the budget counts what was spent.
+    assert a not in fairness.recompute_shares(conn, now=now)
+
+
+def test_a_lease_that_began_before_the_month_is_outside_the_budget(conn, owner):
+    """The boundary the test above used to straddle by accident, asserted on
+    purpose: ``month_hours`` counts from ``leased_at``, so a lease that opened
+    in February is February's spend however long it ran into March."""
+    a, _ = owner("a")
+    _job(conn, "ja", a, 10)
+    now = datetime(2026, 3, 2, 6, 0, tzinfo=timezone.utc)
+    _task(conn, "t1", "ja", "submitted",
+          leased_at=rounds._iso(datetime(2026, 2, 28, 23, 0, tzinfo=timezone.utc)),
+          ended=rounds._iso(datetime(2026, 3, 1, 1, 0, tzinfo=timezone.utc)))
+    assert fairness.month_hours(conn, a, now=now) == 0.0
 
 
 def test_a_spent_budget_refuses_the_enqueue_with_an_answer(client, conn, owner):
