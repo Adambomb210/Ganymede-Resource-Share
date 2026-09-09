@@ -320,8 +320,21 @@ because it drives the coordinator with a fake worker. Four defects; the two in
 the type itself — an unpresigned shard and a right-padded batch — were
 invisible to every test that injected its rows instead of fetching them.
 
-Still open here: the second type, which is what `11` §2's sandbox and `13` §5's
-spot-checks are both waiting on for their first end-to-end consumer.
+Still open here: the third type — `308` above offers two shapes (dataset
+processing, or generic containerised batch) and picks neither.
+
+**Correction to an earlier draft of this paragraph**, which said the sandbox and
+spot-checks were *both* waiting on it. Only the sandbox is. `11` §2's
+`JobContainer` is built and unit-tested and has no caller outside its own tests,
+and only the *containerised* candidate would give it one — a dataset-processing
+type is another in-tree body and leaves it exactly as unconsumed. `13` §5's
+spot-checks are not waiting on anything in this phase: they are built end to end
+(`spotcheck.maybe_issue` / `judge`, the ledger hookup, the migration), their
+determinism requirement is enforced structurally by living on the static-task
+reserve path that `collab_lora_finetune` does not use, and
+`tests/test_spotcheck.py` already drives them against a `batch_inference` job.
+What they want is `GANYMEDE_SPOTCHECK_RATE > 0` and a fleet to issue into —
+which makes them M4b's, not Phase E's.
 
 ---
 
