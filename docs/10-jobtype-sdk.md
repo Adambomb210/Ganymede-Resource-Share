@@ -369,6 +369,33 @@ then depended on which rows a batch happened to contain, and `batch_size` is a
 worker-side knob. Redundancy was comparing the fleet's configuration rather than
 its answers. Now asserted: one digest across batch sizes 1, 2 and 6.
 
+### Both bodies take a `cache=`
+
+`run` and `run_task` each take an optional
+`ganymede.trainer.modelcache.ModelCache`, and the worker passes one that lives
+as long as the process. `cache=None` is the old path exactly, so a one-shot CLI
+keeps nothing resident.
+
+It is not part of the seven-method protocol and should not become part of it: a
+job type does not get to decide the *worker's* memory policy, and a type that
+loads nothing has nothing to say. It is an argument to `run`, like `rows=` and
+`device=`.
+
+The two tiers are separate cache entries even for the same base model.
+`batch_inference` gets a bare model, because it only calls `.eval()` and
+generates — read-only and idempotent. `collab_lora_finetune` gets the whole
+assembled stack, because the training path *mutates what it is given*:
+`enable_input_require_grads` registers a forward hook and `get_peft_model`
+replaces target modules in place, so a second `attach_lora` over a cached base
+would wrap the wrappers. Caching the assembled stack and resetting only the
+weights avoids ever needing to un-mutate anything.
+
+The reset is `load_lora_state`, which is strict in both directions and is
+already what catches a `lora_cfg` disagreeing with its `base_adapter_ref`. That
+strictness is the entire safety argument for reuse — every trainable parameter
+is overwritten or it raises — which is why the reset lives inside the cache
+rather than at a call site where it could be forgotten.
+
 ---
 
 ## Spine deviations

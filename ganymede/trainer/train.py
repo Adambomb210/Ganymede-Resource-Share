@@ -250,23 +250,24 @@ def run_task(
     *,
     rows: Sequence[dict[str, Any]] | None = None,
     device: torch.device | None = None,
+    cache: Any | None = None,
 ) -> TrainResult:
     """Train ``task.local_steps`` optimizer steps on the assigned buckets.
 
     ``rows`` is an injection point for tests and for a worker that has already
     materialized the dataset; left as ``None`` it resolves ``task.dataset_ref``.
+
+    ``cache`` is a :class:`~ganymede.trainer.modelcache.ModelCache`, which a
+    long-lived worker passes so the base model is loaded once rather than once
+    per task (docs/03, "Two things worth knowing before M4b"). Left ``None``
+    this takes the same path it always did -- a one-shot CLI invocation has
+    nothing to reuse a model across, so it should not pay to keep one alive.
     """
     from ganymede.jobtypes.collab_lora_finetune.aggregate import load_adapter, save_adapter
 
     started = time.monotonic()
     hp = task.hp()
     device = device or model_mod.pick_device()
-
-    # Seeded before anything that draws: dropout is the live consumer here, and
-    # an unseeded dropout mask makes an otherwise identical retry of a task
-    # produce a different adapter, which would make a failed round impossible to
-    # reproduce.
-    torch.manual_seed(task.seed)
 
     if rows is None:
         rows = data_mod.resolve_dataset(task.dataset_ref)
@@ -278,20 +279,35 @@ def run_task(
         data_seed=int(hp["data_seed"]),
     )
 
-    tokenizer = model_mod.load_tokenizer(task.base_model)
-    base = model_mod.load_base(task.base_model, task.base_precision, device=device)
-
     checkpointing = hp["gradient_checkpointing"]
     if checkpointing is None:
         checkpointing = device.type == "cuda"
-    if checkpointing:
-        # Order matters: peft's inputs come from a frozen embedding, so without
-        # enable_input_require_grads the checkpointed segment has no input
-        # requiring grad and torch silently produces no gradient at all.
-        base.enable_input_require_grads()
-        base.gradient_checkpointing_enable()
 
-    peft_model = model_mod.attach_lora(base, task.lora_cfg, init_from=load_adapter(base_adapter_bytes))
+    adapter = load_adapter(base_adapter_bytes)
+    cache_hit = cache is not None and cache.would_hit(
+        model_ref=task.base_model, precision=task.base_precision,
+        device=device, lora_cfg=task.lora_cfg, checkpointing=checkpointing,
+    )
+    if cache is not None:
+        tokenizer = cache.tokenizer(task.base_model)
+        # The reset lives inside the cache, not here: `load_lora_state` is
+        # strict in both directions, so every trainable parameter is overwritten
+        # or it raises. See modelcache's "Why reuse is safe".
+        peft_model = cache.peft_model(
+            model_ref=task.base_model, precision=task.base_precision,
+            device=device, lora_cfg=task.lora_cfg,
+            checkpointing=checkpointing, adapter=adapter,
+        )
+    else:
+        tokenizer = model_mod.load_tokenizer(task.base_model)
+        base = model_mod.load_base(task.base_model, task.base_precision, device=device)
+        if checkpointing:
+            # Order matters: peft's inputs come from a frozen embedding, so
+            # without enable_input_require_grads the checkpointed segment has no
+            # input requiring grad and torch silently produces no gradient at all.
+            base.enable_input_require_grads()
+            base.gradient_checkpointing_enable()
+        peft_model = model_mod.attach_lora(base, task.lora_cfg, init_from=adapter)
     peft_model.train()
 
     params = model_mod.lora_params(peft_model)
@@ -301,6 +317,18 @@ def run_task(
     stream, n_rows_assigned = build_stream(task, tokenizer, rows, partition)
     grad_accum = max(1, int(hp["grad_accum"]))
     max_grad_norm = float(hp["max_grad_norm"])
+
+    # Seeded here rather than at the top, and the placement is the whole point:
+    # dropout draws from the global RNG during `train_loop`, and `attach_lora`
+    # also draws (peft initialises LoRA-A, which `init_from` then overwrites).
+    # Seeding before the setup therefore left the loop starting from an RNG
+    # position that depended on *how much setup had run* -- so a cached task,
+    # which skips `attach_lora`, would train a different adapter than the same
+    # task uncached. Seeding here makes the two identical, which is what the
+    # reproducibility this comment used to claim actually requires. Nothing
+    # between here and the old position consumes the global RNG: `build_stream`
+    # takes `task.seed` explicitly and `plan_partition` takes `data_seed`.
+    torch.manual_seed(task.seed)
 
     outcome = train_loop(
         peft_model=peft_model,
@@ -339,6 +367,13 @@ def run_task(
             round(step / outcome.train_seconds * 60, 3) if outcome.train_seconds > 0 else 0.0
         ),
         "setup_sec": round(setup_seconds, 3),
+        # Whether that setup skipped the model load. `safety_margin_sec` is
+        # meant to be set from observed `setup_sec`, and a cache makes that
+        # figure bimodal: the first task in a worker process pays the full
+        # load and every task after it pays almost nothing. Reading the mean of
+        # the two would under-size the margin for exactly the task that needs
+        # it. This flag is what lets an operator take the cold number.
+        "setup_cached": bool(cache is not None and cache_hit),
         "train_sec": round(outcome.train_seconds, 3),
         "tokens": outcome.tokens,
         "samples": outcome.samples,

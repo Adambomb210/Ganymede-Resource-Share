@@ -1148,11 +1148,65 @@ is also what `docker/README.md` tells a contributor to run — and asserts that
   is already usable as a cron check, and it deliberately says nothing about an
   idle fleet — §3.2 is explicit that idleness is normal operation, and alerting
   on it would train the operator to ignore the alert that matters.
-- **A worker re-loads the base model for every task**, and takes several tasks
-  per round when its budget is small relative to the round. At the measured M2
-  setup cost of 110 s on a 1.7B model, three tasks in a round is 330 s of setup
-  against one round of work. Not a correctness problem and not M4a's to fix, but
-  it will show up as soon as rounds run on real models.
+- ~~**A worker re-loads the base model for every task**~~ — **done.** It took
+  several tasks per round when its budget was small relative to the round, and
+  at the measured M2 setup cost of 110 s on a 1.7B model, three tasks in a round
+  was 330 s of setup against one round of work. Fixed before M4b rather than
+  after, because the cost is billed on a rental and it lands on wall-clock —
+  which is an M4b exit criterion, so an uncached worker would have had M4b
+  partly measuring the safetensors reader. `ganymede/trainer/modelcache.py`
+  holds one model for the life of the worker process; `cache=None` is still
+  literally the old path, so a one-shot CLI keeps nothing alive.
+
+  **Measured, and the 110 s does not reproduce.** On the dev box (CUDA, warm OS
+  page cache) `load_base` on `Qwen3-1.7B-Base` at bf16 is **15.7 s cold, ~2.8 s
+  warm**; three tasks went from 21.2 s to 3.4 s. So the saving is real and the
+  ordering is right, but nobody should quote "330 s" as the thing that was
+  fixed — the M2 figure was measured under conditions not reproduced here
+  (plausibly a cold cache or a first download), and `setup_sec` spans more than
+  the model load anyway. Re-measure on the rental.
+
+  Still uncached, and deliberately: **`resolve_dataset` runs per task too**
+  (1.2 s warm for Dolly 15k here). Same class of waste, an order of magnitude
+  smaller, and the eviction question is different — a dataset that does not fit
+  in RAM is a likelier shape than a model that does not fit in VRAM. Worth
+  doing only if the rental says it matters.
+
+  **A cache changes what the pause sentinel means.** docs/02 §7.1 says *create
+  the file and Ganymede stops taking the GPU*, and a worker that keeps a model
+  resident between tasks would have sat in the pause poll still holding 16 GB —
+  taking the GPU in the only sense the contributor cares about, with the kill
+  switch that makes the whole ask reasonable no longer doing what it says. The
+  pause branch now drops the cache. The `CoordinatorError` backoff deliberately
+  does *not*: that worker was not asked to stand down, it is waiting out someone
+  else's storage outage and will want the model back shortly.
+
+  Two things fell out of doing it. Neither was the reload:
+
+  - **The trainer's seed was in the wrong place.** `torch.manual_seed(task.seed)`
+    ran before the setup, and `attach_lora` draws from the global RNG (peft
+    initialises LoRA-A; `init_from` overwrites the values but the draw still
+    advances the stream). So `train_loop` began from an RNG position that
+    depended on *how much setup had run* — meaning a cached task, which skips
+    `attach_lora`, would have trained a different adapter than the same task
+    uncached. Not a crash and not a gate failure: a worker whose output silently
+    depended on whether it was the first task in the process. The seed now sits
+    immediately before `train_loop`. This changes bit-exactness for runs with
+    `lora_cfg.dropout > 0` (the default is 0.0, and no test asserts a golden
+    adapter; `tests/golden/phase_a_losstrace.json` is a captured artifact with
+    no consumer).
+  - **`cached_base_models` was advertising models the worker did not have.** The
+    ref was added from the parsed payload *before* the load that might fail, so
+    a worker whose 16 GB download died half way still claimed affinity for it —
+    and the coordinator, believing it, preferentially sent it more of the same.
+    It is now the cache's `loaded` set, populated when a load returns, which
+    also covers `batch_inference` — that body never fed the old set at all.
+
+  Checked and *not* a problem, recorded so it is not re-investigated:
+  `load_base` sets `model.config.use_cache = False`, which would make
+  `generate` quadratic on the inference path. It does not propagate —
+  `generation_config.use_cache` is independently `True`, and outputs are
+  identical with and without it passed explicitly.
 
 ---
 

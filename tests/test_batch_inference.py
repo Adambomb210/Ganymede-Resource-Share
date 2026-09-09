@@ -788,6 +788,52 @@ def test_the_digest_does_not_depend_on_the_worker_s_batch_size(tiny_lm):
     assert len(set(digests.values())) == 1, digests
 
 
+def test_two_shards_share_one_loaded_model_and_agree_with_an_uncached_run(
+    tiny_model_dir, monkeypatch
+):
+    """The cache matters more here than on the training side: shards are small
+    and numerous, so a worker handed a run's worth of them would otherwise pay
+    the full model load for every one (docs/03, "Two things worth knowing
+    before M4b").
+
+    Reuse is unconditionally safe for this type -- ``.eval()`` and ``generate``
+    are read-only and idempotent -- but "safe by inspection" is what the right
+    padding was too, so the digests are compared against uncached runs rather
+    than assumed.
+    """
+    from ganymede.trainer.modelcache import ModelCache
+
+    loads = []
+    real_load = M.load_base
+    monkeypatch.setattr(
+        M, "load_base",
+        lambda *a, **kw: (loads.append(a[0]), real_load(*a, **kw))[1],
+    )
+
+    spec = _spec([{"ref": "s0", "rows": 3}, {"ref": "s1", "rows": 3}])
+    spec["model_ref"] = tiny_model_dir
+    task_specs = bi_plan.plan(_job_row(spec), conn=None)[:2]
+    rows = [[{"id": f"s{n}r{i}", "input": " ".join(f"w{j}" for j in range(i + 1))}
+             for i in range(3)] for n in (0, 1)]
+
+    cache = ModelCache()
+    shared = [
+        BatchInference().run(_infer_task(spec, ts), _Inputs(), rows=r, device=CPU,
+                             upload=lambda b: None, cache=cache).digest
+        for ts, r in zip(task_specs, rows)
+    ]
+    assert len(loads) == 1, "the second shard reloaded the model"
+
+    uncached = [
+        BatchInference().run(_infer_task(spec, ts), _Inputs(), rows=r, device=CPU,
+                             upload=lambda b: None).digest
+        for ts, r in zip(task_specs, rows)
+    ]
+    assert shared == uncached
+    assert len(loads) == 3
+    assert cache.stats() == {"hits": 1, "misses": 1, "resident": 1}
+
+
 def test_an_hf_ref_is_stripped_before_it_reaches_from_pretrained():
     """``inputs_for`` passes an ``hf://`` ref through on the grounds that the
     worker pulls it from the Hub itself -- and ``from_pretrained`` has never

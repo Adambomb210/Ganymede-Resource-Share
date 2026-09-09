@@ -161,11 +161,19 @@ def run(
     device: Any | None = None,
     upload: Callable[[bytes], None] | None = None,
     batch_size: int = 8,
+    cache: Any | None = None,
 ) -> InferResult:
     """Run the shard. ``rows`` / ``model`` / ``tokenizer`` / ``upload`` are the
     injection points -- left ``None`` they resolve the presigned URLs in
     ``inputs`` and load the model from ``task.model_ref`` (the repo's
-    established ``run_task(rows=..., device=...)`` seam)."""
+    established ``run_task(rows=..., device=...)`` seam).
+
+    ``cache`` is a :class:`~ganymede.trainer.modelcache.ModelCache`. Shards are
+    small and numerous, so the per-task load dominates this type even harder
+    than it does training -- a worker handed a run's worth of shards would
+    otherwise pay the full model load for each one. Reuse is unconditionally
+    safe here because nothing below mutates the model: ``.eval()`` and
+    ``generate`` are read-only and idempotent."""
     import torch
 
     from ganymede.trainer import model as model_mod
@@ -181,10 +189,13 @@ def run(
     rows = list(rows)
 
     device = device or model_mod.pick_device()
+    model_id = _hf_id(task.model_ref)
     if tokenizer is None:
-        tokenizer = model_mod.load_tokenizer(_hf_id(task.model_ref))
+        tokenizer = (cache.tokenizer(model_id) if cache is not None
+                     else model_mod.load_tokenizer(model_id))
     if model is None:
-        model = model_mod.load_base(_hf_id(task.model_ref), "fp32", device=device)
+        model = (cache.base(model_id, "fp32", device) if cache is not None
+                 else model_mod.load_base(model_id, "fp32", device=device))
     model.eval()
 
     # Generation pads on the LEFT. A decoder-only model continues from the last

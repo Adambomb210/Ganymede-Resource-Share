@@ -29,6 +29,7 @@ class StubClient:
         self.heartbeat_raises: Exception | None = None
         self.heartbeat_body: dict = {}
         self.upload_raises: Exception | None = None
+        self.claims: list[dict] = []
 
     def register(self, profile, image_tag=None):
         self.calls.append(("register", image_tag))
@@ -36,6 +37,7 @@ class StubClient:
 
     def claim(self, worker_id, **kwargs):
         self.calls.append(("claim", kwargs.get("run_id")))
+        self.claims.append(dict(kwargs))
         if self.tasks:
             return self.tasks.pop(0), 0
         return None, 1
@@ -333,11 +335,12 @@ def stub_trainer(monkeypatch):
             self.stopped_early = stopped_early
             self.metrics = {"steps": steps, "tokens": 128, "steps_per_min": 12.0}
 
-    state = {"result": Result(), "on_step": None, "should_stop": None}
+    state = {"result": Result(), "on_step": None, "should_stop": None, "kwargs": {}}
 
     def fake_run_task(task, base_adapter, on_step=None, should_stop=None, **kwargs):
         state["on_step"] = on_step
         state["should_stop"] = should_stop
+        state["kwargs"] = kwargs
         if on_step:
             on_step(0, 1.5)
         return state["result"]
@@ -486,6 +489,54 @@ def test_a_pause_file_keeps_the_worker_alive_but_idle(tmp_path, monkeypatch):
     assert slept == [loop_mod.PAUSE_POLL_SEC]
 
 
+def test_a_paused_worker_gives_the_card_back(tmp_path, monkeypatch):
+    """docs/02 §7.1 on the pause sentinel: *create the file and Ganymede stops
+    taking the GPU*.
+
+    Staying installed and claiming nothing is not enough once a worker keeps a
+    model resident between tasks -- a paused worker still holding 16 GB is
+    taking the GPU in the only sense the contributor cares about, and the kill
+    switch that makes the whole ask reasonable would not have done what it says
+    on the tin.
+    """
+    from ganymede.trainer.modelcache import ModelCache
+
+    worker = make_worker(tmp_path, client=StubClient(tasks=[TASK]))
+    worker.model_cache = ModelCache()
+    worker.model_cache._models[("base", "tiny", "fp32", "cuda")] = object()
+    worker.control.request_pause()
+    monkeypatch.setattr(loop_mod.time, "sleep",
+                        lambda s: worker.control.request_stop())
+
+    assert worker.run() == 0
+    assert worker.model_cache.stats()["resident"] == 0
+
+
+def test_a_storage_outage_keeps_the_model_warm(tmp_path, monkeypatch):
+    """The other side of the line above. A worker backing off a coordinator or
+    object-store outage (M4a's lesson) has not been asked to stand down -- it is
+    waiting out someone else's problem and will want the model back shortly, so
+    dropping it there would turn a blip into a reload."""
+    from ganymede.trainer.modelcache import ModelCache
+
+    client = StubClient()
+    client.claim = lambda *a, **k: (_ for _ in ()).throw(CoordinatorError(0, "down", "u"))
+    worker = make_worker(tmp_path, client=client)
+    worker.model_cache = ModelCache()
+    worker.model_cache._models[("base", "tiny", "fp32", "cuda")] = object()
+
+    calls = {"n": 0}
+
+    def idle(seconds=0):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            worker.control.request_stop()
+
+    worker._idle = idle
+    assert worker.run() == 0
+    assert worker.model_cache.stats()["resident"] == 1
+
+
 def test_a_claim_failure_is_survivable(tmp_path):
     """A coordinator restart must not take the fleet down with it (6.4)."""
     client = StubClient()
@@ -553,15 +604,59 @@ def test_a_round_whose_work_was_dropped_still_counts_as_worked(tmp_path, monkeyp
     assert worker.rounds_done == 2
 
 
-def test_the_worker_remembers_which_base_models_it_has_cached(tmp_path, stub_trainer):
+def test_the_worker_advertises_the_base_models_it_actually_loaded(tmp_path, stub_trainer):
     """6.2: given two eligible runs the coordinator prefers the one whose base
-    model this worker already holds -- seconds instead of a 16 GB download."""
+    model this worker already holds -- seconds instead of a 16 GB download.
+
+    The set is now the model cache's, which is populated when a load *returns*.
+    It used to be filled from the parsed payload before the load ran, so a
+    worker whose 16 GB download died half way still advertised affinity for the
+    model it did not have -- and the coordinator, believing it, preferentially
+    sent it more of the same. ``batch_inference`` never fed the old set at all.
+    """
+    from ganymede.trainer.modelcache import ModelCache
+
+    client = StubClient(tasks=[TASK])
+    worker = make_worker(tmp_path, client=client, once=True)
+    monkey_idle(worker)
+
+    # Nothing has loaded yet, so a worker advertises nothing.
+    worker.model_cache = ModelCache()
+    assert worker._cached_base_models() == set()
+
+    # A load that returned is what puts a ref in the set.
+    worker.model_cache.loaded.add("tiny")
+    assert worker._cached_base_models() == {"tiny"}
+
+    worker.run()
+    assert client.claims[0]["cached_base_models"] == ["tiny"]
+
+
+def test_a_stubbed_trainer_loads_nothing_and_so_advertises_nothing(tmp_path, stub_trainer):
+    """The other half of the claim above, and the reason the test beside it has
+    to reach into the cache: a worker only advertises a model it really loaded,
+    and ``stub_trainer`` never loads one."""
     client = StubClient(tasks=[TASK])
     worker = make_worker(tmp_path, client=client, once=True)
     monkey_idle(worker)
     worker.run()
 
-    assert "tiny" in worker.cached_base_models
+    assert worker._cached_base_models() == set()
+
+
+def test_both_bodies_are_handed_the_same_process_lifetime_cache(tmp_path, stub_trainer):
+    """docs/03's pre-M4b note: the point of the cache is that it outlives the
+    task. A cache built per task would save nothing and still hold a model."""
+    client = StubClient(tasks=[_task_in_round(0), _task_in_round(1)])
+    worker = make_worker(tmp_path, client=client, max_rounds=2)
+    monkey_idle(worker)
+    worker.run()
+
+    assert worker.tasks_done == 2
+    assert worker.model_cache is not None
+    # The same object the second task was handed -- not one built per task,
+    # which would save nothing and still hold a model.
+    assert stub_trainer["kwargs"]["cache"] is worker.model_cache
 
 
 def test_config_reads_the_documented_environment(monkeypatch):

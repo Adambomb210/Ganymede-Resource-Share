@@ -249,6 +249,13 @@ class Worker:
     # round 0 having taken twenty tiny tasks each and the run never advanced.
     rounds_worked: set[tuple[str, int]] = field(default_factory=set)
     cached_base_models: set[str] = field(default_factory=set)
+    # One process-lifetime model cache, shared by both bodies. docs/03 flagged
+    # the uncached reload as worth knowing before M4b: at 110 s on a 1.7B model,
+    # a worker taking three tasks in a round spent 330 s loading. That is billed
+    # time on a rental and it lands on wall-clock, which is an M4b exit
+    # criterion -- so an uncached worker would have M4b measuring the
+    # safetensors reader.
+    model_cache: Any = None
 
     @property
     def rounds_done(self) -> int:
@@ -381,6 +388,16 @@ class Worker:
 
     # ---------------- step 8: one round ----------------
 
+    def _cache(self):
+        """Built on first use rather than in ``__post_init__``: constructing the
+        cache imports the trainer, and a Worker gets built in plenty of places
+        that never run a task."""
+        if self.model_cache is None:
+            from ganymede.trainer.modelcache import ModelCache
+
+            self.model_cache = ModelCache()
+        return self.model_cache
+
     def run_round(self, task: dict[str, Any]) -> dict[str, Any] | None:
         """Run and submit one task. Returns the submit response, or None if the
         work was dropped (round closed, lease lost, or told to stop).
@@ -455,7 +472,6 @@ class Worker:
                  task_id, len(base_adapter), download_sec)
 
         parsed = Task.from_payload(task)
-        self.cached_base_models.add(parsed.base_model)
 
         def on_step(step: int, loss: float) -> None:
             beat.record(step + 1, loss)
@@ -464,7 +480,8 @@ class Worker:
             return beat.should_drop() or self.control.should_stop() \
                 or self.control.should_pause()
 
-        result = run_task(parsed, base_adapter, on_step=on_step, should_stop=should_stop)
+        result = run_task(parsed, base_adapter, on_step=on_step,
+                          should_stop=should_stop, cache=self._cache())
 
         if beat.cancelled():
             # docs/11 §3 step 3. For a *built-in* job type there is no job
@@ -563,7 +580,7 @@ class Worker:
             return signal
 
         try:
-            result = jt.run(parsed, inputs, on_step, should_stop)
+            result = jt.run(parsed, inputs, on_step, should_stop, cache=self._cache())
         except RuntimeError:
             # ``run`` raises on a hard stop. That is an abort we asked for iff
             # we asked for it; anything else is a real failure and must reach
@@ -665,6 +682,37 @@ class Worker:
                  f" ({response['reject_reason']})" if response.get("reject_reason") else "")
         return response
 
+    def _release_gpu(self) -> None:
+        """Drop the cached model. Called when the worker is paused.
+
+        docs/02 §7.1 on the pause sentinel: *create the file and Ganymede stops
+        taking the GPU*. A worker that sat in the pause poll still holding a
+        16 GB model would be taking the GPU in the only sense the contributor
+        cares about -- their card would still be full, and the kill switch that
+        makes the whole ask reasonable would not have done what it says.
+
+        Only the pause path, deliberately. The ``CoordinatorError`` backoff also
+        idles, but that worker has not been asked to stand down -- it is waiting
+        out someone else's storage outage and will want the model back shortly.
+        Stopping needs nothing: the process exits and the driver reclaims it.
+        """
+        if self.model_cache is not None and self.model_cache.stats()["resident"]:
+            log.info("pause: releasing the cached model")
+            self.model_cache.clear()
+
+    def _cached_base_models(self) -> set[str]:
+        """What this worker can start on without a download (docs/02 §6.2).
+
+        The cache's ``loaded`` set is the honest version of this: a ref lands in
+        it after a load *succeeded*, where the old call site added it from the
+        parsed payload before the load ran -- so a worker whose download died
+        half way still advertised affinity for the model it did not have, and
+        the coordinator preferentially sent it more of the same. It also covers
+        ``batch_inference``, which never fed the old set at all.
+        """
+        loaded = self.model_cache.loaded if self.model_cache is not None else set()
+        return self.cached_base_models | loaded
+
     def _abandon(self, task_id: str) -> None:
         try:
             self.client.abandon(task_id)
@@ -690,6 +738,7 @@ class Worker:
 
             if self.control.should_pause():
                 log.info("paused: %s", self.control.reason())
+                self._release_gpu()
                 time.sleep(PAUSE_POLL_SEC)
                 continue
 
@@ -697,7 +746,7 @@ class Worker:
                 task, retry_after = self.client.claim(
                     self.worker_id,
                     capabilities=self.profile,
-                    cached_base_models=sorted(self.cached_base_models),
+                    cached_base_models=sorted(self._cached_base_models()),
                     run_id=self.config.run_id,
                 )
             except CoordinatorError as exc:
