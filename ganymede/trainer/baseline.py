@@ -115,10 +115,25 @@ def run_baseline_seed(
         ).as_dict()
 
     curve: list[dict[str, Any]] = []
+    # Time, per curve point, because M4b's second exit criterion is held-out
+    # loss against **wall-clock**, not against steps -- "otherwise the system is
+    # an expensive way to train slower". Without this the run records only its
+    # total, so there is no way to ask when the baseline *reached* a given loss,
+    # and the criterion has nothing to compare a distributed run against.
+    #
+    # Two clocks, because one of them would be misleading on its own.
+    # ``train_sec`` excludes evaluation, and is the fair comparison: evaluating
+    # every ``eval_every`` steps is an artifact of measuring the baseline, and a
+    # distributed run is not charged for it. ``wall_sec`` is everything since
+    # this seed started, which is what an operator actually waited. The harness
+    # uses ``train_sec`` and says so; ``wall_sec`` is here so the overhead is
+    # visible rather than inferred.
+    started = time.monotonic()
     # Step 0 is the seed adapter, which is a no-op on the base model (lora_B is
     # exactly zero), so this point is the untuned base model's held-out loss.
     # Recording it is what makes the rest of the curve interpretable.
-    curve.append({"step": 0, **evaluate_now()})
+    curve.append({"step": 0, "train_sec": 0.0, **evaluate_now(),
+                  "wall_sec": round(time.monotonic() - started, 2)})
 
     done = 0
     train_seconds = 0.0
@@ -134,7 +149,9 @@ def run_baseline_seed(
         done += outcome.steps
         train_seconds += outcome.train_seconds
         losses.extend(outcome.losses)
-        curve.append({"step": done, **evaluate_now()})
+        curve.append({"step": done, "train_sec": round(train_seconds, 2),
+                      **evaluate_now(),
+                      "wall_sec": round(time.monotonic() - started, 2)})
         if outcome.steps < chunk:  # nothing left to draw from; should not happen
             break
 
@@ -172,13 +189,21 @@ def summarize(seed_results: list[dict[str, Any]], k: float = DEFAULT_TOLERANCE_K
     if len(grids) == 1:
         for i, step in enumerate(next(iter(grids))):
             at = [r["curve"][i]["loss"] for r in seed_results]
-            curve_summary.append({
+            point = {
                 "step": step,
                 "mean": round(statistics.fmean(at), 5),
                 "stdev": round(statistics.stdev(at), 5) if len(at) > 1 else 0.0,
                 "min": round(min(at), 5),
                 "max": round(max(at), 5),
-            })
+            }
+            # Mean seconds to reach this point, when the seeds recorded it. A
+            # `baseline.json` written before timing existed has no such key, and
+            # the harness reports the criterion as unevaluated rather than
+            # failed -- a missing measurement is not a failure (scripts/verdict.py).
+            secs = [r["curve"][i].get("train_sec") for r in seed_results]
+            if all(x is not None for x in secs):
+                point["train_sec_mean"] = round(statistics.fmean(secs), 2)
+            curve_summary.append(point)
 
     return {
         "seeds": len(finals),

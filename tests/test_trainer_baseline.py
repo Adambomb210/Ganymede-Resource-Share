@@ -91,3 +91,27 @@ def test_mismatched_eval_grids_produce_no_curve_rather_than_a_wrong_one():
     s = B.summarize(results)
     assert s["curve"] == []
     assert s["final_mean"] > 0  # the final-loss statistics are still valid
+
+
+def test_the_summary_carries_timing_when_the_seeds_recorded_it():
+    """M4b asks whether the distributed run beats one GPU on **wall-clock**, so
+    the baseline has to say when it reached each loss, not just that it got
+    there. Mean seconds per curve point is what the comparison needs."""
+    results = [
+        {"seed": i, "final_loss": 1.8, "initial_loss": 2.5,
+         "curve": [{"step": st, "loss": 2.0, "train_sec": st * mult}
+                   for st in (0, 100, 200)]}
+        for i, mult in ((1, 1.0), (2, 2.0))
+    ]
+    s = B.summarize(results)
+    assert [p["train_sec_mean"] for p in s["curve"]] == [0.0, 150.0, 300.0]
+
+
+def test_a_baseline_written_before_timing_existed_summarizes_without_it():
+    """`baseline.json` is a checked-in artifact produced by a GPU run. Reading
+    an older one must not raise -- the harness reports that criterion as
+    unevaluated, which is not the same as failed."""
+    s = B.summarize([_seed_result(1, [2.5, 2.0, 1.8]),
+                     _seed_result(2, [2.5, 2.1, 1.81])])
+    assert s["curve"], "the curve should still be summarized"
+    assert all("train_sec_mean" not in p for p in s["curve"])
