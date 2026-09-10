@@ -17,11 +17,5 @@
   </table>
 </section>
 
-{% if rounds %}
-<section class="card" id="rounds"
-         hx-trigger="sse:round.close, sse:sync" hx-swap="outerHTML"
-         hx-get="/ui/frag/rounds/{{ job.id }}">
-  {% include "frags/rounds.html" %}
-</section>
-{% endif %}
+{% include "frags/rounds.html" %}
 {% endblock %}

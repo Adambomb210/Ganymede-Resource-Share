@@ -709,3 +709,186 @@ def test_the_form_posts_form_encoded_because_its_endpoint_takes_form_fields(clie
     as_json = client.post("/ui/jobs/new", headers=_as(client, cookie), json={
         "job_type": "batch_inference", "spec": json.dumps(BATCH_SPEC)})
     assert as_json.status_code == 422
+
+
+# ==========================================================================
+# Live fragments -- the swap that deletes its own listener
+# ==========================================================================
+
+
+def _sse_driven_elements():
+    """Every element that refetches itself when an SSE event arrives.
+
+    Yields ``(template, element_id, hx_get, swap)``. Crude parsing again, and
+    again for the same reason: what matters is the literal attribute text.
+    """
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "ganymede/coordinator/templates"
+    for path in sorted(root.rglob("*.html")):
+        text = path.read_text(encoding="utf-8")
+        for tag in re.finditer(r"<(?:section|div|tr|table)\b[^>]*hx-trigger[^>]*>",
+                               text, re.S):
+            blob = tag.group(0)
+            if "sse:" not in blob:
+                continue
+            get = re.search(r'hx-get="([^"]*)"', blob)
+            eid = re.search(r'id="([^"]*)"', blob)
+            swap = re.search(r'hx-swap="([^"]*)"', blob)
+            yield (path.name, eid.group(1) if eid else None,
+                   get.group(1) if get else None,
+                   swap.group(1) if swap else "innerHTML")
+
+
+def test_every_sse_driven_fragment_replaces_itself_with_a_listener(client, conn):
+    """An ``hx-swap="outerHTML"`` element whose fragment route returns only the
+    *inner* content deletes itself on the first swap -- and ``sse:sync`` fires
+    on connect, so that happens on page load. The page then renders correctly
+    and never updates again, which is invisible to every test that fetches a
+    page or a fragment on its own.
+
+    Five shipped that way: the jobs list, the machines list, the queue, the
+    submitters table and the rounds table. The three that were right
+    (``fleet``, ``job_header``, ``job_row``) put the wrapper *in the fragment*,
+    so the response carries the id and the triggers again -- that is the idiom
+    this asserts.
+
+    Found by the browser pass (docs/12); nothing else can see it, because the
+    defect is in what the *next* event does, not in either response.
+    """
+    _make_local_user(conn, "root", is_admin=True, secret="rootpw")
+    cookie = _login(client, "root", "rootpw")
+
+    checked = 0
+    for template, eid, hx_get, swap in _sse_driven_elements():
+        assert eid, f"{template}: an sse-driven element with no id cannot be re-targeted"
+        if hx_get is None or swap != "outerHTML":
+            continue
+        # A URL with a Jinja expression in it needs a real id; those are covered
+        # by the job-detail fragments, which the browser suite drives.
+        if "{{" in hx_get:
+            continue
+        resp = client.get(hx_get, headers={"Cookie": cookie})
+        assert resp.status_code == 200, f"{template}: {hx_get} -> {resp.status_code}"
+        assert f'id="{eid}"' in resp.text, (
+            f'{template}: {hx_get} does not return id="{eid}", so the outerHTML '
+            f"swap removes the element that listens for the event"
+        )
+        assert "hx-trigger" in resp.text and "sse:" in resp.text, (
+            f"{template}: {hx_get} returns the id but no sse trigger -- the "
+            f"element survives one swap and stops listening"
+        )
+        checked += 1
+
+    assert checked >= 4, f"only {checked} fragments checked -- the parse found nothing"
+
+
+def test_a_job_with_rounds_renders_its_rounds_table(client, conn):
+    """`frags/rounds.html` had never been rendered, and could not be.
+
+    It was missing an `{% endfor %}`, which Jinja only reports when it parses
+    the file -- and `{% include %}` parses lazily, so the page's
+    `{% if rounds %}` guard meant a job with no rounds never touched it. Every
+    job in this suite had no rounds. The template shipped, was reachable from
+    the one page that matters most while a run is live, and would have raised
+    a 500 the first time a round existed.
+
+    So this test's real assertion is the 200: it is the only one in the suite
+    that makes the job-detail page render that fragment at all.
+    """
+    owner = _make_local_user(conn, "owner", secret="pw")
+    now = _iso(utcnow())
+    with immediate(conn):
+        conn.execute(
+            """INSERT INTO jobs (id, owner_id, job_type, spec_json, image_id, status,
+                        priority_rank, constraints_json, cancel_mode, created_at)
+               VALUES ('jr', ?, 'collab_lora_finetune', '{}', NULL, 'running', 1, '{}', NULL, ?)""",
+            (owner, now),
+        )
+        conn.execute(
+            """INSERT INTO runs (id, job_id, status, base_model, base_precision,
+                        lora_cfg_json, dataset_ref, hyperparams_json, target_rounds,
+                        created_at)
+               VALUES ('run1', 'jr', 'active', 'm', 'bf16', '{}', 'd', '{}', 4, ?)""",
+            (now,),
+        )
+        conn.execute(
+            """INSERT INTO rounds (run_id, idx, base_adapter_ref, status, target_steps,
+                        min_round_sec, max_round_sec, opened_at, closed_at,
+                        distinct_contributors, eval_loss, adapter_divergence)
+               VALUES ('run1', 0, 'a/0', 'closed', 10, 0, 600, ?, ?, 3, 4.878, 0.657)""",
+            (now, now),
+        )
+
+    cookie = _login(client, "owner", "pw")
+    resp = client.get("/ui/jobs/jr", headers={"Cookie": cookie})
+    assert resp.status_code == 200, resp.text
+    assert 'id="rounds"' in resp.text
+    assert "4.878" in resp.text and "0.657" in resp.text
+
+    # And the fragment route renders the same wrapper, so the SSE swap keeps
+    # its listener (see test_every_sse_driven_fragment_replaces_itself_with_a_listener).
+    frag = client.get("/ui/frag/rounds/jr", headers={"Cookie": cookie})
+    assert frag.status_code == 200, frag.text
+    assert 'id="rounds"' in frag.text and "sse:round.close" in frag.text
+
+
+def test_a_job_with_no_rounds_shows_the_listener_but_not_the_table(client, conn):
+    """Both halves of the same element, and they pull against each other.
+
+    docs/12's read model: a type without ``reduce`` shows tasks only, so a
+    `batch_inference` job must not sprout an empty Rounds section. But the
+    wrapper has to exist from page load, or the `sse:round.close` refetch has
+    nothing to target when the first round *does* close -- which is exactly the
+    defect the wrapper was moved into the fragment to fix.
+
+    So the guard is on the contents, not on the element.
+    """
+    owner = _make_local_user(conn, "owner2", secret="pw")
+    with immediate(conn):
+        conn.execute(
+            """INSERT INTO jobs (id, owner_id, job_type, spec_json, image_id, status,
+                        priority_rank, constraints_json, cancel_mode, created_at)
+               VALUES ('nr', ?, 'batch_inference', '{}', NULL, 'queued', 1, '{}', NULL, ?)""",
+            (owner, _iso(utcnow())),
+        )
+    cookie = _login(client, "owner2", "pw")
+    resp = client.get("/ui/jobs/nr", headers={"Cookie": cookie})
+    assert resp.status_code == 200
+    assert 'id="rounds"' in resp.text
+    assert "sse:round.close" in resp.text
+    assert "<h2>Rounds</h2>" not in resp.text
+
+
+def test_the_enroll_fragment_is_chosen_by_hx_request_not_accept(client, conn):
+    """htmx sends **no** Accept header -- the XHR default is ``*/*``.
+
+    So the original ``"text/html" in accept`` test was false for the one caller
+    it was written for: the browser got the JSON body, and ``hx-swap="outerHTML"``
+    replaced the #enroll section with the one-time token as raw text. The suite
+    could not see it, because its own test hands the endpoint
+    ``Accept: text/html`` -- exactly what the real client never sends.
+
+    Both keys are asserted here: an htmx request with no Accept gets the
+    fragment, and a plain API caller still gets the frozen JSON shape.
+    """
+    _make_local_user(conn, "root", is_admin=True, secret="rootpw")
+    cookie = _login(client, "root", "rootpw")
+
+    as_htmx = client.post(
+        "/v1/machines/enroll",
+        headers={"Cookie": cookie, "X-Ganymede-UI": "1", "HX-Request": "true",
+                 "Accept": "*/*"},
+        json={"display_name": "box"},
+    )
+    assert as_htmx.status_code == 200
+    assert as_htmx.headers["content-type"].startswith("text/html")
+    assert 'id="enroll"' in as_htmx.text
+
+    as_api = client.post(
+        "/v1/machines/enroll",
+        headers={"Cookie": cookie, "X-Ganymede-UI": "1"},
+        json={"display_name": "box2"},
+    )
+    assert as_api.status_code == 200
+    assert as_api.json()["enroll_token"].startswith("gme_")

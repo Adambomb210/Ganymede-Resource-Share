@@ -1,12 +1,20 @@
-<table>
-  <tr><th>job</th><th>owner</th><th>type</th><th>status</th><th>rank</th><th>leased</th><th>created</th></tr>
-  {% for j in jobs %}
-  {% set job = j %}
-  {% include "frags/job_row.html" %}
-  {% else %}
-  <tr><td colspan="7">no jobs</td></tr>
-  {% endfor %}
-</table>
-{% if before %}
-<p><a href="/ui/jobs?before={{ before[0] }},{{ before[1] }}">older →</a></p>
-{% endif %}
+{# The wrapper lives here, not in the page: this fragment answers its own
+   hx-get with hx-swap="outerHTML", so what comes back must carry the id
+   and the triggers again or the element replaces itself with something
+   that no longer listens. See docs/12. #}
+<section id="jobs-list"
+         hx-trigger="sse:job.status, sse:sync"
+         hx-get="/ui/frag/jobs-table" hx-swap="outerHTML">
+  <table>
+    <tr><th>job</th><th>owner</th><th>type</th><th>status</th><th>rank</th><th>leased</th><th>created</th></tr>
+    {% for j in jobs %}
+    {% set job = j %}
+    {% include "frags/job_row.html" %}
+    {% else %}
+    <tr><td colspan="7">no jobs</td></tr>
+    {% endfor %}
+  </table>
+  {% if before %}
+  <p><a href="/ui/jobs?before={{ before[0] }},{{ before[1] }}">older →</a></p>
+  {% endif %}
+</section>

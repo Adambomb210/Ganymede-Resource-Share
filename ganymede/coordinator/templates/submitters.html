@@ -2,9 +2,5 @@
 {% block title %}Submitters — Ganymede{% endblock %}
 {% block content %}
 <h1>Submitters</h1>
-<section id="submitters-table"
-         hx-trigger="sse:submitter.change, sse:queue.change, sse:sync" hx-swap="outerHTML"
-         hx-get="/ui/frag/submitters">
-  {% include "frags/submitters_table.html" %}
-</section>
+{% include "frags/submitters_table.html" %}
 {% endblock %}

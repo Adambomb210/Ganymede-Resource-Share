@@ -1,43 +1,51 @@
-<table>
-  <tr><th>user</th><th>status</th><th>running jobs</th><th>pinned images</th><th>decided</th><th>note</th><th>action</th></tr>
-  {% for s in submitters %}
-  <tr>
-    <td>{{ s.user_name }}</td>
-    <td>{{ s.status }}</td>
-    <td>{{ s.running_jobs }}</td>
-    <td>
-      {% for img in s.pinned_images %}
-      <code title="{{ img.digest }}">{{ img.id[:8] }}</code> ({{ img.scan_status }}){{ ", " if not loop.last else "" }}
-      {% else %}—
-      {% endfor %}
-    </td>
-    <td>{{ s.decided_by_name or "—" }}{{ " " }}{{ s.decided_at or "" }}</td>
-    <td>{{ s.note or "—" }}</td>
-    <td>
-      {# Approve / deny / revoke: the frozen docs/06 body. hx-vals is static,
-         server-rendered -- never js: (CSP). Revoking does not kill jobs; the
-         admin cancels those explicitly per job (docs/06 Decision 18). #}
-      {% if s.status != "approved" %}
-      <button hx-post="/v1/admin/submitters/{{ s.user_id }}" hx-ext="json-enc"
-              hx-headers='{"X-Ganymede-UI":"1"}'
-              hx-vals='{"status": "approved"}'
-              hx-swap="none">approve</button>
-      {% endif %}
-      {% if s.status == "pending" %}
-      <button hx-post="/v1/admin/submitters/{{ s.user_id }}" hx-ext="json-enc"
-              hx-headers='{"X-Ganymede-UI":"1"}'
-              hx-vals='{"status": "denied"}'
-              hx-swap="none">deny</button>
-      {% endif %}
-      {% if s.status != "revoked" %}
-      <button hx-post="/v1/admin/submitters/{{ s.user_id }}" hx-ext="json-enc"
-              hx-headers='{"X-Ganymede-UI":"1"}'
-              hx-vals='{"status": "revoked"}'
-              hx-swap="none">revoke</button>
-      {% endif %}
-    </td>
-  </tr>
-  {% else %}
-  <tr><td colspan="7">no submitters</td></tr>
-  {% endfor %}
-</table>
+{# The wrapper lives here, not in the page: this fragment answers its own
+   hx-get with hx-swap="outerHTML", so what comes back must carry the id
+   and the triggers again or the element replaces itself with something
+   that no longer listens. See docs/12. #}
+<section id="submitters-table"
+         hx-trigger="sse:submitter.change, sse:queue.change, sse:sync"
+         hx-get="/ui/frag/submitters" hx-swap="outerHTML">
+  <table>
+    <tr><th>user</th><th>status</th><th>running jobs</th><th>pinned images</th><th>decided</th><th>note</th><th>action</th></tr>
+    {% for s in submitters %}
+    <tr>
+      <td>{{ s.user_name }}</td>
+      <td>{{ s.status }}</td>
+      <td>{{ s.running_jobs }}</td>
+      <td>
+        {% for img in s.pinned_images %}
+        <code title="{{ img.digest }}">{{ img.id[:8] }}</code> ({{ img.scan_status }}){{ ", " if not loop.last else "" }}
+        {% else %}—
+        {% endfor %}
+      </td>
+      <td>{{ s.decided_by_name or "—" }}{{ " " }}{{ s.decided_at or "" }}</td>
+      <td>{{ s.note or "—" }}</td>
+      <td>
+        {# Approve / deny / revoke: the frozen docs/06 body. hx-vals is static,
+           server-rendered -- never js: (CSP). Revoking does not kill jobs; the
+           admin cancels those explicitly per job (docs/06 Decision 18). #}
+        {% if s.status != "approved" %}
+        <button hx-post="/v1/admin/submitters/{{ s.user_id }}" hx-ext="json-enc"
+                hx-headers='{"X-Ganymede-UI":"1"}'
+                hx-vals='{"status": "approved"}'
+                hx-swap="none">approve</button>
+        {% endif %}
+        {% if s.status == "pending" %}
+        <button hx-post="/v1/admin/submitters/{{ s.user_id }}" hx-ext="json-enc"
+                hx-headers='{"X-Ganymede-UI":"1"}'
+                hx-vals='{"status": "denied"}'
+                hx-swap="none">deny</button>
+        {% endif %}
+        {% if s.status != "revoked" %}
+        <button hx-post="/v1/admin/submitters/{{ s.user_id }}" hx-ext="json-enc"
+                hx-headers='{"X-Ganymede-UI":"1"}'
+                hx-vals='{"status": "revoked"}'
+                hx-swap="none">revoke</button>
+        {% endif %}
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="7">no submitters</td></tr>
+    {% endfor %}
+  </table>
+</section>

@@ -1,2 +1,9 @@
-<h2>Your machines</h2>
-{% include "frags/machines_table.html" %}
+{# The wrapper lives here, not in the page: this fragment answers its own
+   hx-get with hx-swap="outerHTML", so what comes back must carry the id
+   and the triggers again or the element replaces itself with something
+   that no longer listens. See docs/12. #}
+<section id="machines-list"
+         hx-trigger="sse:standing.change, sse:fleet.delta, sse:sync"
+         hx-get="/ui/frag/machines-list" hx-swap="outerHTML">
+  {% include "frags/machines_table.html" %}
+</section>

@@ -115,7 +115,7 @@ class _Hub:
                 continue
             sub_tasks.append((sub, env))
         if not sub_tasks:
-            return env
+            return env.id
         try:
             running = asyncio.get_running_loop()
         except RuntimeError:

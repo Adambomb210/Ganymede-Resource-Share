@@ -1,16 +1,27 @@
-<h2>Rounds</h2>
-<table>
-  <tr><th>idx</th><th>status</th><th>contributors</th><th>eval loss</th>
-      <th>divergence</th><th>opened</th><th>closed</th></tr>
-  {% for r in rounds %}
-  <tr>
-    <td>{{ r.idx }}</td><td>{{ r.status }}</td>
-    <td>{{ r.distinct_contributors }}</td>
-    <td>{{ "%g" | format(r.eval_loss) if r.eval_loss is not none else "—" }}</td>
-    <td>{{ "%g" | format(r.adapter_divergence) if r.adapter_divergence is not none else "—" }}</td>
-    <td>{{ r.opened_at }}</td><td>{{ r.closed_at or "—" }}</td>
-  </tr>
-</table>
-{% if coverage %}
-<p>Coverage: {{ coverage }}</p>
+{# The wrapper lives here, not in the page: this fragment answers its own
+   hx-get with hx-swap="outerHTML", so what comes back must carry the id
+   and the triggers again or the element replaces itself with something
+   that no longer listens. See docs/12. #}
+<section class="card" id="rounds"
+         hx-trigger="sse:round.close, sse:sync"
+         hx-get="/ui/frag/rounds/{{ job_id }}" hx-swap="outerHTML">
+{% if rounds %}
+  <h2>Rounds</h2>
+  <table>
+    <tr><th>idx</th><th>status</th><th>contributors</th><th>eval loss</th>
+        <th>divergence</th><th>opened</th><th>closed</th></tr>
+    {% for r in rounds %}
+    <tr>
+      <td>{{ r.idx }}</td><td>{{ r.status }}</td>
+      <td>{{ r.distinct_contributors }}</td>
+      <td>{{ "%g" | format(r.eval_loss) if r.eval_loss is not none else "—" }}</td>
+      <td>{{ "%g" | format(r.adapter_divergence) if r.adapter_divergence is not none else "—" }}</td>
+      <td>{{ r.opened_at }}</td><td>{{ r.closed_at or "—" }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% if coverage %}
+  <p>Coverage: {{ coverage }}</p>
+  {% endif %}
 {% endif %}
+</section>

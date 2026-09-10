@@ -252,7 +252,7 @@ Each step is independently shippable and adds only additive routes.
 
 ---
 
-## Status — built, and one thing that was never run
+## Status — built, and driven in a real browser
 
 All three rollout steps are in: `ganymede/coordinator/webui.py`, the templates
 under `coordinator/templates/`, vendored `htmx.min.js` / `sse.js` / `json-enc.js`,
@@ -335,15 +335,120 @@ string and a naive `issubclass` check matches nothing and passes by being inert.
 The test asserts its own detection is non-empty in both directions for exactly
 that reason.
 
-### Still not verified: a real browser
+### The browser pass — six defects, none of them visible to the suite
 
-The server was driven with `curl` — pages, static assets, a live SSE stream, the
-CSRF guard, and the fixed enroll round trip. What that still does not exercise
-is **htmx and the SSE extension actually executing**: no JS ran. Swap targets,
-`hx-select`, `sse:` trigger names and the CSP's effect on the vendored scripts
-are all unconfirmed. Sizing the risk honestly: the encoding bug above was
-exactly this class and cost three broken forms, so the next thing worth doing to
-this UI is opening it in a browser once, not adding another `TestClient` test.
+`tests/test_webui_browser.py` drives a real Chromium against a real coordinator
+process. It exists because everything else here runs through `TestClient`, which
+never executes a line of the vendored htmx: the suite and the handler agree
+about the request by construction, because the suite *is* the request. Six
+things were wrong. Five were invisible in every existing test, and the sixth
+could not have been found by reading either side alone.
+
+**The suite is three mechanisms, not eight pages.** `json-enc` + the CSRF header
+(enrollment), plain `Form` encoding (the submission form), and
+SSE → `hx-trigger` driven by a *second* client. Every other page is one of those
+three at a different URL, and a browser suite slow enough to skip is worse than
+none. It asserts the **request the browser makes** — intercepted, its
+`content-type` read — rather than htmx's internals, because introspecting
+`htmx.config` would just be a different stand-in.
+
+The load-bearing check is not a test: the page fixture fails any test whose
+console logged an error or whose page threw. CSP blocking a script does not fail
+an assertion — it prints a violation and leaves a page that renders correctly
+and does nothing.
+
+**1. Every page 500ed intermittently, and it was not a UI bug.** `get_conn` is a
+*sync generator* dependency, so FastAPI runs its three phases through
+`run_in_threadpool` separately: `__enter__`, the endpoint, `__exit__`. anyio
+hands each whichever worker thread is idle, and sqlite3's own guard then raises
+`ProgrammingError` on the first query or on `close()`. A browser opens several
+connections at once for a page and its assets, which is what spreads the phases
+across threads; `TestClient` drives everything through one portal thread and
+cannot reproduce it. This affected `/v1` exactly as much as `/ui` — the whole
+coordinator, under any real concurrency. `db.connect` grew `same_thread=False`
+for this one caller. The phases are strictly sequential, so a connection is
+still only ever used by one thread at a time; what is disabled is a check that
+cannot tell "sequentially, on three threads" from "concurrently".
+
+**2. Five live fragments deleted the element that listened for updates.** A
+`hx-swap="outerHTML"` element whose fragment route returns only the *inner*
+content replaces itself with content carrying no `id` and no `hx-trigger`. Since
+`sse:sync` is emitted per subscriber on connect, that happened on page load: the
+jobs list, machines list, queue, submitters table and rounds table each went
+live for exactly one event and then silently stopped. Three fragments —
+`fleet`, `job_header`, `job_row` — had it right, and the difference is where the
+wrapper lives. The wrapper now lives in the fragment everywhere, which is the
+only version that survives its own swap.
+
+`test_every_sse_driven_fragment_replaces_itself_with_a_listener` fetches each
+one and asserts the response carries the id and the trigger back. The defect is
+in what the *next* event does, so neither response is wrong on its own — which
+is why nothing saw it.
+
+**3. `frags/rounds.html` had never been rendered, and could not be.** It was
+missing an `{% endfor %}`. Jinja reports that when it *parses* the file, and
+`{% include %}` parses lazily, so the page's `{% if rounds %}` guard meant a job
+with no rounds never touched it — and no test ever built a job with a round. The
+first live run would have 500ed the one page you watch while a run is live.
+
+The guard **moved inside the wrapper** rather than going away: the section has
+to exist from page load or the `sse:round.close` refetch has nothing to target
+when the first round closes, but a `batch_inference` job must not sprout an
+empty Rounds heading either (the read model above: types without `reduce` show
+tasks only). Both are asserted now, and
+`test_a_job_with_rounds_renders_its_rounds_table` is the first test in the suite
+that makes the fragment render at all.
+
+A seventh, found while reading rather than running, and folded in here because
+it is the same neighbourhood: `hub.publish` returned the `Envelope` instead of
+`env.id` on the one path where no subscriber is authorized, against its own
+`-> int`. No caller reads the value, which is why it sat there.
+
+**4. Enrollment negotiated on a header htmx does not send.** The endpoint keyed
+the HTML fragment on `Accept: text/html`; htmx sets no `Accept` at all, so the
+XHR default `*/*` won and the browser got JSON — which `hx-swap="outerHTML"`
+then swapped in, replacing the `#enroll` section with the one-time token as raw
+text. This survived the *previous* round of fixes: adding `json-enc` corrected
+the request, and nobody ever exercised the response. It keys on `HX-Request`
+now, which htmx always sends, with `Accept` still honoured for callers that do
+ask. `test_enroll_token_shown_once_via_html_fragment` passes either way, because
+it hands the endpoint `Accept: text/html` by hand.
+
+**5. htmx does not swap a 4xx, so the submission form's error path did
+nothing.** Typing a malformed spec and pressing the button produced no visible
+change whatsoever — the response was logged as a "Response Status Error Code"
+and discarded. That path is the entire reason `/ui/jobs/new` exists rather than
+posting to `/v1/jobs`, and it had never run. `static/ui.js` opts **422 from a
+`/ui/` path** back into swapping, and nothing else: a 422 from `/v1` is a
+FastAPI validation blob, and putting that in front of a person is what this
+endpoint was built to avoid. Vendored rather than inline, because `script-src
+'self'` allows a served file and nothing else.
+
+**6. CSP blocked htmx's own indicator stylesheet on every page load.** htmx
+injects a `<style>` element for `.htmx-indicator` at startup; `style-src 'self'`
+refuses it. Harmless today — no template uses an indicator — but it was a
+console violation on every navigation, which is precisely the noise that hides
+the next real one. `base.html` sets `includeIndicatorStyles: false` through the
+`htmx-config` meta tag and the three rules moved into `style.css` verbatim.
+
+**What the pass confirmed working**, which is worth recording because it was all
+unverified: the three vendored scripts load and run under `script-src 'self'`;
+`json-enc` produces `application/json` and `hx-headers` carries
+`X-Ganymede-UI: 1`; the submission form correctly sends
+`application/x-www-form-urlencoded` to its `Form` endpoint; the EventSource
+connects under `connect-src 'self'`; `sse:` trigger names match the hub's
+`event:` names, dots included; and a change made by an entirely separate client
+reaches an open page and updates it without a reload.
+
+**Cost.** Six seconds, six tests. Playwright is a separate `browser` extra
+rather than part of `dev`, because a ~150 MB Chromium download does not belong
+in the path of someone running the unit suite; without it the module skips with
+a reason that says the browser pass is not running, rather than a bare "no
+playwright".
+
+**Still not exercised:** Firefox and Safari (Chromium only), any viewport but
+the default, and the `Last-Event-ID` replay path — the tests reconnect nothing.
+Image upload remains API-only.
 
 ---
 

@@ -1,9 +1,11 @@
 <section class="card" id="enroll">
   <h2>Enroll a machine</h2>
-  {# Content negotiation: htmx sends Accept: text/html, the /v1 endpoint
-     answers with this fragment carrying the one-time enroll token. No GET
-     ever returns it; a refresh loses it (docs/05 enrollments). hx-select
-     picks the freshly rendered #enroll out of the response. #}
+  {# Content negotiation: the /v1 endpoint answers an htmx request with the
+     fragment carrying the one-time enroll token, and a JSON caller with JSON.
+     It keys on HX-Request, not Accept -- htmx sends no Accept header at all,
+     so the original Accept test sent JSON here and the outerHTML swap put the
+     raw token in the page (docs/12). No GET ever returns the token; a refresh
+     loses it (docs/05 enrollments). #}
   <form hx-post="/v1/machines/enroll" hx-ext="json-enc"
         hx-headers='{"X-Ganymede-UI":"1"}'
         hx-target="#enroll" hx-swap="outerHTML">

@@ -2,9 +2,5 @@
 {% block title %}Queue — Ganymede{% endblock %}
 {% block content %}
 <h1>Queue</h1>
-<section id="queue-table"
-         hx-trigger="sse:queue.change, sse:sync" hx-swap="outerHTML"
-         hx-get="/ui/frag/queue">
-  {% include "frags/queue_table.html" %}
-</section>
+{% include "frags/queue_table.html" %}
 {% endblock %}

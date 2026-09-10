@@ -154,11 +154,18 @@ CREATE INDEX IF NOT EXISTS idx_audit_contributor ON audit(contributor_id, at);
 """
 
 
-def connect(db_path: str) -> sqlite3.Connection:
-    """Open a connection with the pragmas the concurrency story depends on."""
+def connect(db_path: str, *, same_thread: bool = True) -> sqlite3.Connection:
+    """Open a connection with the pragmas the concurrency story depends on.
+
+    ``same_thread=False`` disables sqlite3's own "created in another thread"
+    guard. Exactly one caller needs it -- ``app.get_conn`` -- and the reason is
+    written there. Everywhere else the guard stays on, because everywhere else
+    a connection crossing a thread boundary really is a bug.
+    """
     if db_path != ":memory:":
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=30.0, isolation_level=None)
+    conn = sqlite3.connect(db_path, timeout=30.0, isolation_level=None,
+                           check_same_thread=same_thread)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")

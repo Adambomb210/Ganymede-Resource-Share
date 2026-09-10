@@ -5,9 +5,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}Ganymede{% endblock %}</title>
   <link rel="stylesheet" href="/ui/static/style.css">
+  {# htmx injects a <style> element for .htmx-indicator on load, which
+     `style-src 'self'` blocks -- a CSP violation on every page view, and an
+     indicator that would be permanently visible the first time one is used.
+     The rules live in style.css instead. Must precede htmx.min.js: the config
+     is read at load. #}
+  <meta name="htmx-config" content='{"includeIndicatorStyles":false}'>
   <script src="/ui/static/htmx.min.js"></script>
   <script src="/ui/static/sse.js"></script>
   <script src="/ui/static/json-enc.js"></script>
+  {# Last: it only adds a listener, and htmx must exist first. #}
+  <script src="/ui/static/ui.js"></script>
 </head>
 <body {% if user %}hx-ext="sse" sse-connect="/v1/events"{% endif %}>
 {% if user %}

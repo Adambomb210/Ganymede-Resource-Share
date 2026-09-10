@@ -52,3 +52,10 @@ input {
   background: #233324; border: 1px solid #3a5d3a; padding: 0.6rem 0.9rem;
   border-radius: 6px; font-family: ui-monospace, monospace; word-break: break-all;
 }
+
+/* htmx's own indicator rules, verbatim from the <style> it would otherwise
+   inject at load. `style-src 'self'` blocks that injection (base.html turns it
+   off with includeIndicatorStyles), so they are served from here instead. */
+.htmx-indicator { opacity: 0; }
+.htmx-request .htmx-indicator { opacity: 1; transition: opacity 200ms ease-in; }
+.htmx-request.htmx-indicator { opacity: 1; transition: opacity 200ms ease-in; }

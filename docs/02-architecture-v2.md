@@ -885,6 +885,17 @@ so two simultaneous claims can't lease the same task. Good to a few hundred work
 past that, move to Postgres. Write the DB access behind a thin module so that swap
 stays a day of work rather than a rewrite.
 
+One connection per request, opened in `app.get_conn` and closed with the
+request. It is a **sync generator** dependency, which FastAPI runs in three
+separate threadpool hand-offs — `__enter__`, the endpoint, `__exit__` — and
+anyio gives each whichever worker thread is idle, so the connection legitimately
+crosses threads *sequentially*. `db.connect(..., same_thread=False)` is
+therefore load-bearing for the server and only for the server: sqlite3's guard
+cannot tell that apart from concurrent use, and raises either way. Under low
+concurrency anyio tends to reuse one thread, which is why this survived M2 and
+M4a and only surfaced when a browser fetched a page and its assets at once
+(docs/12).
+
 ### 6.2 API
 
 ```

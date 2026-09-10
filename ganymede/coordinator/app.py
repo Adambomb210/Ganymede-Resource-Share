@@ -195,8 +195,24 @@ def get_conn(request: Request):
     sync endpoints in a threadpool, so pooling one would be a race. Opening a
     connection is microseconds against a local file; the WAL pragmas in
     db.connect make concurrent readers free.
+
+    ``same_thread=False`` is load-bearing, and the reason is subtle enough to be
+    worth stating: this is a **sync generator** dependency, so FastAPI runs its
+    three phases through ``run_in_threadpool`` separately -- ``__enter__``, then
+    the endpoint, then ``__exit__``. anyio hands each one whatever worker thread
+    is idle, which under any real concurrency is not the same thread, and
+    sqlite3's own guard then raises ``ProgrammingError`` on the endpoint's first
+    query or on ``close()``. The phases are strictly sequential (FastAPI awaits
+    each before the next), so one connection is still only ever used by one
+    thread at a time; what is being disabled is a check that cannot tell
+    "sequentially, on three threads" from "concurrently".
+
+    Found by the browser pass (docs/12): a browser opens several connections at
+    once for a page and its assets, which is what spreads the phases across
+    threads. A ``TestClient`` drives the app through a single portal thread and
+    can never reproduce it.
     """
-    conn = connect(request.app.state.settings.db_path)
+    conn = connect(request.app.state.settings.db_path, same_thread=False)
     try:
         yield conn
     finally:
@@ -219,7 +235,10 @@ def _principal(
 
     CSRF (docs/06 "CSRF", docs/08): a bearer caller is immune. A cookie caller
     on a state-changing method must additionally carry ``X-Ganymede-UI: 1`` --
-    a static header htmx sets globally and a cross-origin form cannot forge.
+    a static header a cross-origin form cannot forge. Every mutating element
+    carries it in ``hx-headers``; it is not set globally, which is why
+    ``test_every_form_posts_the_encoding_its_endpoint_accepts`` checks the
+    templates rather than trusting one place to have got it right.
     ``SameSite=Lax`` on the cookie already blocks the cross-site form post; this
     is the second lock, and there is no token store.
     """
@@ -1059,12 +1078,22 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         expires_at = rounds._iso(
             rounds.utcnow() + timedelta(seconds=settings.enroll_ttl_sec)
         )
-        # Content negotiation (docs/12): the htmx form sends Accept: text/html
-        # and gets the one-time token rendered once, inline, in this fragment;
-        # no GET ever returns it, it never enters a URL. A JSON caller gets the
-        # frozen JSON shape unchanged.
+        # Content negotiation (docs/12): the browser form gets the one-time token
+        # rendered once, inline, in this fragment; no GET ever returns it, it
+        # never enters a URL. A JSON caller gets the frozen JSON shape unchanged.
+        #
+        # ``HX-Request`` is what identifies the browser, not ``Accept``. htmx
+        # sets no Accept header at all -- the XHR default is ``*/*`` -- so the
+        # original Accept-only test sent JSON to the one caller that cannot use
+        # it, and ``hx-swap="outerHTML"`` then replaced the #enroll section with
+        # the raw token as text. Accept is still honoured for anything that does
+        # ask for HTML; ``HX-Request: true`` is the header htmx always sends.
+        # Found by the browser pass (docs/12): the suite's own test supplies
+        # ``Accept: text/html`` by hand, which is exactly what the real client
+        # never does.
         accept = request.headers.get("accept", "")
-        if "text/html" in accept:
+        from_htmx = request.headers.get("hx-request") == "true"
+        if from_htmx or "text/html" in accept:
             from ganymede.coordinator import webui as _webui
 
             return _webui.templates.TemplateResponse(

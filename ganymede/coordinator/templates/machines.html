@@ -3,12 +3,8 @@
 {% block content %}
 <h1>Your machines</h1>
 {% include "frags/enroll.html" %}
-<section id="machines-list"
-         hx-trigger="sse:standing.change, sse:fleet.delta, sse:sync" hx-swap="outerHTML"
-         {# the list refetches whole; per-row fragments keep SSE simple #}
-         hx-get="/ui/frag/machines-list">
-  {% include "frags/machines_table.html" %}
-</section>
+{# the list refetches whole; per-row fragments keep SSE simple #}
+{% include "frags/machines_list.html" %}
 
 <section class="card">
   <h2>Recent credit events</h2>

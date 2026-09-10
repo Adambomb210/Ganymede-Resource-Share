@@ -323,7 +323,10 @@ def mount(app: FastAPI, settings: Settings) -> None:
         if data["job"]["owner_id"] != user.id and not user.is_admin:
             raise _404()
         return _csp(templates.TemplateResponse(request, "job_detail.html", {
-            "user": user, **data, "is_admin": user.is_admin,
+            # `job_id` as well as `job`: frags/rounds.html renders from here and
+            # from its own fragment route, and now carries the hx-get that
+            # refetches it, so both contexts have to name the job the same way.
+            "user": user, **data, "job_id": job_id, "is_admin": user.is_admin,
         }))
 
     @app.get("/ui/queue", response_class=HTMLResponse)
