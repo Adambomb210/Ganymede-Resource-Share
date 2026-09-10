@@ -93,6 +93,37 @@ RUNNABLE_JOB_TYPES = frozenset(
 )
 
 
+# Environment variables a container platform sets per node, tried in order
+# after the explicit one. Best-effort and deliberately short: the platform's own
+# variable is a convenience, ``GANYMEDE_NODE_ID`` is the answer that always
+# works, and ``--require-node-id`` is how a fleet operator makes the difference
+# fatal instead of silent.
+_PLATFORM_NODE_VARS = ("SALAD_MACHINE_ID", "RUNPOD_POD_ID", "VAST_CONTAINERLABEL",
+                       "HOSTNAME")
+
+
+def resolve_node_id() -> str | None:
+    """Which machine this is, when the contributor runs more than one.
+
+    Only identity, never capability: two machines with the same card are the
+    same *kind* of worker and a different *instance* of one, and it is the
+    instance the lease is issued to.
+
+    ``HOSTNAME`` is last and is genuinely weak -- a container platform that
+    hands every replica the same hostname gives back exactly the collision this
+    is meant to break. That is why ``--require-node-id`` exists and why nothing
+    here guesses harder than the platform is willing to say.
+    """
+    explicit = os.environ.get("GANYMEDE_NODE_ID")
+    if explicit and explicit.strip():
+        return explicit.strip()
+    for var in _PLATFORM_NODE_VARS:
+        value = os.environ.get(var)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
 @dataclass
 class WorkerConfig:
     coordinator_url: str
@@ -110,6 +141,9 @@ class WorkerConfig:
     # machine did not opt into running submitter code, and the profile it
     # registers says so -- see ``Worker.create``.
     job_scratch: str | None = None
+    # Distinguishes this machine from another of the same contributor's with the
+    # same GPU (see ``app.register``). Resolved by ``resolve_node_id``.
+    node_id: str | None = None
 
     @classmethod
     def from_env(cls, **overrides: Any) -> "WorkerConfig":
@@ -124,6 +158,7 @@ class WorkerConfig:
             cache_dir=os.environ.get("GANYMEDE_CACHE_DIR"),
             backend=os.environ.get("GANYMEDE_BACKEND"),
             job_scratch=os.environ.get("GANYMEDE_JOB_SCRATCH"),
+            node_id=resolve_node_id(),
         )
         for key, value in overrides.items():
             if value is not None:
@@ -325,7 +360,8 @@ class Worker:
         )
 
     def register(self) -> str:
-        result = self.client.register(self.profile, self.config.image_tag)
+        result = self.client.register(self.profile, self.config.image_tag,
+                                      node_id=self.config.node_id)
         self.worker_id = result["worker_id"]
         self.heartbeat_interval = int(result.get("heartbeat_interval_sec", 60))
         log.info("registered as %s", self.worker_id)
@@ -991,6 +1027,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--state-dir", default=None, help="where the stop/pause sentinels live")
     p.add_argument("--cache-dir", default=None, help="host-persistent HF cache")
     p.add_argument("--backend", default=None, help="pin the compute backend (cuda, rocm, xpu, mps, cpu)")
+    p.add_argument("--node-id", default=None,
+                   help="distinguishes this machine from another of yours with "
+                        "the same GPU; overrides GANYMEDE_NODE_ID")
+    p.add_argument("--require-node-id", action="store_true",
+                   help="exit 2 rather than register without a node id -- for a "
+                        "rented fleet, where sharing one silently makes N "
+                        "machines into one worker")
     p.add_argument("--once", action="store_true", help="one claim then exit; for smoke tests")
     p.add_argument("--max-rounds", type=int, default=None,
                    help="stop after taking part in this many coordinator rounds; "
@@ -1023,7 +1066,22 @@ def main(argv: list[str] | None = None) -> int:
         image_tag=args.image_tag, state_dir=args.state_dir, cache_dir=args.cache_dir,
         backend=args.backend, once=args.once or None, max_rounds=args.max_rounds,
         verify_tls=False if args.insecure else None, skip_bench=args.skip_bench or None,
+        node_id=args.node_id,
     )
+
+    # require_device's fail-loud twin, for the other thing a rented fleet gets
+    # silently wrong. Registering without a node id is correct on a single
+    # machine and catastrophic on N identical ones, and the coordinator cannot
+    # tell the two cases apart -- only the operator can, which is what this flag
+    # is them saying so.
+    if args.require_node_id and not config.node_id:
+        print("--require-node-id was given but no node id could be resolved. "
+              "Set GANYMEDE_NODE_ID to something unique per machine (on a "
+              "container platform, its own per-node variable). "
+              "Without one, every machine of yours with this GPU registers as "
+              "the SAME worker: they are all handed the same task, all train "
+              "it, and all but one lose the submit race.", file=sys.stderr)
+        return 2
 
     try:
         return Worker.create(config).run()

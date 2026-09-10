@@ -1255,3 +1255,90 @@ def test_an_empty_round_at_its_backstop_is_reopened_by_a_polling_worker(
     # And with a fresh deadline there is a full round of time to budget against,
     # so the worker that did the reopening gets work on the same request.
     assert task is not None
+
+
+# ==========================================================================
+# Worker identity on a fleet of identical machines
+# ==========================================================================
+
+
+def _register(client, key, *, device="NVIDIA GeForce RTX 4090", vram=24576,
+              node_id=None):
+    body = {
+        "compute_profile": {
+            "backend": "cuda", "device_name": device, "vram_mb": vram,
+        },
+        "image_tag": "ganymede/worker-llm:v1",
+    }
+    if node_id is not None:
+        body["node_id"] = node_id
+    resp = client.post("/v1/workers/register", json=body,
+                       headers={"Authorization": f"Bearer {key}"})
+    assert resp.status_code == 200, resp.text
+    return resp.json()["worker_id"]
+
+
+def test_two_identical_machines_without_a_node_id_are_one_worker(
+        client, conn, make_contributor):
+    """The behaviour this documents is a trap, and it is worth written down
+    rather than discovered on rented hardware.
+
+    The fingerprint is (contributor, GPU, backend, VRAM). Two machines a
+    contributor rents with the same card produce the same ``worker_id`` -- and
+    the consequence is not a refusal. ``claim_task`` hands a worker the lease it
+    already holds rather than a second one, so both machines train the same
+    task, both submit, and one loses the primary-key race. Two GPUs do one
+    worker's work and nothing errors.
+    """
+    _, key = make_contributor("fleet-owner")
+    assert _register(client, key) == _register(client, key)
+    assert conn.execute("SELECT COUNT(*) c FROM workers").fetchone()["c"] == 1
+
+
+def test_a_node_id_separates_them(client, conn, make_contributor):
+    _, key = make_contributor("fleet-owner")
+    a = _register(client, key, node_id="salad-node-1")
+    b = _register(client, key, node_id="salad-node-2")
+    assert a != b
+    assert conn.execute("SELECT COUNT(*) c FROM workers").fetchone()["c"] == 2
+
+
+def test_omitting_the_node_id_reproduces_the_historical_worker_id(
+        client, make_contributor):
+    """The compatibility property, and the reason ``node_id`` is **appended** to
+    the fingerprint rather than inserted into it.
+
+    A worker's id is derived rather than generated so a machine that restarts
+    keeps its measured throughput instead of resetting to the cold-start
+    default. If adding this field changed the fingerprint of a worker that does
+    not send one, every machine already in the fleet would get a new identity on
+    its next restart and lose exactly the history the scheme exists to preserve.
+
+    The expected value is computed the old way on purpose: asserting that two
+    calls agree with each other would pass even if both had changed.
+    """
+    import uuid as _uuid
+
+    cid, key = make_contributor("old-timer")
+    legacy = json.dumps([cid, "NVIDIA GeForce RTX 4090", "cuda", 24576],
+                        sort_keys=True)
+    assert _register(client, key) == _uuid.uuid5(_uuid.NAMESPACE_OID, legacy).hex
+
+
+def test_an_empty_node_id_is_the_same_as_none(client, make_contributor):
+    """A platform that sets the variable to "" must not mint a different
+    identity from one that leaves it unset."""
+    _, key = make_contributor("blank")
+    assert _register(client, key, node_id="") == _register(client, key)
+
+
+def test_the_node_id_does_not_leak_into_capability(client, conn, make_contributor):
+    """Identity, never capability. Two machines with the same card are the same
+    *kind* of worker, and eligibility has to keep seeing that."""
+    _, key = make_contributor("cap")
+    wid = _register(client, key, node_id="node-9")
+    profile = json.loads(conn.execute(
+        "SELECT compute_profile_json FROM workers WHERE id = ?", (wid,)
+    ).fetchone()["compute_profile_json"])
+    assert "node_id" not in profile
+    assert profile["device_name"] == "NVIDIA GeForce RTX 4090"

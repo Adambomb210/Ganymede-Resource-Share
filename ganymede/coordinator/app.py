@@ -75,6 +75,11 @@ class ComputeProfile(BaseModel):
 class RegisterRequest(BaseModel):
     compute_profile: ComputeProfile
     image_tag: str | None = None
+    # Distinguishes two machines a contributor runs that are otherwise
+    # identical -- same GPU, same backend, same VRAM. Optional because a
+    # single-machine contributor does not need it and because omitting it has
+    # to leave an existing worker's id byte-for-byte unchanged. See ``register``.
+    node_id: str | None = None
 
 
 class ClaimRequest(BaseModel):
@@ -510,11 +515,28 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         # generated fresh, so a worker that restarts keeps its measured
         # throughput history instead of resetting to the cold-start default
         # every time its host reboots.
-        fingerprint = json.dumps(
-            [contributor.id, profile.get("device_name"), profile.get("backend"),
-             profile.get("vram_mb")],
-            sort_keys=True,
-        )
+        #
+        # ``node_id`` is what makes that safe on a rented fleet. Without it the
+        # fingerprint is (contributor, GPU model, backend, VRAM), so N machines
+        # one contributor rents with the *same card* collapse to one
+        # ``worker_id`` -- and the failure is silent and worse than a refusal:
+        # ``claim_task`` hands a worker the lease it already holds rather than a
+        # second one, so every one of those machines trains the same task, all
+        # submit, and all but one lose the ``submissions`` primary-key race. N
+        # GPUs do one worker's work, ``distinct_contributors`` reads 1, and
+        # nothing anywhere errors. A container platform that runs N replicas
+        # from one image with one set of environment variables walks straight
+        # into this.
+        #
+        # **Appended, never inserted.** An absent ``node_id`` has to reproduce
+        # the historical fingerprint exactly, or every worker already in the
+        # fleet gets a new identity on its next restart and loses the measured
+        # throughput this scheme exists to preserve.
+        parts = [contributor.id, profile.get("device_name"), profile.get("backend"),
+                 profile.get("vram_mb")]
+        if body.node_id:
+            parts.append(body.node_id)
+        fingerprint = json.dumps(parts, sort_keys=True)
         worker_id = uuid.uuid5(uuid.NAMESPACE_OID, fingerprint).hex
 
         with immediate(conn):

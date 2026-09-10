@@ -920,7 +920,11 @@ class _LoopbackClient:
         self.h = {"Authorization": f"Bearer {key}"}
         self.calls: list[str] = []
 
-    def register(self, profile, image_tag=None):
+    # `node_id` is accepted rather than swallowed by **kwargs on purpose:
+    # this stub failing loudly when the real client's signature changed is
+    # the suite noticing, and a stand-in that accepts anything notices
+    # nothing.
+    def register(self, profile, image_tag=None, node_id=None):
         self.calls.append("register")
         r = self.c.post("/v1/workers/register", headers=self.h,
                         json={"compute_profile": profile})

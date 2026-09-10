@@ -1487,6 +1487,29 @@ exactly the contributors the project most wants.
 **Verify before the rented-host phase:** whether running your own workload on a listed
 GPU affects platform reliability scoring (Review Finding M).
 
+**Worker identity on a rented fleet.** ``POST /v1/workers/register`` derives
+``worker_id`` from ``(contributor, device_name, backend, vram_mb)`` so a machine
+that restarts keeps its measured throughput instead of resetting to the
+cold-start default. On one contributor's *fleet of identical machines* that same
+derivation is a trap: N rented boxes with the same card hash to one
+``worker_id``. The failure is silent and worse than a refusal -- ``claim_task``
+returns the lease a worker already holds rather than issuing a second one, so
+every machine trains the same task, all submit, all but one lose the
+``submissions`` primary key, ``distinct_contributors`` reads 1, and nothing
+errors. A container platform running N replicas from one image with one set of
+environment variables walks straight into it.
+
+So ``RegisterRequest`` carries an optional ``node_id``, **appended** to the
+fingerprint rather than inserted into it -- an absent one has to reproduce the
+historical id exactly or every existing worker loses its history on next
+restart. The worker resolves it from ``GANYMEDE_NODE_ID`` first and then from a
+short list of platform variables (``SALAD_MACHINE_ID`` and friends);
+``--require-node-id`` turns "could not resolve one" into exit 2, which is
+``require_device``'s pattern applied to the other thing a rented fleet gets
+silently wrong. The coordinator cannot tell one machine from N identical ones,
+so only the operator can say which case this is, and that flag is them saying
+it.
+
 ---
 
 ## 8. Task spec (replaces v1 §5)

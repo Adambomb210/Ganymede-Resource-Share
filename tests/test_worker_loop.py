@@ -32,7 +32,11 @@ class StubClient:
         self.upload_raises: Exception | None = None
         self.claims: list[dict] = []
 
-    def register(self, profile, image_tag=None):
+    # `node_id` is accepted rather than swallowed by **kwargs on purpose:
+    # this stub failing loudly when the real client's signature changed is
+    # the suite noticing, and a stand-in that accepts anything notices
+    # nothing.
+    def register(self, profile, image_tag=None, node_id=None):
         self.calls.append(("register", image_tag))
         return {"worker_id": "w1", "heartbeat_interval_sec": 5}
 

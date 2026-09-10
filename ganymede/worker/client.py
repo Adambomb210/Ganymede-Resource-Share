@@ -213,10 +213,12 @@ class CoordinatorClient:
     def manifest(self) -> dict[str, Any]:
         return self.request("GET", "/v1/manifest").body
 
-    def register(self, compute_profile: dict[str, Any], image_tag: str | None = None) -> dict[str, Any]:
+    def register(self, compute_profile: dict[str, Any], image_tag: str | None = None,
+                 node_id: str | None = None) -> dict[str, Any]:
         return self.request(
             "POST", "/v1/workers/register",
-            {"compute_profile": compute_profile, "image_tag": image_tag},
+            {"compute_profile": compute_profile, "image_tag": image_tag,
+             "node_id": node_id},
         ).body
 
     def claim(
