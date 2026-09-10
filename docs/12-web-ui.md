@@ -252,6 +252,101 @@ Each step is independently shippable and adds only additive routes.
 
 ---
 
+## Status — built, and one thing that was never run
+
+All three rollout steps are in: `ganymede/coordinator/webui.py`, the templates
+under `coordinator/templates/`, vendored `htmx.min.js` / `sse.js` / `json-enc.js`,
+and the SSE hub on `/v1/events`.
+
+| Step | State |
+|---|---|
+| C1 — read-only operator view | **built.** All eight pages, `303`-to-login for anonymous, `404` (not `403`) cross-tenant, CSP `default-src 'self'` with no `unsafe-inline` |
+| C2 — admin surface | **built** except job submission, below. Queue reorder, submitter approve/deny/revoke, job enqueue/cancel |
+| C3 — account and machine management | **built.** Enroll (token inline, exactly once, never on a `GET`) and retire |
+| `/v1/events` SSE | **built.** Ring buffer, `Last-Event-ID` replay, `sync` on connect, per-subscriber emit-time authorization |
+
+Mutations post **directly to the frozen `/v1` endpoints** from htmx rather than
+through `/ui/*` handlers, with `X-Ganymede-UI: 1` as the CSRF marker — so there
+is one implementation of every action and the UI cannot drift from the API.
+`POST /ui/login` and `/ui/logout` are the only `/ui` writers.
+
+### The job submission form, and the one `/ui` POST that is not login
+
+C2's "job submission ... landing here too" is now built, minimally:
+`frags/new_job.html` on `/ui/jobs`, shown only to an approved submitter.
+Job type (from `REGISTRY`), an optional image picked from the caller's own
+finalized images, and the spec as JSON text. It creates a **draft**; enqueueing
+stays the separate action it already was.
+
+**It posts to `/ui/jobs/new`, not to `/v1/jobs`, and that is forced.** htmx's
+`json-enc` encodes a form as a *flat* object of strings; `POST /v1/jobs` takes a
+nested `spec` object. With `script-src 'self'` and no build step there is no way
+for a browser form to produce that body — which is the likeliest reason this
+page was specified and never built. So the spec arrives as text, is parsed
+server-side, and goes on to `app.create_job`, which is the same function
+`POST /v1/jobs` calls. **Nothing about which jobs are allowed lives in the UI.**
+
+The second reason is the error path: a 422 from `/v1` swapped into the page by
+htmx puts a raw JSON error blob in front of a person, and a malformed spec is
+the *expected* outcome of typing JSON into a textarea, not an exceptional one.
+The type's own `validate_spec` message already names the field, so it is shown
+verbatim beside the input with the submitter's text preserved.
+
+This is a **deviation from "each page's POST targets"** in Frozen vs. open,
+recorded rather than quiet: one `/ui` writer beyond login, justified by an
+encoding mismatch the frozen API cannot express through a CSP-compliant form.
+
+**Still API-only: image upload.** The picker lists images the submitter already
+uploaded; it does not upload one. A browser upload means PUTting to a presigned
+URL, which needs JS beyond htmx — a real decision, not an oversight, and the
+natural place for whatever larger submission system replaces this form.
+
+### Four forms had the wrong encoding, and why nothing caught it
+
+Found by starting the server and driving it over HTTP — not by reading it, and
+not by the suite.
+
+htmx posts `application/x-www-form-urlencoded` unless `json-enc` is on the
+element or an ancestor. Every mutating `/v1` endpoint declares a Pydantic body,
+so FastAPI answers **422 before the handler runs**. Machine enrollment and both
+job-cancel buttons had no encoder: in a browser, enrolling a machine and
+cancelling a job both failed. `queue/reorder` and `submitters/{id}` had it and
+worked, and the `enqueue` button correctly omits it because that endpoint takes
+no body — so the author had reasoned about the encoder and simply missed the two
+forms that send fields.
+
+Every test around them passed. `test_enroll_token_shown_once_via_html_fragment`
+posts `json={"display_name": "box"}` through `TestClient` — it supplies exactly
+what the browser would have had to produce. The test asserted the *endpoint*;
+nobody asserted the *form*. That is the same shape as `10` §4's `FakeWorker` and
+`11`'s fake container runner: a stand-in cannot disagree with the code under
+test about what the real client sends.
+
+`test_every_form_posts_the_encoding_its_endpoint_accepts` now checks the
+templates against the app's own routes, **both ways**: a route whose
+`body_field` is a JSON `Body` must have the encoder, and one whose `body_field`
+is `Form` must not. Both directions are 422s in a browser and silent in a
+`TestClient` suite. It earned the second direction immediately — the submission
+form takes `Form` fields, and the first version of this test flagged it.
+
+It reads `route.body_field` rather than the handler's signature deliberately:
+`app.py` uses `from __future__ import annotations`, so every annotation is a
+string and a naive `issubclass` check matches nothing and passes by being inert.
+The test asserts its own detection is non-empty in both directions for exactly
+that reason.
+
+### Still not verified: a real browser
+
+The server was driven with `curl` — pages, static assets, a live SSE stream, the
+CSRF guard, and the fixed enroll round trip. What that still does not exercise
+is **htmx and the SSE extension actually executing**: no JS ran. Swap targets,
+`hx-select`, `sse:` trigger names and the CSP's effect on the vendored scripts
+are all unconfirmed. Sizing the risk honestly: the encoding bug above was
+exactly this class and cost three broken forms, so the next thing worth doing to
+this UI is opening it in a browser once, not adding another `TestClient` test.
+
+---
+
 ## Spine deviations
 
 **None.** The ring-buffer transport avoids a new `events` table, so `05` is

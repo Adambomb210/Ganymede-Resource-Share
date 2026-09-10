@@ -9,6 +9,9 @@ TestClient would test TestClient more than the hub.
 
 from __future__ import annotations
 
+import json
+import pathlib
+
 import asyncio
 import uuid
 
@@ -452,3 +455,257 @@ def test_sse_frame_matches_frozen_envelope():
     assert frame == (
         'id: 42\nevent: job.status\ndata: {"type": "job.status", "id": 42, "job_id": "j1"}\n\n'
     )
+
+
+# ==========================================================================
+# Form encoding -- the class of bug no TestClient test can see
+# ==========================================================================
+
+
+def _hx_post_elements():
+    """Every element in every template that posts, with the tag it sits in.
+
+    Crude on purpose: a real parser would be no more accurate here, because
+    what matters is the literal attribute text htmx will read.
+    """
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "ganymede/coordinator/templates"
+    for path in sorted(root.rglob("*.html")):
+        text = path.read_text(encoding="utf-8")
+        for tag in re.finditer(r"<(?:form|button)\b[^>]*hx-post[^>]*>", text, re.S):
+            blob = tag.group(0)
+            url = re.search(r'hx-post="([^"]*)"', blob)
+            if url:
+                yield path.name, url.group(1), blob
+
+
+def _post_route_encodings(app):
+    """``{path: "json" | "form"}`` for every POST that takes a body.
+
+    Read off ``route.body_field``, which is FastAPI's own resolved answer.
+    Inspecting the signature does not work: ``app.py`` uses
+    ``from __future__ import annotations``, so every annotation is a string and
+    a naive ``issubclass`` check silently matches nothing -- a test that passes
+    by being inert. Hence the assertion in the caller.
+    """
+    from fastapi import params
+
+    out = {}
+    for route in app.routes:
+        if "POST" not in (getattr(route, "methods", None) or set()):
+            continue
+        body = getattr(route, "body_field", None)
+        if body is None:
+            continue
+        out[route.path] = ("form" if isinstance(body.field_info, params.Form)
+                           else "json")
+    return out
+
+
+def _matches(url: str, route_path: str) -> bool:
+    """``/v1/jobs/{{ job.id }}/cancel`` against ``/v1/jobs/{job_id}/cancel``."""
+    import re
+
+    pattern = re.escape(route_path)
+    pattern = re.sub(r"\\\{[a-z_]+\\\}", "[^/]+", pattern)
+    normalised = re.sub(r"\{\{[^}]*\}\}", "X", url)
+    return re.fullmatch(pattern, normalised) is not None
+
+
+def test_every_form_posts_the_encoding_its_endpoint_accepts(app):
+    """htmx posts ``application/x-www-form-urlencoded`` unless ``json-enc`` is
+    on the element or an ancestor. So the encoder is not a style choice: an
+    endpoint that declares a JSON body answers **422 before its handler runs**
+    without it, and an endpoint that declares ``Form`` fields answers 422
+    *with* it. Both directions are checked, because both are silent in a
+    ``TestClient`` suite and loud in a browser.
+
+    Three forms shipped broken the first way: machine enrollment and both
+    job-cancel buttons. Every test around them passed, because a ``TestClient``
+    test posts ``json={...}`` and supplies exactly what the browser would have
+    had to produce. The tests asserted the *endpoints*; nobody asserted the
+    *forms*.
+
+    Checked against the app's own routes rather than a hand-kept list, so a new
+    form is covered the moment it is written -- as the submission form was: it
+    posts to ``/ui/jobs/new``, which takes ``Form`` fields, and this caught it
+    the first time it ran.
+    """
+    encodings = _post_route_encodings(app)
+    assert "json" in encodings.values(), "no JSON-body POST routes -- check is inert"
+    assert "form" in encodings.values(), "no form POST routes -- check is inert"
+
+    offenders = []
+    for template, url, blob in _hx_post_elements():
+        match = next((k for k in encodings if _matches(url, k)), None)
+        if match is None:
+            continue
+        has = "json-enc" in blob
+        if encodings[match] == "json" and not has:
+            offenders.append(f"{template}: hx-post=\"{url}\" sends a JSON body without json-enc")
+        if encodings[match] == "form" and has:
+            offenders.append(f"{template}: hx-post=\"{url}\" takes Form fields but carries json-enc")
+    assert offenders == [], "\n".join(offenders)
+
+
+def test_a_form_encoded_body_is_actually_rejected(client, conn):
+    """The premise of the test above, asserted rather than assumed: FastAPI
+    really does refuse the encoding htmx would have sent, and really does
+    accept the one ``json-enc`` produces. If this ever stopped being true the
+    check above would be enforcing a rule that no longer exists."""
+    _make_local_user(conn, "root", is_admin=True, secret="rootpw")
+    cookie = _login(client, "root", "rootpw")
+    hdr = _as(client, cookie)
+
+    form = client.post("/v1/machines/enroll", headers=hdr, data={"display_name": "box"})
+    assert form.status_code == 422
+
+    js = client.post("/v1/machines/enroll", headers=hdr, json={"display_name": "box"})
+    assert js.status_code == 200
+
+
+# ==========================================================================
+# The submission form (docs/12 C2)
+# ==========================================================================
+
+BATCH_SPEC = {
+    "model_ref": "hf://test-model",
+    "shards": [{"ref": "s0", "rows": 4}],
+    "output_prefix": "out/j1",
+    "prompt_template": "{input}",
+    "decode": {"mode": "greedy", "max_new_tokens": 4},
+    "output_schema": {"id": "str", "output": "str"},
+}
+
+
+def _approve_submitter(conn, user_id):
+    from ganymede.coordinator import rounds
+
+    conn.execute(
+        "INSERT INTO submitters (user_id, status, decided_at) VALUES (?, ?, ?)",
+        (user_id, "approved", rounds._iso(rounds.utcnow())),
+    )
+    conn.commit()
+
+
+def _submitter_session(client, conn, name="sub"):
+    # A distinct secret per user: contributors.key_hash is UNIQUE, so two
+    # users sharing one is an IntegrityError rather than a login failure.
+    uid = _make_local_user(conn, name, is_admin=False, secret=f"{name}-pw")
+    _approve_submitter(conn, uid)
+    return _login(client, name, f"{name}-pw"), uid
+
+
+def test_the_form_is_only_shown_to_an_approved_submitter(client, conn):
+    """docs/08: the submitter surface is not confirmed to exist for anyone
+    else. The API answers 404; a page already rendering for a logged-in user
+    cannot, so it omits the form instead."""
+    _make_local_user(conn, "plain", is_admin=False, secret="plain-pw")
+    cookie = _login(client, "plain", "plain-pw")
+    assert "new-job" not in client.get("/ui/jobs", headers={"Cookie": cookie}).text
+
+    cookie, _ = _submitter_session(client, conn)
+    page = client.get("/ui/jobs", headers={"Cookie": cookie}).text
+    assert 'id="new-job"' in page
+    assert "batch_inference" in page and "contained_batch" in page
+
+
+def test_a_non_submitter_posting_the_form_directly_gets_404(client, conn):
+    """The page hiding the form is presentation. This is the check."""
+    _make_local_user(conn, "plain", is_admin=False, secret="plain-pw")
+    cookie = _login(client, "plain", "plain-pw")
+    resp = client.post("/ui/jobs/new", headers=_as(client, cookie),
+                       data={"job_type": "batch_inference", "spec": "{}"})
+    assert resp.status_code == 404
+
+
+def test_a_valid_spec_creates_a_draft_and_links_to_it(client, conn):
+    cookie, uid = _submitter_session(client, conn)
+    resp = client.post("/ui/jobs/new", headers=_as(client, cookie), data={
+        "job_type": "batch_inference", "image_id": "",
+        "spec": json.dumps(BATCH_SPEC),
+    })
+    assert resp.status_code == 200, resp.text
+
+    row = conn.execute(
+        "SELECT id, owner_id, job_type, status FROM jobs").fetchone()
+    assert row["owner_id"] == uid
+    assert row["job_type"] == "batch_inference"
+    assert row["status"] == "draft"
+    # The fragment links to the job it just made -- otherwise the submitter has
+    # a draft and no way to reach it without going back to the list.
+    assert f'/ui/jobs/{row["id"]}' in resp.text
+
+
+def test_malformed_json_comes_back_as_a_sentence_not_a_500(client, conn):
+    """Typing JSON into a textarea makes this the *expected* outcome, not an
+    exceptional one -- and the reason the form posts to /ui rather than /v1,
+    where htmx would swap a raw error blob in front of a person."""
+    cookie, _ = _submitter_session(client, conn)
+    resp = client.post("/ui/jobs/new", headers=_as(client, cookie), data={
+        "job_type": "batch_inference", "spec": "{not json"})
+    assert resp.status_code == 422
+    assert "not valid JSON" in resp.text
+    assert conn.execute("SELECT COUNT(*) c FROM jobs").fetchone()["c"] == 0
+    # The typing is handed back rather than cleared.
+    assert "{not json" in resp.text
+
+
+def test_a_spec_the_job_type_rejects_shows_the_type_s_own_reason(client, conn):
+    """``create_job`` runs the type's ``validate_spec``, and its message names
+    the field. That sentence is what a submitter needs, so it is shown rather
+    than mapped to something vaguer."""
+    cookie, _ = _submitter_session(client, conn)
+    resp = client.post("/ui/jobs/new", headers=_as(client, cookie), data={
+        "job_type": "batch_inference", "spec": json.dumps({"shards": []})})
+    assert resp.status_code == 422
+    assert "shards" in resp.text
+    assert conn.execute("SELECT COUNT(*) c FROM jobs").fetchone()["c"] == 0
+
+
+def test_a_spec_that_is_not_an_object_is_refused(client, conn):
+    cookie, _ = _submitter_session(client, conn)
+    resp = client.post("/ui/jobs/new", headers=_as(client, cookie), data={
+        "job_type": "batch_inference", "spec": "[1, 2, 3]"})
+    assert resp.status_code == 422
+    assert "must be a JSON object" in resp.text
+
+
+def test_an_image_the_caller_does_not_own_is_refused_by_create_job(client, conn):
+    """docs/11 §1.2: many jobs may pin one image, but only the uploader's own.
+    The form's picker only lists the caller's, so this is the check behind it."""
+    cookie, _ = _submitter_session(client, conn)
+    other = _make_local_user(conn, "other", is_admin=False, secret="other-pw")
+    conn.execute(
+        """INSERT INTO images (id, submitter_id, digest, object_ref,
+                               scan_status, finalized_at, uploaded_at)
+           VALUES ('theirs', ?, 'd', 'images/theirs', 'clean',
+                   '2026-01-01', '2026-01-01')""",
+        (other,),
+    )
+    conn.commit()
+    resp = client.post("/ui/jobs/new", headers=_as(client, cookie), data={
+        "job_type": "contained_batch", "image_id": "theirs",
+        "spec": json.dumps({"shards": [{"ref": "s0", "rows": 2}],
+                            "output_prefix": "out/j",
+                            "output_schema": {"id": "str"}})})
+    assert resp.status_code == 422
+    assert "unknown image" in resp.text
+
+
+def test_the_form_posts_form_encoded_because_its_endpoint_takes_form_fields(client, conn):
+    """The inverse of the json-enc rule, and the reason this endpoint exists at
+    all: ``POST /v1/jobs`` takes a nested ``spec``, htmx sends a flat object of
+    strings, and ``script-src 'self'`` leaves no way to bridge that in the
+    browser. So the spec arrives as text here and is parsed server-side."""
+    cookie, _ = _submitter_session(client, conn)
+    ok = client.post("/ui/jobs/new", headers=_as(client, cookie), data={
+        "job_type": "batch_inference", "spec": json.dumps(BATCH_SPEC)})
+    assert ok.status_code == 200
+
+    # The same body as JSON is what the *endpoint* refuses -- which is why the
+    # template must not carry json-enc.
+    as_json = client.post("/ui/jobs/new", headers=_as(client, cookie), json={
+        "job_type": "batch_inference", "spec": json.dumps(BATCH_SPEC)})
+    assert as_json.status_code == 422

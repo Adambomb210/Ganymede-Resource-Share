@@ -1,0 +1,51 @@
+{# The submission form (docs/12 C2). Posts to /ui/jobs/new, not to /v1/jobs:
+   json-enc sends a flat object of strings and POST /v1/jobs takes a nested
+   `spec`, so a CSP-compliant browser form cannot produce that body. The whole
+   card is re-rendered by the response, which is how the error and the created
+   link arrive without any client-side state. #}
+<section class="card" id="new-job">
+  <h2>Submit a job</h2>
+
+  {% if new_job.created %}
+  <p class="ok">Created
+    <a href="/ui/jobs/{{ new_job.created }}">{{ new_job.created }}</a>
+    as <b>draft</b> &mdash; open it to enqueue.</p>
+  {% endif %}
+  {% if new_job.error %}
+  <p class="error">{{ new_job.error }}</p>
+  {% endif %}
+
+  <form hx-post="/ui/jobs/new" hx-headers='{"X-Ganymede-UI":"1"}'
+        hx-target="#new-job" hx-swap="outerHTML">
+    <label>Type
+      <select name="job_type">
+        {% for t in new_job.job_types %}
+        <option value="{{ t }}" {% if new_job.form.job_type == t %}selected{% endif %}>{{ t }}</option>
+        {% endfor %}
+      </select>
+    </label>
+
+    <label>Image
+      <select name="image_id">
+        <option value="">none (first-party type)</option>
+        {% for i in new_job.images %}
+        <option value="{{ i.id }}" {% if new_job.form.image_id == i.id %}selected{% endif %}>
+          {{ i.id[:12] }} &mdash; {{ (i.digest or "")[:12] }} ({{ i.scan_status }})
+        </option>
+        {% endfor %}
+      </select>
+    </label>
+    <p class="hint">Required for: {{ new_job.image_required|join(", ") }}.
+      Upload one with <code>POST /v1/images/upload-url</code>; only a
+      <b>clean</b> image is ever leased (docs/11 §1.4).</p>
+
+    <label>Spec (JSON)
+      <textarea name="spec" rows="10" cols="72"
+                placeholder='{"shards": [...], "output_prefix": "out/j1"}'>{{ new_job.form.spec }}</textarea>
+    </label>
+    <p class="hint">The job type validates its own shape; a bad spec comes back
+      here with the reason.</p>
+
+    <button type="submit">Create draft</button>
+  </form>
+</section>

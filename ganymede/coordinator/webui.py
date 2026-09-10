@@ -13,6 +13,7 @@ never a naked 403.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import Annotated
@@ -126,6 +127,70 @@ def mount(app: FastAPI, settings: Settings) -> None:
         )
         return resp
 
+    @app.post("/ui/jobs/new", response_class=HTMLResponse)
+    def ui_jobs_new(request: Request, conn: ConnDep,
+                    job_type: Annotated[str, Form()],
+                    spec: Annotated[str, Form()] = "",
+                    image_id: Annotated[str, Form()] = "") -> HTMLResponse:
+        """Create a job from the browser (docs/12 C2).
+
+        **Why this is a ``/ui`` POST when every other mutation goes straight to
+        ``/v1``.** htmx's ``json-enc`` encodes a form as a *flat* object of
+        strings, and ``POST /v1/jobs`` takes a nested ``spec`` object. With
+        ``script-src 'self'`` and no build step there is no way for a browser
+        form to produce that body -- so the spec arrives here as text, gets
+        parsed, and goes on to the same :func:`~ganymede.coordinator.app.create_job`
+        the API calls. Nothing about *which jobs are allowed* lives here.
+
+        The other half of the reason is the error path: a 422 from ``/v1``
+        swapped into the page by htmx would put a raw JSON error blob in front
+        of a person. A malformed spec is the expected outcome of typing JSON
+        into a textarea, so it is rendered as a message beside the field.
+        """
+        from ganymede.coordinator.app import JobCreateRequest, create_job
+
+        user, redirect = _page_user(request, conn)
+        if redirect:
+            return redirect
+        if not _is_submitter(conn, user):
+            # Matches the API's answer for a non-allowlisted caller (docs/08):
+            # the submitter surface is not confirmed to exist for them.
+            raise _404()
+
+        form = {"job_type": job_type, "image_id": image_id, "spec": spec}
+
+        def fail(message: str) -> HTMLResponse:
+            return _csp(templates.TemplateResponse(
+                request, "frags/new_job.html",
+                {"new_job": _new_job_context(conn, user, error=message, form=form),
+                 "user": user},
+                status_code=422,
+            ))
+
+        text = spec.strip() or "{}"
+        try:
+            parsed = json.loads(text)
+        except ValueError as exc:
+            return fail(f"spec is not valid JSON: {exc}")
+        if not isinstance(parsed, dict):
+            return fail("spec must be a JSON object")
+
+        try:
+            result = create_job(conn, user, JobCreateRequest(
+                job_type=job_type, spec=parsed,
+                image_id=image_id.strip() or None,
+            ))
+        except HTTPException as exc:
+            # create_job raises 422 with a field-named message; that is already
+            # the sentence a submitter needs, so it is shown rather than mapped.
+            return fail(str(exc.detail))
+
+        return _csp(templates.TemplateResponse(
+            request, "frags/new_job.html",
+            {"new_job": _new_job_context(conn, user, created=result["job_id"]),
+             "user": user},
+        ))
+
     @app.post("/ui/logout")
     def ui_logout(request: Request, conn: ConnDep) -> RedirectResponse:
         cookie = request.cookies.get(_SESSION_COOKIE)
@@ -148,6 +213,50 @@ def mount(app: FastAPI, settings: Settings) -> None:
         if user is None:
             return None, _redirect_login(request)
         return user, None
+
+    def _is_submitter(conn: sqlite3.Connection, user: Contributor) -> bool:
+        """Approved on the vetted allowlist (docs/08). The API's
+        ``require_submitter`` answers 404 for everyone else, because the
+        submitter surface is not confirmed to exist for them; a *page* cannot
+        do that to a logged-in user it is already rendering, so the UI asks the
+        same question and simply omits the form."""
+        row = conn.execute(
+            "SELECT status FROM submitters WHERE user_id = ?", (user.id,)
+        ).fetchone()
+        return row is not None and row["status"] == "approved"
+
+    def _new_job_context(conn: sqlite3.Connection, user: Contributor,
+                         **over) -> dict:
+        """What the submission form needs to render, empty or after a failure."""
+        from ganymede.jobtypes import REGISTRY
+
+        # `repo_tag` is accepted by `upload-url` and never stored (docs/11 §1.1
+        # names it; the table does not have it), so the picker identifies an
+        # image by id and digest. `object_ref IS NULL` means retention took the
+        # archive -- `create_job` refuses those, so they are not offered.
+        images = conn.execute(
+            """SELECT id, digest, scan_status, uploaded_at FROM images
+                WHERE submitter_id = ? AND finalized_at IS NOT NULL
+                  AND object_ref IS NOT NULL
+                ORDER BY uploaded_at DESC LIMIT 50""",
+            (user.id,),
+        ).fetchall()
+        ctx = {
+            "job_types": sorted(REGISTRY),
+            # docs/11 §4: a contained type is unrunnable without one, so the
+            # form says which types need an image rather than letting the
+            # submitter find out from a 422.
+            "image_required": sorted(
+                name for name, cls in REGISTRY.items()
+                if getattr(cls, "requires_image", False)
+            ),
+            "images": images,
+            "error": None,
+            "created": None,
+            "form": {"job_type": "", "image_id": "", "spec": ""},
+        }
+        ctx.update(over)
+        return ctx
 
     def _need_admin(user: Contributor) -> HTMLResponse | None:
         if not user.is_admin:
@@ -196,8 +305,11 @@ def mount(app: FastAPI, settings: Settings) -> None:
             created, jid = raw.split(",", 1)
             before = (created, jid)
         rows = readmodel.jobs_page(conn, user.id, is_admin=user.is_admin, before=before)
+        can_submit = _is_submitter(conn, user)
         return _csp(templates.TemplateResponse(request, "jobs.html", {
             "user": user, "jobs": rows, "before": before, "is_admin": user.is_admin,
+            "can_submit": can_submit,
+            "new_job": _new_job_context(conn, user) if can_submit else None,
         }))
 
     @app.get("/ui/jobs/{job_id}", response_class=HTMLResponse)

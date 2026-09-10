@@ -8,19 +8,24 @@
     <div class="kpi"><b>{{ job.owner_id }}</b> owner</div>
   </div>
   {% if job.status == "draft" %}
-  {# A plain form POST to the frozen /v1 endpoint; hx-headers carries the CSRF
-     header. json-enc omitted: an empty body needs no encoder. #}
+  {# hx-headers carries the CSRF header. json-enc is omitted *here only*
+     because `jobs_enqueue` takes no body -- every /v1 endpoint that declares a
+     Pydantic body needs the encoder, since htmx posts form-encoded by default
+     and FastAPI answers 422 before the handler runs. The cancel forms below
+     send `mode` and therefore carry it. #}
   <button hx-post="/v1/jobs/{{ job.id }}/enqueue"
           hx-headers='{"X-Ganymede-UI":"1"}'
           hx-swap="none">Enqueue</button>
   {% endif %}
   {% if job.status in ("queued", "running") %}
-  <form hx-post="/v1/jobs/{{ job.id }}/cancel" hx-headers='{"X-Ganymede-UI":"1"}'
+  <form hx-post="/v1/jobs/{{ job.id }}/cancel" hx-ext="json-enc"
+        hx-headers='{"X-Ganymede-UI":"1"}'
         hx-swap="none" class="inline">
     <input type="hidden" name="mode" value="soft">
     <button type="submit">Cancel (soft)</button>
   </form>
-  <form hx-post="/v1/jobs/{{ job.id }}/cancel" hx-headers='{"X-Ganymede-UI":"1"}'
+  <form hx-post="/v1/jobs/{{ job.id }}/cancel" hx-ext="json-enc"
+        hx-headers='{"X-Ganymede-UI":"1"}'
         hx-swap="none" class="inline">
     <input type="hidden" name="mode" value="hard">
     <button type="submit">Cancel (hard)</button>

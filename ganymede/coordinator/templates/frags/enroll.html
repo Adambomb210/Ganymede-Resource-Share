@@ -4,7 +4,8 @@
      answers with this fragment carrying the one-time enroll token. No GET
      ever returns it; a refresh loses it (docs/05 enrollments). hx-select
      picks the freshly rendered #enroll out of the response. #}
-  <form hx-post="/v1/machines/enroll" hx-headers='{"X-Ganymede-UI":"1"}'
+  <form hx-post="/v1/machines/enroll" hx-ext="json-enc"
+        hx-headers='{"X-Ganymede-UI":"1"}'
         hx-target="#enroll" hx-swap="outerHTML">
     <label>Display name <input name="display_name" placeholder="gpu-box-1"></label>
     <button type="submit">Enroll</button>

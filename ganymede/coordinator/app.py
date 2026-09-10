@@ -293,6 +293,86 @@ def require_machine(
     return Machine(legacy["id"], legacy["contributor_id"], legacy["standing"])
 
 
+def create_job(conn: sqlite3.Connection, user: Contributor,
+               body: "JobCreateRequest") -> dict:
+    """Validate and insert one job in ``draft``. Raises ``HTTPException``.
+
+    Module-level because two callers need it: ``POST /v1/jobs`` and the web
+    UI's submission form (docs/12). The form cannot post to the endpoint
+    directly -- htmx sends a flat object and ``spec`` is nested -- so it parses
+    the spec itself and arrives here with the same ``JobCreateRequest`` the API
+    builds. Everything that decides whether a job is *allowed* lives here, once:
+    the job type must exist, the type validates its own spec shape, the
+    constraint grammar is checked (Decision 15), and a pinned image must exist
+    and belong to the caller.
+    """
+    if body.job_type not in REGISTRY:
+        raise HTTPException(status_code=422, detail=f"unknown job type: {body.job_type}")
+    # Resolve at the version the body pins, if any -- a spec that names a
+    # newer version than this build ships is a 422 here, not a silent
+    # never-place (docs/10 §2).
+    pinned = None
+    sdk_in = body.spec.get("sdk") if isinstance(body.spec, dict) else None
+    if isinstance(sdk_in, dict) and sdk_in.get("version") is not None:
+        try:
+            pinned = int(sdk_in["version"])
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="spec.sdk.version must be an integer")
+    try:
+        jt = resolve(body.job_type, pinned)
+    except AssertionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    validate_spec = getattr(jt, "validate_spec", None)
+    if validate_spec is not None:
+        try:
+            validate_spec(body.spec)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"invalid spec: {exc}") from exc
+    try:
+        constraints_mod.validate(body.constraints)
+    except constraints_mod.ConstraintError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # Freeze the resolved pair into the spec and never mutate it again
+    # (docs/10 §2). ``jobs`` gets no version column -- this is where the
+    # binding lives.
+    spec = dict(body.spec) if isinstance(body.spec, dict) else {}
+    spec["sdk"] = {"job_type": jt.name, "version": jt.version}
+
+    # A pin the submitter does not own, or that does not exist, is a 422
+    # here rather than a job that can never be leased (docs/11 §1.2: many
+    # jobs may pin one image, but only the uploader's own).
+    if body.image_id is not None:
+        img = conn.execute(
+            "SELECT submitter_id, object_ref FROM images WHERE id = ?",
+            (body.image_id,),
+        ).fetchone()
+        if img is None or (img["submitter_id"] != user.id and not user.is_admin):
+            raise HTTPException(
+                status_code=422, detail=f"unknown image: {body.image_id}")
+        if img["object_ref"] is None:
+            # Retention took the archive (docs/11 §1.2). Said plainly here,
+            # because the alternative is a job that queues, never leases,
+            # and gives the submitter nothing to go on.
+            raise HTTPException(
+                status_code=422,
+                detail=f"image {body.image_id} has been collected; "
+                       "upload it again")
+
+    job_id = uuid.uuid4().hex
+    now = rounds._iso(rounds.utcnow())
+    with immediate(conn):
+        conn.execute(
+            """INSERT INTO jobs
+                 (id, owner_id, job_type, spec_json, image_id, status,
+                  priority_rank, constraints_json, cancel_mode, created_at)
+               VALUES (?, ?, ?, ?, ?, 'draft', 0, ?, NULL, ?)""",
+            (job_id, user.id, body.job_type, json.dumps(spec),
+             body.image_id, json.dumps(body.constraints), now),
+        )
+    return {"job_id": job_id, "status": "draft"}
+
+
 def require_submitter(
     request: Request,
     conn: ConnDep,
@@ -1464,76 +1544,16 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
     @app.post(f"/{API_VERSION}/jobs")
     def jobs_create(body: JobCreateRequest, conn: ConnDep,
                     user: Annotated[Contributor, Depends(require_submitter)]) -> dict:
-        """Create a job in ``draft`` (docs/06). The job type validates its own
-        ``spec`` shape; the constraint grammar is validated here (Decision 15 --
-        an unknown field or operator is a submit-time 422, not a silent
-        never-place). ``priority_rank`` in the body is ignored, not a 422
-        (docs/07 §5): priority is admin-write-only."""
-        if body.job_type not in REGISTRY:
-            raise HTTPException(status_code=422, detail=f"unknown job type: {body.job_type}")
-        # Resolve at the version the body pins, if any -- a spec that names a
-        # newer version than this build ships is a 422 here, not a silent
-        # never-place (docs/10 §2).
-        pinned = None
-        sdk_in = body.spec.get("sdk") if isinstance(body.spec, dict) else None
-        if isinstance(sdk_in, dict) and sdk_in.get("version") is not None:
-            try:
-                pinned = int(sdk_in["version"])
-            except (TypeError, ValueError):
-                raise HTTPException(status_code=422, detail="spec.sdk.version must be an integer")
-        try:
-            jt = resolve(body.job_type, pinned)
-        except AssertionError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        validate_spec = getattr(jt, "validate_spec", None)
-        if validate_spec is not None:
-            try:
-                validate_spec(body.spec)
-            except ValueError as exc:
-                raise HTTPException(status_code=422, detail=f"invalid spec: {exc}") from exc
-        try:
-            constraints_mod.validate(body.constraints)
-        except constraints_mod.ConstraintError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        """Create a job in ``draft`` (docs/06).
 
-        # Freeze the resolved pair into the spec and never mutate it again
-        # (docs/10 §2). ``jobs`` gets no version column -- this is where the
-        # binding lives.
-        spec = dict(body.spec) if isinstance(body.spec, dict) else {}
-        spec["sdk"] = {"job_type": jt.name, "version": jt.version}
-
-        # A pin the submitter does not own, or that does not exist, is a 422
-        # here rather than a job that can never be leased (docs/11 §1.2: many
-        # jobs may pin one image, but only the uploader's own).
-        if body.image_id is not None:
-            img = conn.execute(
-                "SELECT submitter_id, object_ref FROM images WHERE id = ?",
-                (body.image_id,),
-            ).fetchone()
-            if img is None or (img["submitter_id"] != user.id and not user.is_admin):
-                raise HTTPException(
-                    status_code=422, detail=f"unknown image: {body.image_id}")
-            if img["object_ref"] is None:
-                # Retention took the archive (docs/11 §1.2). Said plainly here,
-                # because the alternative is a job that queues, never leases,
-                # and gives the submitter nothing to go on.
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"image {body.image_id} has been collected; "
-                           "upload it again")
-
-        job_id = uuid.uuid4().hex
-        now = rounds._iso(rounds.utcnow())
-        with immediate(conn):
-            conn.execute(
-                """INSERT INTO jobs
-                     (id, owner_id, job_type, spec_json, image_id, status,
-                      priority_rank, constraints_json, cancel_mode, created_at)
-                   VALUES (?, ?, ?, ?, ?, 'draft', 0, ?, NULL, ?)""",
-                (job_id, user.id, body.job_type, json.dumps(spec),
-                 body.image_id, json.dumps(body.constraints), now),
-            )
-        return {"job_id": job_id, "status": "draft"}
+        The work is in :func:`create_job`, which the web UI's submission form
+        calls with the same ``JobCreateRequest``. That split is not tidying:
+        htmx's ``json-enc`` produces a **flat** object of strings, and this body
+        has a nested ``spec``, so no CSP-compliant browser form can post here
+        directly. The form therefore needs a server-side parse -- and the one
+        thing it must not also acquire is a second copy of these rules.
+        """
+        return create_job(conn, user, body)
 
     @app.post(f"/{API_VERSION}/jobs/{{job_id}}/enqueue")
     def jobs_enqueue(job_id: str, conn: ConnDep,

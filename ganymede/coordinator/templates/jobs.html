@@ -2,6 +2,7 @@
 {% block title %}Jobs — Ganymede{% endblock %}
 {% block content %}
 <h1>Jobs</h1>
+{% if can_submit %}{% include "frags/new_job.html" %}{% endif %}
 <section id="jobs-list"
          hx-trigger="sse:job.status, sse:sync"
          hx-get="/ui/frag/jobs-table" hx-swap="outerHTML">
