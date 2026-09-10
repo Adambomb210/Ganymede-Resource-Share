@@ -966,6 +966,58 @@ Everything before this is plumbing. This is where you find out whether the idea 
 Budget for it to fail the first time and need a tuning pass — that's the normal
 outcome, not a signal to abandon the approach.
 
+### The verdict harness — `ganymede-verdict`
+
+Seven criteria answered by reading a loss curve at the end of a rented afternoon
+is seven judgement calls, made by the person who is paying for the machines and
+wants the answer to be yes. `scripts/verdict.py` answers them from the run's own
+tables instead, prints one line per criterion, and exits with a code.
+
+**Three exit codes, and the third is the point.** `0` everything evaluated
+passed, `1` something failed, `2` a fact needed to reach a verdict was missing —
+nobody ran `evalround.py`, the baseline predates timing, the trainer extra is
+absent. A criterion nobody measured is neither a pass nor a failure, and
+collapsing it into either is how a milestone gets declared on data that was
+never collected. `status.py` splits its alert the same way for the same reason.
+
+**It runs on a database file and `baseline.json`, and nothing else.** No torch,
+no transformers, no object store, no `STORAGE_HOST`. That is not tidiness: the
+coordinator box deliberately has no trainer stack (§6.5, `pyproject`'s split),
+and `Settings.from_env()` *raises* when storage is unconfigured — so a harness
+that built a `Store` at startup would refuse to run on the one machine you have
+left after the rentals are destroyed and all you kept was a copy of the
+database. Criterion 3 (greedy generations) is the single exception; it is
+`--generations`, imported lazily, and reports *not evaluated* when the stack or
+the credentials are absent rather than crashing or quietly passing.
+
+**What each criterion actually reads:**
+
+| Criterion | Source |
+|---|---|
+| loss vs cumulative steps | `rounds.eval_loss` against `baseline.json`'s `pass_if_final_loss_at_most`; steps summed from **accepted** submissions only, since rejected work was never aggregated |
+| loss vs wall-clock | round `opened_at`/`closed_at` vs the baseline's per-point `train_sec_mean`. Compared as *time to reach the same loss* — the two runs share no step grid, so comparing at an arbitrary timestamp would reward whoever evaluated most recently |
+| greedy generations | the final `result_adapter_ref` through `evaluate.smoke_generate`, then mechanical checks only: empty, dolly-v1 template leak, degenerate repetition. Every generation is written out, because the rest is a judgement a script should not pretend to make |
+| divergence trend | first-third vs last-third mean of `rounds.adapter_divergence`. Growing is 5.2's signal that `local_steps` is too high |
+| combine-mode A/B | reported, not decided: one run can only say which mode it used and what it scored. The A/B is a diff of two `verdict.json` files |
+| worker budgets | claim-to-submit against the `max_runtime_sec` the worker was handed. **Both** directions fail — finishing at 40% of budget means §3.5 under-filled the round, and nothing errored |
+| dominance cap | per-round steps against `cap × median`. Being bound is not a failure; being bound in *every* multi-worker round means one machine carried the run |
+
+Plus `invariants.check` over the whole database, and bucket coverage.
+
+The A/B is deliberately not a `--compare-run` mode. It needs two completed M4b
+runs, which is two afternoons, so a comparison path could not be tested against
+real data until the day it mattered — the shape of thing that breaks on the
+rental afternoon. Every number goes into `verdict.json`; the A/B is a diff.
+
+**Writing it moved one item into the pre-rental checklist.** Criterion 2 was
+uncomputable: `baseline.py` recorded a total per seed and nothing per curve
+point, so there was no single-node answer to "when did it reach this loss".
+Fixed (`train_sec` and `wall_sec` per point), but the committed `baseline.json`
+predates it — **the baseline needs re-running on your own GPU before the rental
+day**, and until it is, criterion 2 reports *not evaluated* rather than passing.
+Finding that from a harness costs an afternoon of local GPU time; finding it
+from three rented machines costs the rental.
+
 ---
 
 ## M4a status — built and run
@@ -1471,7 +1523,13 @@ require the hardware:
    `test_trainer_calibrate.py`: the ladder stops at the first OOM instead of
    retrying higher rungs, bf16's answer is stricter than nf4's on the same card,
    and a first-rung OOM is a clean False/None rather than an exception).
-4. ~~**Solo multi-worker distributed run**~~ — done. Exactly what
+4. **Re-run the baseline so it records timing.** `ganymede-baseline` now writes
+   `train_sec`/`wall_sec` per curve point, but the committed `baseline.json`
+   predates that, so M4b's wall-clock criterion has nothing on the single-node
+   side to compare against and `ganymede-verdict` reports it as *not evaluated*.
+   Local GPU time, no rentals involved — and the reason to do it *before* the
+   afternoon rather than during it.
+5. ~~**Solo multi-worker distributed run**~~ — done. Exactly what
    `tests/test_worker_concurrency.py` already was (three real worker processes,
    one real coordinator, one real MinIO, several rounds); the work was fixing the
    Windows-only blockers standing between the suite and this box: hosts-file
