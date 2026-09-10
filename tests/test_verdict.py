@@ -455,3 +455,89 @@ def test_the_mechanical_generation_checks(text, expected):
     """Conservative on purpose: each of these is wrong regardless of taste, and
     anything subtler belongs in the generations.json a person reads."""
     assert V._generation_problem(text) == expected
+
+
+# ---------------------------------------------------------------------------
+# Is this baseline about this run?
+# ---------------------------------------------------------------------------
+
+
+def _matching_baseline(**over) -> dict:
+    """A baseline whose `run` block describes the fixture's run."""
+    b = _baseline()
+    b["run"] = {"base_model": "Qwen/Qwen3-0.6B", "base_precision": "bf16",
+                "dataset_ref": "d", "lora_cfg": {}}
+    b["run"].update(over)
+    return b
+
+
+def test_a_baseline_for_a_different_model_is_ignored_not_failed(run_db):
+    """Found by running the harness against a real fleet database rather than
+    this file's fixture.
+
+    It compared a 107k-parameter model trained on synthetic rows against the
+    committed Qwen3-1.7B/Dolly baseline and reported a confident FAIL. The
+    fixture could never catch it: the same person wrote the baseline and the
+    run, so they always agreed.
+
+    The failing direction is merely wrong. The passing one is dangerous -- on a
+    rented afternoon nobody questions a PASS -- and an unusable comparison is a
+    criterion that was not evaluated, which is what the third exit code says.
+    """
+    v = _collect(run_db, _matching_baseline(base_model="Qwen/Qwen3-1.7B-Base"))
+    assert v["loss_vs_steps"].state == V.UNKNOWN
+    assert "not about this run" in v["loss_vs_steps"].detail
+    assert "Qwen3-1.7B-Base" in v["loss_vs_steps"].detail
+    # The same fact stops the wall-clock criterion too: both compare losses.
+    assert v["loss_vs_wallclock"].state == V.UNKNOWN
+
+
+def test_a_matching_baseline_is_used(run_db):
+    """The guard has to not fire on the case it exists to protect."""
+    v = _collect(run_db, _matching_baseline())
+    assert v["loss_vs_steps"].state == V.PASS
+    assert v["loss_vs_wallclock"].state == V.PASS
+
+
+@pytest.mark.parametrize("field,value", [
+    ("base_precision", "nf4"),
+    ("dataset_ref", "hf://somewhere/else"),
+])
+def test_precision_and_dataset_also_make_a_baseline_unusable(run_db, field, value):
+    """Each of these changes the curve on its own, so a mismatch does not make
+    the comparison imprecise -- it makes it meaningless."""
+    v = _collect(run_db, _matching_baseline(**{field: value}))
+    assert v["loss_vs_steps"].state == V.UNKNOWN
+    assert field in v["loss_vs_steps"].detail
+
+
+def test_a_different_lora_rank_makes_a_baseline_unusable(run_db):
+    conn = _open(run_db)
+    conn.execute("""UPDATE runs SET lora_cfg_json = '{"rank": 16}' """)
+    conn.commit()
+    conn.close()
+    v = _collect(run_db, _matching_baseline(lora_cfg={"rank": 8}))
+    assert v["loss_vs_steps"].state == V.UNKNOWN
+    assert "lora_cfg.rank" in v["loss_vs_steps"].detail
+
+
+def test_the_mismatch_is_printed_where_it_cannot_be_missed(run_db, tmp_path, capsys):
+    """Buried in one criterion's detail it reads as that criterion's problem.
+    It is the whole report's problem."""
+    import json as _json
+
+    b = tmp_path / "baseline.json"
+    b.write_text(_json.dumps(_matching_baseline(base_model="other/model")),
+                 encoding="utf-8")
+    V.main(["--db", run_db, "--baseline", str(b)])
+    assert "BASELINE IGNORED" in capsys.readouterr().out
+
+
+def test_a_missing_baseline_does_not_send_you_to_re_run_the_gpu_job(run_db):
+    """The wall-clock criterion used to blame missing per-point timing for a
+    baseline that was simply never passed -- sending someone off to spend GPU
+    hours on the wrong problem."""
+    v = _collect(run_db, None)["loss_vs_wallclock"]
+    assert v.state == V.UNKNOWN
+    assert "no baseline.json found" in v.detail
+    assert "ganymede-baseline" not in v.detail

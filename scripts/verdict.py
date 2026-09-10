@@ -154,13 +154,56 @@ def accepted_steps_by_round(conn: sqlite3.Connection, run_id: str) -> dict[int, 
 
 
 # ---------------------------------------------------------------------------
+# Is this baseline even about this run?
+# ---------------------------------------------------------------------------
+
+# What has to match before two loss numbers can be compared at all. Each of
+# these changes the curve on its own, so a mismatch does not make the comparison
+# imprecise -- it makes it meaningless.
+_MUST_MATCH = ("base_model", "base_precision", "dataset_ref")
+
+
+def baseline_mismatch(run: sqlite3.Row, baseline: dict | None) -> str | None:
+    """Why this baseline cannot judge this run, or None if it can.
+
+    Found by running the harness against a real fleet database: it compared a
+    107k-parameter model trained on synthetic rows against the committed
+    Qwen3-1.7B/Dolly baseline and reported a confident FAIL. The failing
+    direction is merely wrong; the passing direction is the dangerous one, and
+    on a rented afternoon nobody would question a PASS.
+
+    Deliberately not a warning. An unusable comparison is a criterion that was
+    not evaluated, which is what the third exit code exists to say.
+    """
+    if not baseline:
+        return None
+    ref = baseline.get("run") or {}
+    for field in _MUST_MATCH:
+        want, got = ref.get(field), (run[field] if field in run.keys() else None)
+        if want and got and want != got:
+            return f"{field}: baseline has {want!r}, this run has {got!r}"
+
+    want_lora = ref.get("lora_cfg") or {}
+    try:
+        got_lora = json.loads(run["lora_cfg_json"] or "{}")
+    except ValueError:
+        got_lora = {}
+    for key in ("rank", "alpha", "target_modules"):
+        want, got = want_lora.get(key), got_lora.get(key)
+        if want is not None and got is not None and want != got:
+            return f"lora_cfg.{key}: baseline has {want!r}, this run has {got!r}"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # 1 -- loss against cumulative steps, inside the baseline's seed band
 # ---------------------------------------------------------------------------
 
 
 def criterion_loss_vs_steps(rounds: list[sqlite3.Row],
                             steps: dict[int, list[tuple[str, int]]],
-                            baseline: dict | None) -> Verdict:
+                            baseline: dict | None,
+                            mismatch: str | None = None) -> Verdict:
     title = "held-out loss vs cumulative steps is inside the baseline band"
     evaluated = [(int(r["idx"]), float(r["eval_loss"]))
                  for r in rounds if r["eval_loss"] is not None]
@@ -170,7 +213,12 @@ def criterion_loss_vs_steps(rounds: list[sqlite3.Row],
                        "--once` against this database first")
     if not baseline:
         return Verdict("loss_vs_steps", title, UNKNOWN,
-                       "no baseline.json given (--baseline), so there is no band")
+                       "no baseline.json found (--baseline), so there is no band")
+    if mismatch:
+        return Verdict("loss_vs_steps", title, UNKNOWN,
+                       f"this baseline is not about this run -- {mismatch}. "
+                       "Comparing them would be a verdict on nothing.",
+                       {"mismatch": mismatch})
 
     band = (baseline.get("summary") or {}).get("tolerance", {}).get(
         "pass_if_final_loss_at_most")
@@ -208,7 +256,8 @@ def criterion_loss_vs_steps(rounds: list[sqlite3.Row],
 
 
 def criterion_loss_vs_wallclock(rounds: list[sqlite3.Row],
-                                baseline: dict | None) -> Verdict:
+                                baseline: dict | None,
+                                mismatch: str | None = None) -> Verdict:
     title = "held-out loss vs wall-clock beats single-node"
     evaluated = [r for r in rounds if r["eval_loss"] is not None]
     if not evaluated:
@@ -228,7 +277,19 @@ def criterion_loss_vs_wallclock(rounds: list[sqlite3.Row],
         return Verdict("loss_vs_wallclock", title, UNKNOWN,
                        "rounds carry no usable opened_at/closed_at")
 
-    curve = (baseline or {}).get("summary", {}).get("curve") or []
+    if not baseline:
+        # Said separately from the timing case below, which used to swallow it:
+        # telling someone to re-run ganymede-baseline when they simply did not
+        # pass one sends them off to spend GPU hours on the wrong problem.
+        return Verdict("loss_vs_wallclock", title, UNKNOWN,
+                       "no baseline.json found (--baseline), so there is nothing "
+                       "to compare against", {"distributed": distributed})
+    if mismatch:
+        return Verdict("loss_vs_wallclock", title, UNKNOWN,
+                       f"this baseline is not about this run -- {mismatch}",
+                       {"mismatch": mismatch, "distributed": distributed})
+
+    curve = baseline.get("summary", {}).get("curve") or []
     timed = [p for p in curve if p.get("train_sec_mean") is not None]
     if not timed:
         return Verdict(
@@ -513,9 +574,10 @@ def collect(conn: sqlite3.Connection, run: sqlite3.Row, baseline: dict | None,
     run_id = run["id"]
     rounds = round_rows(conn, run_id)
     steps = accepted_steps_by_round(conn, run_id)
+    mismatch = baseline_mismatch(run, baseline)
     verdicts = [
-        criterion_loss_vs_steps(rounds, steps, baseline),
-        criterion_loss_vs_wallclock(rounds, baseline),
+        criterion_loss_vs_steps(rounds, steps, baseline, mismatch),
+        criterion_loss_vs_wallclock(rounds, baseline, mismatch),
         criterion_generations(run, rounds, out_dir) if generations else Verdict(
             "generations",
             "greedy generations show no collapse or template corruption",
@@ -548,6 +610,10 @@ def render(run: sqlite3.Row, verdicts: list[Verdict],
           f"round {run['current_round']}/{run['target_rounds']}", file=stream)
     print(f"coverage: {coverage['distinct_trained']}/{coverage['buckets']} buckets "
           f"trained, spread {coverage['spread']}", file=stream)
+    mismatch = next((v.data.get("mismatch") for v in verdicts
+                     if v.data.get("mismatch")), None)
+    if mismatch:
+        print(f"BASELINE IGNORED -- {mismatch}", file=stream)
     print("", file=stream)
     for v in verdicts:
         print(f"[{_MARK[v.state]}] {v.title}", file=stream)

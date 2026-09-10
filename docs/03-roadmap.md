@@ -1009,6 +1009,30 @@ runs, which is two afternoons, so a comparison path could not be tested against
 real data until the day it mattered — the shape of thing that breaks on the
 rental afternoon. Every number goes into `verdict.json`; the A/B is a diff.
 
+**Run against a real fleet database, which found a defect the fixture could
+not.** The harness was built against a synthetic run in `tests/test_verdict.py`
+-- and a fixture written by the same person as the code agrees with it by
+construction. Pointed instead at the `fleet.db` an actual M4a run left behind
+(three worker processes, real MinIO, four closed rounds), it compared a
+107k-parameter tiny model trained on synthetic rows against the committed
+Qwen3-1.7B/Dolly baseline and reported a confident **FAIL**.
+
+The failing direction is merely wrong. The passing direction is the dangerous
+one: on a rented afternoon, a baseline from some other run quietly declaring
+PASS is exactly the outcome nobody would question. So `baseline_mismatch` now
+refuses the comparison when `base_model`, `base_precision`, `dataset_ref` or the
+LoRA config differ, reports both criteria as *not evaluated*, and prints
+`BASELINE IGNORED` at the top of the report where it cannot be read as one
+criterion's problem.
+
+That run also confirmed what the fixture could only assert: the real tables
+carry what the harness reads. Divergence 0.7784 -> 0.0212 across four rounds,
+24 accepted tasks landing at 79-86% of their budgets, the dominance cap binding
+in none of four multi-worker rounds, coverage 32/32 with a spread of one, and
+`invariants.check` clean. MinIO was already torn down by the time it ran, which
+is the "rentals are destroyed, all you kept is a copy of the database" case the
+no-torch, no-store design exists for -- demonstrated rather than argued.
+
 **Writing it moved one item into the pre-rental checklist.** Criterion 2 was
 uncomputable: `baseline.py` recorded a total per seed and nothing per curve
 point, so there was no single-node answer to "when did it reach this loss".
