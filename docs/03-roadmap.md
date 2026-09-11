@@ -955,7 +955,10 @@ Exit criteria:
 - Held-out loss vs. **wall-clock** beats single-node — otherwise the system is an
   expensive way to train slower
 - Greedy generations on the fixed prompt set show no template corruption or collapse
-- Inter-worker adapter divergence is stable across rounds, not growing
+- Inter-worker adapter divergence is stable across rounds, not growing. This is
+  two checks in one: it is DiLoCo's local-steps knob, and it is also the
+  validity condition for averaging LoRA's `A` and `B` separately at all
+  (docs/02 5.2, "Why LoRA makes that risk specific")
 - Both combine modes A/B'd (§5.2's research risk). If DiLoCo outer momentum doesn't
   beat plain weighted mean on LoRA adapters, **ship the plain mean** and record the
   negative result

@@ -745,6 +745,54 @@ variant. The plain weighted mean (`lr_outer = 1`, `β = 0`) is the conservative
 fallback and reduces to straightforward federated averaging. **M4 must A/B these two
 against a single-node baseline** rather than assuming the momentum variant helps.
 
+#### Why LoRA makes that risk specific, and what guards it
+
+The risk above is not vague unfamiliarity. There is a concrete reason averaging
+LoRA adapters is not the same operation as averaging full parameters, and it is
+worth writing down because it tells you *which number to watch*.
+
+`combine` averages every tensor in the manifest independently, so `lora_A` and
+`lora_B` are averaged separately. But what the forward pass sees is their
+**product**:
+
+```
+mean(B) . mean(A)  =  (1/n^2) sum_i sum_j  B_i A_j     <- has cross terms, i != j
+mean(B . A)        =  (1/n)   sum_i        B_i A_i     <- what we actually want
+```
+
+The cross terms pair one worker's `B` with another worker's `A`. They are not
+a contribution from anybody. This is a known issue in the federated-LoRA
+literature and it is the mechanism behind the risk stated above.
+
+**Why the scheme is still sound here.** Every round starts from one shared base
+adapter, so each worker's result is a perturbation of the same point. Writing
+`B_i = B0 + dB_i` and `A_i = A0 + dA_i`, the two expressions agree to first
+order and differ only by
+
+```
+mean(dB_i . dA_i) - mean(dB) . mean(dA)
+```
+
+a covariance term, second order in the drift. So per-tensor averaging is a valid
+approximation **exactly while per-round drift stays small**, and degrades as
+drift grows.
+
+**That makes `adapter_divergence` load-bearing, not diagnostic.** It is usually
+described as the DiLoCo knob -- more local steps means more drift means a less
+meaningful mean -- but it is also the validity condition for averaging `A` and
+`B` separately at all. M4b's "divergence is stable, not growing" is therefore
+checking two things at once, and a run whose drift climbs is not merely
+tuned badly: its aggregation arithmetic is leaving the regime where it
+approximates the thing it is supposed to compute.
+
+**The fallback, if drift misbehaves at scale.** Freezing `A` at its shared
+initialization and training only `B` makes `mean(B_i) A = mean(B_i A)` exactly,
+with no cross terms and no small-drift assumption. It costs expressiveness and
+is a trainer change, so it is not built -- but it is the known answer, and the
+decision point is M4b showing divergence growing at 1.7B where it collapsed at
+toy scale (0.657 -> 0.006 over four rounds, M4a). Worth knowing in advance
+rather than discovering while rented hardware is billing.
+
 #### Evaluating the result: a separate process, not part of the close
 
 `rounds.eval_loss` is held-out loss for the adapter a round published, and it is
