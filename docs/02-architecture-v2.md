@@ -785,13 +785,48 @@ checking two things at once, and a run whose drift climbs is not merely
 tuned badly: its aggregation arithmetic is leaving the regime where it
 approximates the thing it is supposed to compute.
 
-**The fallback, if drift misbehaves at scale.** Freezing `A` at its shared
-initialization and training only `B` makes `mean(B_i) A = mean(B_i A)` exactly,
-with no cross terms and no small-drift assumption. It costs expressiveness and
-is a trainer change, so it is not built -- but it is the known answer, and the
-decision point is M4b showing divergence growing at 1.7B where it collapsed at
-toy scale (0.657 -> 0.006 over four rounds, M4a). Worth knowing in advance
-rather than discovering while rented hardware is billing.
+This is not our observation; it is established. FFA-LoRA
+(arXiv:2403.12313) states it directly -- the average of the products of two
+low-rank matrices is not the product of their averages, "yielding inadequate
+updates" -- and a 2025 survey of federated LoRA aggregation (arXiv:2501.06332)
+treats it as the defining problem of the area.
+
+**Two known fixes, and neither is free for us.**
+
+*Freeze `A`* at its shared initialization and train only `B`. Then
+`mean(B_i) A = mean(B_i A)` exactly, with no cross terms and no small-drift
+assumption (FFA-LoRA). The cost is larger than "some expressiveness": the survey
+above reports that halving the trainable factors transmits less information and
+**degrades performance**. It is also a trainer change, not a coordinator one.
+
+*Exact aggregation via a residual* (FedEx-LoRA, arXiv:2410.09432). The server
+computes `dW_res = mean(B_i A_i) - mean(B_i) mean(A_i)` and folds it into the
+frozen base weights: `W0 <- W0 + dW_res`. Clients keep training plain LoRA, so
+it is a **server-side** fix, which maps onto our architecture -- aggregation
+already happens in one place, `combine()`.
+
+The catch is specific to us and worth stating before anyone reaches for it.
+`dW_res` is higher-rank than an adapter (up to `n_workers * r`), and it lands on
+the *base weights*. Our whole shipping model is that the base model is immutable
+and identical on every machine and only small adapters cross the network (4.1,
+6.6). Adopting this means either distributing a growing residual factor
+alongside the adapter every round, or giving up base-model immutability. Not
+impossible, but it is an architecture change rather than a tweak to `combine`.
+
+**So the decision point stands where it was**: M4b showing divergence growing at
+1.7B where it collapsed at toy scale (0.657 -> 0.006 over four rounds, M4a). If
+drift stays small, the first-order argument holds and the plain mean is fine. If
+it climbs, the choice is freeze-`A` (cheap, documented to cost quality) or
+residual aggregation (exact, costs an architectural invariant).
+
+**One thing the literature does not yet settle.** The federated-LoRA work above
+is about *FedAvg-style* aggregation. Searching the current literature (through
+2026) turns up no characterization of DiLoCo's **outer momentum** applied to
+LoRA adapters specifically: LoRDO (arXiv:2602.04396) applies infrequent
+communication to low-rank *optimizers* like GaLore, not to LoRA modules, and the
+outer-optimizer theory (arXiv:2509.10439) is full-parameter. The research risk
+stated above is therefore still open rather than merely unread, which is exactly
+why 5.2's A/B is an M4b exit criterion and not a literature question.
 
 #### Evaluating the result: a separate process, not part of the close
 
