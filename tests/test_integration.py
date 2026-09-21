@@ -303,6 +303,87 @@ def test_claim_twice_returns_same_task_not_a_new_lease(client, store, conn, make
     assert t1["buckets"] == t2["buckets"]
 
 
+def test_a_successful_close_publishes_round_close_and_job_status(
+    client, store, conn, make_contributor, seeded_run, monkeypatch
+):
+    """``close_round`` must actually emit its two events.
+
+    It did not, from the commit that added ``_publish_close`` (89fb980) until
+    this test was written: the ``try`` block ``return``ed the result of
+    ``reduce_close`` directly, which made ``_publish_close(conn, run_id)`` and
+    the ``return result`` after it unreachable -- ``result`` was not even a
+    bound name. ``round.close`` has exactly one publisher in the codebase, so
+    it never fired at all, and an operator's dashboard never refreshed on an
+    ordinary round close.
+
+    Nothing in the accounting path depended on those events, and no test
+    asserted they were emitted -- ``test_webui.py`` only checks that the
+    template wires up the ``sse:round.close`` trigger attribute, never that
+    anything publishes it. That is the gap this closes.
+    """
+    published = []
+    monkeypatch.setattr(
+        close.events.hub, "publish",
+        lambda kind, **kw: published.append((kind, kw)),
+    )
+
+    run_id = seeded_run(target_steps=10**9, min_round_sec=0, max_round_sec=3600)
+    _, key = make_contributor(name="w-publish")
+    fw = FakeWorker(client, store, key, device="gpu0")
+    assert fw.claim(run_id) is not None
+    fw.heartbeat(50)
+    assert fw.submit(50)["accepted"] is True
+
+    result = close.close_round(conn, store, run_id, 0, "test_forced")
+    assert result is not None, "precondition: the close itself succeeded"
+
+    kinds = [kind for kind, _ in published]
+    assert "round.close" in kinds, f"only published {kinds}"
+    assert "job.status" in kinds, f"only published {kinds}"
+
+    # The envelopes carry the job id, because the UI fragments key on it.
+    job_id = conn.execute(
+        "SELECT job_id FROM runs WHERE id = ?", (run_id,)
+    ).fetchone()["job_id"]
+    for kind, kw in published:
+        if kind in ("round.close", "job.status"):
+            assert kw["job_id"] == job_id
+
+
+def test_a_failed_close_publishes_nothing(
+    client, store, conn, make_contributor, seeded_run, monkeypatch
+):
+    """The companion guard: ``_publish_close`` sits after the ``except`` that
+    reopens the round and re-raises, so a close that blew up must not tell the
+    dashboard a round finished."""
+    published = []
+    monkeypatch.setattr(
+        close.events.hub, "publish",
+        lambda kind, **kw: published.append((kind, kw)),
+    )
+
+    run_id = seeded_run(target_steps=10**9, min_round_sec=0, max_round_sec=3600)
+    _, key = make_contributor(name="w-fail")
+    fw = FakeWorker(client, store, key, device="gpu0")
+    assert fw.claim(run_id) is not None
+    fw.heartbeat(50)
+    assert fw.submit(50)["accepted"] is True
+
+    class _Exploding:
+        def reduce_close(self, *a, **k):
+            raise RuntimeError("aggregation exploded")
+
+    monkeypatch.setattr(close, "resolve", lambda _name: _Exploding())
+    with pytest.raises(RuntimeError, match="aggregation exploded"):
+        close.close_round(conn, store, run_id, 0, "test_forced")
+
+    assert [k for k, _ in published if k == "round.close"] == []
+    # And the round was given back, per the except block's own contract.
+    assert conn.execute(
+        "SELECT status FROM rounds WHERE run_id = ? AND idx = 0", (run_id,)
+    ).fetchone()["status"] == "open"
+
+
 def test_concurrent_submits_all_land_round_closes_once(client, store, conn, make_contributor, seeded_run):
     """Concurrent submits from many workers all land: 8 workers submit
     simultaneously and every one is accepted and recorded. target_steps is

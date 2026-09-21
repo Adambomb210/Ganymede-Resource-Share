@@ -68,6 +68,24 @@ could have that machine. If a job leases a card and the task is abandoned, the
 fleet still lost the time, and a submitter whose jobs abandon constantly would
 otherwise be charged nothing for a great deal of damage. Charge the reservation.
 
+**"A machine" is stale as of `14`, and the gap is real.** A lease is now a set of
+*devices*, not a machine. For `collab_lora_finetune` nothing changes: `14` §7 gives a
+multi-GPU box one lease per card, so four cards are four task rows and accrue four
+times — already correctly weighted, and `14` §8.1 now caps that type at one device per
+task anyway. But a **static** type (`batch_inference`, `contained_batch`) with
+`gpu_count > 1` allocates several devices to a *single* task row, and `_task_seconds`
+charges per task: that lease's seconds are counted once, identically to a one-card lease
+of the same duration, while holding N times the hardware. A submitter running wide
+static jobs therefore pays 1x the fairness cost for Nx the consumption and is
+under-demoted by `effective_rank`.
+
+Left unfixed deliberately, and recorded here rather than in a commit message. The fix is
+to multiply by `tasks.gpu_count`, which changes what the accrued number *means* — and
+this section's whole point is that such a change is a `formula_version` bump with a
+migration, not a silent redefinition. It is also currently inert: nothing in the fleet
+submits a wide static job yet. Fold it into `formula_version = 1` alongside
+`machine_weight`, where the unit is being restated anyway.
+
 `formula_version = 0` is unweighted seconds. A second of a 4090 and a second of a
 3060 count the same, which is wrong, and `machine_weight` (`09` §3.2) is sitting
 right there to fix it — but weighting the share by machine class makes the

@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from ganymede.coordinator import ledger, rounds
 from ganymede.coordinator.ledger import (
     AWAKE_WINDOW_SEC,
@@ -316,3 +318,103 @@ def test_leaderboard_machines(client, conn, settings, make_contributor):
                    headers={"Authorization": f"Bearer {key}"}).json()
     assert len(u["by_user"]) == 1
     assert u["by_user"][0]["user_name"] == "bob"
+
+
+# --- reputation sweep idempotency (docs/09 5.1; scripts/ledger.py) -----------
+
+
+def _one_rejection_and_clean_work(conn, mid, at):
+    """One ordinary structural rejection plus five accepted submissions --
+    the shape of a machine that had a bad round and a lot of good ones."""
+    rows = [("t-rej-" + mid, 0, "norm_outlier")]
+    rows += [(f"t-ok{i}-{mid}", 1, None) for i in range(5)]
+    for tid, accepted, reason in rows:
+        conn.execute(
+            """INSERT INTO tasks (id, run_id, round_idx, job_id, buckets_json,
+                 input_ref_json, attempt_group, local_steps, status, worker_id,
+                 lease_expires_at, attempts, created_at)
+               VALUES (?, NULL, NULL, NULL, '[]', NULL, NULL, 1, 'submitted',
+                       ?, NULL, 1, ?)""",
+            (tid, mid, at))
+        conn.execute(
+            """INSERT INTO submissions (task_id, artifact_ref, steps_completed,
+                 accepted, reject_reason, received_at)
+               VALUES (?, 'ref', 100, ?, ?, ?)""",
+            (tid, accepted, reason, at))
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "Known defect, found by review 2026-09-21 and not fixed here because the "
+    "fix is a semantics decision about contributor credit. recompute_reputation "
+    "starts from the STORED reputation and then applies TRAILING-WINDOW TOTALS "
+    "(_trailing_outcomes / outcomes_for / _minorities_since are window counts, "
+    "not deltas -- there is no watermark column anywhere). So every sweep "
+    "re-convicts the machine for the same historical events. Solving the "
+    "per-rejection recurrence s' = (s + inc)*0.5 - REP_REJECT_FLOOR gives a "
+    "fixed point of inc - 0.20, and with spot checks off by default inc is "
+    "capped at min(acc,8)*REP_CLEAN_STEP = 0.16 -- so ANY machine with one "
+    "rejection in its 30-day window converges to 0.0 and is REVOKED, which is "
+    "terminal for accrual and admin-only to reverse. scripts/ledger.py's own "
+    "docstring recommends running this ONCE A MINUTE and asserts 'the sweep is "
+    "idempotent and recomputes to a fixpoint' -- so the doc states exactly the "
+    "property this test checks, and the code does not have it. Fix by counting "
+    "each event once (a watermark column, needing a migration) or by making "
+    "the score a pure function of the window rather than a mutated scalar."))
+def test_the_reputation_sweep_is_idempotent(conn, make_contributor):
+    """Running the sweep twice over an unchanged history must not move the
+    score. Anything else makes standing a function of cron cadence rather than
+    of what the machine actually did."""
+    cid, _ = make_contributor(name="rep-idem")
+    mid = _make_machine(conn, cid)
+    _one_rejection_and_clean_work(conn, mid, _iso(9, 30))
+    conn.commit()
+
+    now = rounds.utcnow().replace(day=10, hour=12, minute=0, second=0,
+                                  microsecond=0)
+    ledger.recompute_reputation(conn, mid, now=now)
+    first = conn.execute(
+        "SELECT reputation, standing FROM workers WHERE id = ?", (mid,)
+    ).fetchone()
+
+    ledger.recompute_reputation(conn, mid, now=now)
+    second = conn.execute(
+        "SELECT reputation, standing FROM workers WHERE id = ?", (mid,)
+    ).fetchone()
+
+    assert second["reputation"] == first["reputation"], (
+        "nothing happened between these two sweeps, so the score must not move"
+    )
+    assert second["standing"] == first["standing"]
+
+
+def test_the_reputation_sweep_currently_revokes_on_repetition_alone(
+    conn, make_contributor
+):
+    """The companion to the xfail above: this pins the behaviour as it actually
+    is today, so the severity is visible in the suite rather than only in a
+    review comment, and so whoever fixes it sees exactly what changes.
+
+    A single ordinary rejection plus five accepted submissions -- nothing else
+    ever happening -- walks good -> probation -> revoked purely by running the
+    sweep, which scripts/ledger.py recommends doing every minute.
+    """
+    cid, _ = make_contributor(name="rep-decay")
+    mid = _make_machine(conn, cid)
+    _one_rejection_and_clean_work(conn, mid, _iso(9, 30))
+    conn.commit()
+
+    now = rounds.utcnow().replace(day=10, hour=12, minute=0, second=0,
+                                  microsecond=0)
+    seen = []
+    for _ in range(3):
+        ledger.recompute_reputation(conn, mid, now=now)
+        r = conn.execute(
+            "SELECT reputation, standing FROM workers WHERE id = ?", (mid,)
+        ).fetchone()
+        seen.append((r["reputation"], r["standing"]))
+
+    assert seen[0][1] == "probation"
+    assert seen[1][1] == "revoked", seen
+    assert seen[1][0] == 0.0
+    # Terminal: further sweeps cannot bring it back.
+    assert seen[2] == seen[1]

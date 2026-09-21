@@ -22,6 +22,30 @@ Recommended cadence: once a minute. A 30-minute settle delay plus a minute
 sweep means a window settles within a minute of eligibility, and a standing
 change lands within the minute a rejection would have justified it. Nothing is
 latency-critical -- the sweep is idempotent and recomputes to a fixpoint.
+
+**KNOWN DEFECT, found by review 2026-09-21: step 2 is NOT idempotent, and at
+this cadence that is severe.** ``ledger.recompute_reputation`` starts from the
+*stored* reputation and then applies *trailing-window totals* --
+``_trailing_outcomes``, ``spotcheck.outcomes_for`` and ``_minorities_since``
+all return 30-day counts, not deltas, and no watermark column exists anywhere --
+so every sweep re-convicts a machine for the same historical events. Solving
+the per-rejection recurrence ``s' = (s + inc)*0.5 - REP_REJECT_FLOOR`` gives a
+fixed point of ``inc - 0.20``; with spot checks off (the default) ``inc`` is
+capped at ``min(acc, 8) * REP_CLEAN_STEP = 0.16``, which is below it. So **any
+machine with a single rejection in its 30-day window converges to 0.0 and is
+``revoked``** -- terminal for accrual, admin-only to reverse -- after about two
+sweeps, i.e. about two minutes at the cadence recommended above, no matter how
+much clean work it has done. Reproduced in
+``tests/test_ledger.py::test_the_reputation_sweep_currently_revokes_on_repetition_alone``;
+the property this paragraph's previous sentence claims is asserted by the
+``xfail(strict=True)`` beside it.
+
+Not fixed in place because the fix is a **semantics decision about contributor
+credit**, not a typo: either count each event exactly once (a watermark column,
+which needs a migration) or make the score a pure function of the window rather
+than a mutated scalar -- and the latter changes the "earned slowly, asymptotic
+to 1.0" behaviour that the accumulation is currently what produces. Until it is
+decided, do not install this on a cron against a fleet you care about.
 """
 
 from __future__ import annotations

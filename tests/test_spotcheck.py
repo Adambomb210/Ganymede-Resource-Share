@@ -536,6 +536,59 @@ def test_a_cohort_of_zeros_falls_back_rather_than_killing_the_round():
     assert fell_back == aggregate.dense_weights(steps, keys)
 
 
+def test_a_majority_zero_cohort_does_not_wedge_the_round():
+    """The gap between "every machine is at zero" (handled above) and "one is
+    not" -- and the second one used to be a ``ZeroDivisionError``.
+
+    With at least half the cohort at reputation 0.0 by sorted position, the
+    median *share* is 0.0, so ``limit = cap * 0`` clamps every share to zero
+    and the renormalisation divides by zero. That exception leaves
+    ``reduce_close`` and reaches ``close_round``, which reopens the round and
+    re-raises -- so the round then fails again on the next submit or claim, and
+    every one after that. A wedged round, from a cohort that is merely
+    lopsided rather than broken.
+
+    Reachable for real: ``recompute_reputation`` floors at 0.0, so a mixed
+    cohort of one honest machine and two floored ones is an ordinary state.
+    """
+    keys = ["a"]
+    w = aggregate.dense_weights([100, 100, 100], keys, cap=2.0,
+                                reputation=[0.0, 0.0, 1.0])
+    assert sum(x["a"] for x in w) == pytest.approx(1.0)
+    # The machines at zero carry nothing; the one that is trusted carries it all.
+    assert w[0]["a"] == pytest.approx(0.0)
+    assert w[1]["a"] == pytest.approx(0.0)
+    assert w[2]["a"] == pytest.approx(1.0)
+
+
+def test_a_zero_median_does_not_disable_the_cap_for_ordinary_cohorts():
+    """The skip above is scoped to the zero-median case only -- a cohort whose
+    median is positive must still be capped, or the fix would have quietly
+    turned the dominance cap off."""
+    keys = ["a"]
+    w = aggregate.dense_weights([100, 100, 10_000], keys, cap=2.0,
+                                reputation=[1.0, 1.0, 1.0])
+    shares = [x["a"] for x in w]
+    assert sum(shares) == pytest.approx(1.0)
+    # Raw shares would be ~[0.0098, 0.0098, 0.98]; the cap holds it to 2x the
+    # median instead of letting one machine carry the round.
+    assert shares[2] == pytest.approx(0.5)
+    assert max(shares) <= 2.0 * sorted(shares)[len(shares) // 2] + 1e-9
+
+
+def test_an_even_cohort_with_half_at_zero_is_still_capped_normally():
+    """An even split averages the two middle shares, so the median is positive
+    and the ordinary cap path runs -- included so the boundary between the two
+    behaviours is pinned rather than incidental."""
+    keys = ["a"]
+    w = aggregate.dense_weights([100, 100, 100, 100], keys, cap=2.0,
+                                reputation=[0.0, 0.0, 1.0, 1.0])
+    shares = [x["a"] for x in w]
+    assert sum(shares) == pytest.approx(1.0)
+    assert shares[0] == pytest.approx(0.0)
+    assert shares[2] == pytest.approx(0.5)
+
+
 def test_a_mismatched_reputation_vector_is_an_error_not_a_silent_truncation():
     with pytest.raises(ValueError, match="2 entries for 3 workers"):
         aggregate.dense_weights([1, 2, 3], ["a"], reputation=[1.0, 1.0])

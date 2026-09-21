@@ -276,6 +276,29 @@ def dense_weights(
                 if m % 2
                 else (sorted_shares[m // 2 - 1] + sorted_shares[m // 2]) / 2
             )
+            if median_share <= 0.0:
+                # The cap is meaningless against a zero median, the same way
+                # it is meaningless below three workers, and for a sharper
+                # reason: ``limit`` would be 0, every share would clamp to 0,
+                # and ``total_clamped`` would be 0 -- a ZeroDivisionError that
+                # propagates out of ``reduce_close`` into ``close_round``,
+                # which reopens the round and re-raises, so the round then
+                # fails again on every subsequent submit or claim. A wedged
+                # round, from a cohort that is merely lopsided.
+                #
+                # Reachable whenever at least half the cohort (by sorted
+                # position) has reputation exactly 0.0 while someone does not
+                # -- e.g. reputation [0.0, 0.0, 1.0]. The all-zero case above
+                # is already handled and is *not* this one: there, nobody has
+                # weight and the fallback is unweighted; here the surviving
+                # workers have real weight and the right answer is simply to
+                # leave it alone. Capping "no more than cap x median" cannot
+                # say anything useful when the median contributed nothing.
+                log.warning(
+                    "median reputation share is 0 (%d of %d workers at zero); "
+                    "skipping the dominance cap for this round",
+                    sum(1 for s in shares if s <= 0.0), m)
+                break
             limit = cap * median_share
             clamped = [min(s, limit) for s in shares]
             total_clamped = sum(clamped)

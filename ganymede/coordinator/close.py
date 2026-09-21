@@ -85,7 +85,14 @@ def close_round(
         return None
 
     try:
-        return resolve(_JOB_TYPE).reduce_close(
+        # Bound, not returned: ``_publish_close`` below has to run on the
+        # success path, and a ``return`` here made it -- and the return after
+        # it -- unreachable from the day it was added (89fb980). The symptom
+        # was silent and looked like a UI problem: ``round.close`` has exactly
+        # one publisher in the codebase and it never fired, so an operator's
+        # dashboard never refreshed on an ordinary round close. Nothing in the
+        # accounting path depended on it, which is why the suite stayed green.
+        result = resolve(_JOB_TYPE).reduce_close(
             conn, store, run_id, round_idx, reason, now, norm_k, cap, rep_weighted
         )
     except Exception:

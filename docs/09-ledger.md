@@ -241,6 +241,31 @@ accepted submission and passed spot-check raises it a small increment (asymptoti
 to 1.0). A spot-check failure or minority disagreement drops it sharply (≈ ×0.5
 plus a floor subtraction); a `validate()` rejection drops it modestly.
 
+> **This section and §5's "a cached rollup, recomputed on a schedule from recorded
+> outcomes" are in tension, and the implementation fell into the gap between them
+> (review, 2026-09-21).** "Recomputed from recorded outcomes" describes a *pure
+> function of history*. "Each submission raises it a small increment, asymptotic
+> to 1.0" describes an *accumulator* — a pure function of a 30-day window cannot
+> asymptote to anything, since the window's contribution is bounded (the code caps
+> it at `min(acc, 8) * REP_CLEAN_STEP = 0.16`).
+>
+> `ledger.recompute_reputation` does both at once, and that is the defect: it
+> starts from the **stored** score, then applies **trailing-window totals** — not
+> deltas; there is no watermark column — so every sweep re-convicts a machine for
+> the same historical events. The per-rejection recurrence `s' = (s + inc)*0.5 −
+> REP_REJECT_FLOOR` has fixed point `inc − 0.20`, and with spot checks off (the
+> default) `inc ≤ 0.16` sits below it. **Any machine with one rejection in its
+> 30-day window therefore decays to 0.0 and is `revoked`** — terminal for accrual
+> per §5.3, admin-only to reverse — after about two sweeps. `scripts/ledger.py`
+> recommends running that sweep *once a minute*.
+>
+> Deciding this is deciding what the scalar *means*, so it is recorded here rather
+> than patched: either count each event exactly once (a watermark column, hence a
+> migration) and keep the accumulator, or make the score a pure function of the
+> window and drop the "asymptotic to 1.0" language above. Pinned by
+> `tests/test_ledger.py::test_the_reputation_sweep_is_idempotent`
+> (`xfail(strict=True)`) and its companion that asserts today's decay.
+
 ### 5.3 `workers.standing` transitions
 
 `good ⇄ probation → revoked` (`05`).
