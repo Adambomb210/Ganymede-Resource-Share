@@ -33,6 +33,7 @@ whose artifacts went down with the disk.
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -210,8 +211,30 @@ def restore(
         report.db_path = f"{db_path} (dry run: nothing written)"
         return report
 
-    with open(db_path, "wb") as fh:
-        fh.write(db_bytes)
+    # Temp-file-then-rename, not a direct write. ``backup.py``'s whole module
+    # docstring is about not producing a torn file on the *source* side (hence
+    # ``conn.backup()`` rather than ``cp``); this is the same care on the
+    # destination, which had none. It matters most in the one case the
+    # operator has explicitly opted into: ``--force`` means a database already
+    # exists here and is being replaced, so a crash or a full disk partway
+    # through a direct write would take out the old database *and* leave a
+    # truncated new one. ``os.replace`` is atomic on POSIX and on Windows
+    # within a volume, and the temp file is created in the same directory so
+    # it is always the same volume.
+    tmp_path = f"{db_path}.restore-tmp"
+    try:
+        with open(tmp_path, "wb") as fh:
+            fh.write(db_bytes)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, db_path)
+    except BaseException:
+        # Leave nothing half-written behind for the next run to trip over.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
     conn = connect(db_path)
     try:
@@ -301,7 +324,6 @@ def main(argv: list[str] | None = None, *, settings: Settings | None = None,
     settings = settings or Settings.from_env()
     db_path = args.db_path or settings.db_path
 
-    import os
 
     if os.path.exists(db_path) and not args.force and not args.dry_run:
         # The one destructive step in the whole system, and the moment it would

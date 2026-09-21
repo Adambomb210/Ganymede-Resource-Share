@@ -254,3 +254,97 @@ def test_an_empty_backup_store_is_reported_rather_than_crashing(backup_store, st
     assert not report.ok
     assert "no backups/" in report.problems[0]
     assert not (tmp_path / "restored.db").exists()
+
+
+# --------------------------------------------------------------------------
+# The write itself. Nothing exercised the real (non-dry-run) path before, so
+# a NameError in it would have shipped: `restore()` used `os` while the only
+# `import os` in the module was function-local to `main()`.
+# --------------------------------------------------------------------------
+
+
+def _snapshot_of(conn) -> bytes:
+    """The bytes `backup.py` would have uploaded for this database."""
+    import sqlite3
+    import tempfile
+    from pathlib import Path
+
+    dest = Path(tempfile.mkdtemp()) / "snap.db"
+    target = sqlite3.connect(str(dest))
+    try:
+        conn.backup(target)
+    finally:
+        target.close()
+    return dest.read_bytes()
+
+
+def test_a_real_restore_writes_a_usable_database(
+    conn, store, backup_store, seeded_run, tmp_path
+):
+    """End to end with ``dry_run=False``: the one path that actually creates
+    the file an operator then runs a coordinator against."""
+    run_id = seeded_run()
+    base_ref = conn.execute(
+        "SELECT base_adapter_ref FROM rounds WHERE run_id = ? AND idx = 0", (run_id,)
+    ).fetchone()["base_adapter_ref"]
+    backup_store.put_bytes(base_ref, store.get_bytes(base_ref))
+    backup_store.put_bytes("backups/20260921T000000Z/coordinator.db",
+                           _snapshot_of(conn))
+
+    db_path = tmp_path / "restored.db"
+    report = restore_mod.restore(
+        backup_store=backup_store, primary_store=store, db_path=str(db_path),
+    )
+
+    assert report.ok, report.problems
+    assert db_path.exists() and db_path.stat().st_size > 0
+    # No temp file left lying around for the next run to trip over.
+    assert not (tmp_path / "restored.db.restore-tmp").exists()
+
+    # And it is a real database, not just bytes on disk.
+    import sqlite3
+    c = sqlite3.connect(str(db_path))
+    try:
+        got = c.execute("SELECT id FROM runs WHERE id = ?", (run_id,)).fetchone()
+    finally:
+        c.close()
+    assert got is not None
+
+
+def test_a_failed_write_does_not_destroy_the_database_it_was_replacing(
+    conn, store, backup_store, seeded_run, tmp_path, monkeypatch
+):
+    """``--force`` means a database already exists here and is being replaced.
+    A direct write that died partway through -- a crash, a full disk -- would
+    take out the old database *and* leave a truncated new one. The temp file
+    plus ``os.replace`` is what makes the old one survive a failed restore.
+    """
+    run_id = seeded_run()
+    base_ref = conn.execute(
+        "SELECT base_adapter_ref FROM rounds WHERE run_id = ? AND idx = 0", (run_id,)
+    ).fetchone()["base_adapter_ref"]
+    backup_store.put_bytes(base_ref, store.get_bytes(base_ref))
+    backup_store.put_bytes("backups/20260921T000000Z/coordinator.db",
+                           _snapshot_of(conn))
+
+    db_path = tmp_path / "existing.db"
+    db_path.write_bytes(b"THE PRECIOUS ORIGINAL")
+
+    real_replace = restore_mod.os.replace
+
+    def _die(src, dst):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(restore_mod.os, "replace", _die)
+    with pytest.raises(OSError):
+        restore_mod.restore(
+            backup_store=backup_store, primary_store=store, db_path=str(db_path),
+        )
+
+    assert db_path.read_bytes() == b"THE PRECIOUS ORIGINAL", (
+        "the database being replaced must survive a restore that failed"
+    )
+    assert not (tmp_path / "existing.db.restore-tmp").exists(), (
+        "and the half-written temp file must be cleaned up"
+    )
+    assert real_replace is not None  # keep the reference meaningful
