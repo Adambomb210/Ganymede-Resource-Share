@@ -400,6 +400,73 @@ def _blob(walk: _Walk, digest: str) -> bytes:
     return walk.small_blobs.get(f"blobs/{algo}/{hexpart}", b"")
 
 
+# An OCI index may point at other indexes (a multi-platform build) rather than
+# straight at image manifests. Two levels is what a real archive uses -- the
+# top-level index.json of a containerd-store ``docker save`` points at one
+# nested index per image -- and the bound is what stops a self-referential
+# digest from recursing forever.
+#
+# An index is recognised by *having* a ``manifests`` list rather than by its
+# mediaType: an image manifest never carries one, and a hand-rolled layout may
+# carry no mediaType at all.
+_MAX_INDEX_DEPTH = 2
+
+
+def _is_attestation(entry: dict) -> bool:
+    """A buildx provenance/SBOM manifest, which is not an image.
+
+    It sits in the index beside the real ones and is marked two ways; both are
+    checked because the annotation is Docker's and the ``unknown`` platform is
+    the convention every other builder follows.
+    """
+    plat = entry.get("platform") or {}
+    if str(plat.get("architecture", "")).lower() == "unknown":
+        return True
+    ann = entry.get("annotations") or {}
+    return ann.get("vnd.docker.reference.type") == "attestation-manifest"
+
+
+def _image_manifests(walk: _Walk, entries: list, depth: int = 0):
+    """Flatten an index into the image manifests it actually points at.
+
+    Yields ``(descriptor, manifest)`` pairs. A descriptor whose blob is missing
+    or unparseable is skipped rather than raised on: ``scan_archive`` runs once
+    per image inside ``drain_pending``, so an exception here is the difference
+    between one flagged image and a sweep that stops.
+    """
+    if depth > _MAX_INDEX_DEPTH:
+        return
+    for entry in entries:
+        if not isinstance(entry, dict) or _is_attestation(entry):
+            continue
+        blob = _decode(_blob(walk, entry.get("digest", "")))
+        if not isinstance(blob, dict):
+            continue
+        nested = blob.get("manifests")
+        if isinstance(nested, list):
+            yield from _image_manifests(walk, nested, depth + 1)
+        elif isinstance(blob.get("config"), dict):
+            yield entry, blob
+
+
+def _pick_platform(candidates: list) -> dict | None:
+    """The linux/amd64 image out of an index, else the first one there is.
+
+    Selecting by platform rather than by position is the whole point: a
+    multi-platform archive lists its variants in no guaranteed order, and
+    taking ``manifests[0]`` reads whichever one the builder happened to write
+    first. The fallback covers a hand-rolled layout that declares no platform
+    at all -- ``_check_manifest`` still has the config's own ``os``/
+    ``architecture`` to refuse it by, which is where that verdict belongs.
+    """
+    for entry, man in candidates:
+        plat = entry.get("platform") or {}
+        if (str(plat.get("os", "")).lower(),
+                str(plat.get("architecture", "")).lower()) == ("linux", "amd64"):
+            return man
+    return candidates[0][1] if candidates else None
+
+
 def _resolve_config(walk: _Walk) -> tuple[dict | None, str, list[str]]:
     """Find the image config JSON and the layer list, in either format.
 
@@ -434,8 +501,8 @@ def _resolve_config(walk: _Walk) -> tuple[dict | None, str, list[str]]:
         idx = _decode(index)
         manifests = idx.get("manifests") if isinstance(idx, dict) else None
         if isinstance(manifests, list) and manifests:
-            man = _decode(_blob(walk, (manifests[0] or {}).get("digest", "")))
-            if isinstance(man, dict):
+            man = _pick_platform(list(_image_manifests(walk, manifests)))
+            if man is not None:
                 cfg = _decode(_blob(walk, (man.get("config") or {}).get("digest", "")))
                 layers = [
                     str((d or {}).get("digest", "")) for d in man.get("layers") or []

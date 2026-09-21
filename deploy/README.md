@@ -101,3 +101,21 @@ needing a configured coordinator -- so it works before you have one deployed.
   Run `scripts/gc.py` on the same schedule to reclaim old worker submission
   artifacts (`--dry-run` first to see what it would delete; `--yes` to
   actually delete).
+
+- **The two sweeps, once a minute.** Neither is optional and neither is run by
+  the coordinator process, so a deployment that installs nothing here looks
+  healthy and quietly does not work:
+
+  ```
+  * * * * * python3 -m scripts.imagescan   # docs/11 §1.3
+  * * * * * python3 -m scripts.ledger      # docs/09 §5
+  ```
+
+  `imagescan` is the one that stops a submitter cold. `/finalize` marks an
+  uploaded image `pending` and returns -- the scan is out-of-band by design, so
+  that a 10 GiB archive stays off the request cycle -- and docs/11 §1.4 refuses
+  a lease for any job pinned to an image that is not `clean`. With nothing
+  draining the queue the image stays `pending` for ever, the job enqueues
+  normally, and every claim against it 204s with no error anywhere to explain
+  why. `imagescan` also carries retention (docs/11 §1.2), so without it
+  collected archives are never reclaimed either.

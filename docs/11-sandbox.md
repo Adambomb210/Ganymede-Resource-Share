@@ -82,6 +82,11 @@ level it checks four things:
 
 - **Manifest sanity.** Valid Docker / OCI schema; `linux/amd64`; layer count and
   uncompressed size within bounds (a decompression-bomb guard, not escape analysis).
+  An archive may describe more than one image — a multi-platform build, plus
+  buildx's attestation manifests — so the `linux/amd64` variant is *selected*
+  and judged, and an archive that has none is refused by this same check on the
+  config it fell back to. Selection is by declared platform, never by position:
+  an index lists its variants in whatever order the builder wrote them.
 - **Base-image provenance.** Walk the base layers' digests; the bottom of the stack
   must match a vetted set — the pinned `ganymede/torch-base` digests (§4.1), official
   CUDA runtime images, distroless. An unrecognised base → `flagged` for a human, not a
@@ -330,6 +335,33 @@ site, and the checks do not move with it.
 today, which is fine at the sizes being scanned and wrong at the 10 GiB cap. The
 scan itself takes a stream and never seeks backwards, so this is a `Store`
 change when it matters, not a scan change.
+
+### What the in-memory fixtures could not say
+
+**A real multi-platform export was refused as "no readable image config".**
+Found by `tests/test_images_live.py`, which scans archives a daemon actually
+wrote rather than ones the suite builds. `index.json`'s `manifests[0]` is a
+nested *index* for a `docker buildx build --platform linux/arm64,linux/amd64
+--output type=oci` image, and the reader dereferenced it expecting an image
+manifest; it found no `config` key and called an ordinary image unreadable,
+which under §1.4 means it could never be leased. The synthetic `oci_archive()`
+fixture put a single manifest exactly where the reader already looked, so the
+branch had been green since the day it was written.
+
+Two things kept it hidden longer than it should have been. Docker's current
+`docker save` writes a *hybrid* archive — an OCI layout plus a legacy
+`manifest.json` — and the legacy member is checked first, so the OCI branch was
+almost never reached in practice. And the archives that do reach it carry
+buildx **attestation manifests** beside the real ones, marked
+`platform: unknown/unknown`; a reader that merely descended one level without
+skipping those would trade one wrong answer for another. Both shapes now have a
+fixture, and the live file keeps a genuine copy of each.
+
+The same file is the only place the pipeline is exercised end to end over real
+bytes — `upload-url` → `finalize` → the sweep → a pinned job → a lease.
+Everywhere else that chain is cut: `test_contained_batch.py` sets
+`scan_status = 'clean'` with a SQL `UPDATE`, and `test_images.py` runs the real
+scan over a synthetic tar.
 
 ### One thing worth knowing before §2
 

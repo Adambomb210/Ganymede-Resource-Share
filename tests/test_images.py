@@ -15,6 +15,7 @@ rewrite it, while "no lease against an unscanned image" must survive that.
 from __future__ import annotations
 
 import gzip
+import hashlib
 import io
 import json
 import tarfile
@@ -103,6 +104,75 @@ def oci_archive(**cfg_kwargs) -> bytes:
     return _tar_bytes(members)
 
 
+_OCI_INDEX = "application/vnd.oci.image.index.v1+json"
+_OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
+
+
+def _blobbed(members: dict[str, bytes], payload: bytes) -> str:
+    """Store a blob under its real digest and return the reference."""
+    digest = hashlib.sha256(payload).hexdigest()
+    members[f"blobs/sha256/{digest}"] = payload
+    return f"sha256:{digest}"
+
+
+def oci_multiplatform_archive(*, platforms=(("linux", "arm64"), ("linux", "amd64")),
+                              **cfg_kwargs) -> bytes:
+    """What ``docker buildx build --platform a,b --output type=oci`` writes.
+
+    Two things ``oci_archive`` above cannot express, both of which a real
+    archive has and both of which broke the selector:
+
+    * ``index.json`` points at a **nested index**, not at an image manifest, so
+      a reader that dereferences ``manifests[0]`` and expects a ``config`` key
+      finds none and calls a perfectly good image unreadable.
+    * buildx writes an **attestation manifest** beside the real ones, marked
+      ``platform: unknown/unknown``. It is not an image; selecting it yields a
+      verdict about provenance metadata rather than about the image.
+
+    The attestation is written first, and the platforms are listed in the order
+    given, so neither "take the first entry" nor "take the first image" can
+    pass by luck.
+    """
+    layer = gzip.compress(_tar_bytes({"app/main.py": b"print(1)"}))
+    members: dict[str, bytes] = {"oci-layout": b'{"imageLayoutVersion": "1.0.0"}'}
+    layer_ref = _blobbed(members, layer)
+
+    att_cfg = _blobbed(members, json.dumps(
+        {"architecture": "unknown", "os": "unknown"}).encode())
+    att_ref = _blobbed(members, json.dumps({
+        "schemaVersion": 2, "mediaType": _OCI_MANIFEST,
+        "config": {"digest": att_cfg, "size": 2},
+        "layers": [],
+    }).encode())
+    descriptors = [{
+        "mediaType": _OCI_MANIFEST, "digest": att_ref,
+        "platform": {"architecture": "unknown", "os": "unknown"},
+        "annotations": {"vnd.docker.reference.type": "attestation-manifest"},
+    }]
+
+    for os_name, arch in platforms:
+        cfg = _config(os_name=os_name, arch=arch, **cfg_kwargs)
+        cfg_ref = _blobbed(members, cfg)
+        man_ref = _blobbed(members, json.dumps({
+            "schemaVersion": 2, "mediaType": _OCI_MANIFEST,
+            "config": {"digest": cfg_ref, "size": len(cfg)},
+            "layers": [{"digest": layer_ref, "size": len(layer)}],
+        }).encode())
+        descriptors.append({
+            "mediaType": _OCI_MANIFEST, "digest": man_ref,
+            "platform": {"architecture": arch, "os": os_name},
+        })
+
+    nested = _blobbed(members, json.dumps(
+        {"schemaVersion": 2, "mediaType": _OCI_INDEX,
+         "manifests": descriptors}).encode())
+    members["index.json"] = json.dumps({
+        "schemaVersion": 2, "mediaType": _OCI_INDEX,
+        "manifests": [{"mediaType": _OCI_INDEX, "digest": nested}],
+    }).encode()
+    return _tar_bytes(members)
+
+
 def _scan(payload: bytes, **limit_kwargs) -> images.ScanResult:
     limits = images.ScanLimits(
         vetted_base_diff_ids=frozenset({VETTED}), **limit_kwargs)
@@ -129,6 +199,63 @@ def test_oci_layout_is_read_too():
     on Docker versions."""
     result = _scan(oci_archive())
     assert result.status == "clean", result.detail()
+
+
+def test_a_multi_platform_export_is_read_through_its_nested_index():
+    """``manifests[0]`` is an *index*, not a manifest (docs/11 §1.3).
+
+    A genuine ``docker buildx build --platform linux/arm64,linux/amd64
+    --output type=oci`` archive was flagged "no readable image config" -- a
+    perfectly ordinary image refused because of how its author built it. The
+    synthetic OCI fixture hid it by putting a single manifest where the reader
+    already looked.
+    """
+    result = _scan(oci_multiplatform_archive())
+    assert result.status == "clean", result.detail()
+    assert "linux/amd64" in _checks(result)["manifest_sanity"].detail
+
+
+def test_the_amd64_variant_is_chosen_whatever_order_it_is_listed_in():
+    """Selection is by platform, not by position: an index lists its variants
+    in whatever order the builder wrote them."""
+    for order in ((("linux", "arm64"), ("linux", "amd64")),
+                  (("linux", "amd64"), ("linux", "arm64"))):
+        result = _scan(oci_multiplatform_archive(platforms=order))
+        assert result.status == "clean", f"{order}: {result.detail()}"
+
+
+def test_an_attestation_manifest_is_never_mistaken_for_the_image():
+    """buildx's provenance manifest sits in the index beside the real one and
+    is marked ``unknown/unknown``. Reading it would produce a verdict about the
+    metadata rather than about the image -- here, a platform failure."""
+    result = _scan(oci_multiplatform_archive(platforms=(("linux", "amd64"),)))
+    assert result.status == "clean", result.detail()
+    assert "unknown" not in _checks(result)["manifest_sanity"].detail
+
+
+def test_an_index_with_no_amd64_variant_still_fails_the_platform_check():
+    """The selector must not swallow the policy decision: with nothing to
+    prefer it falls back to the first image, and ``_check_manifest`` refuses it
+    on the config's own architecture."""
+    result = _scan(oci_multiplatform_archive(platforms=(("linux", "arm64"),)))
+    assert result.status == "flagged"
+    assert "not linux/amd64" in _checks(result)["manifest_sanity"].detail
+
+
+def test_an_index_pointing_at_a_missing_blob_is_a_verdict_not_a_raise():
+    """``scan_archive`` runs once per image inside ``drain_pending``; an
+    exception is the difference between one flagged image and a dead sweep."""
+    payload = oci_multiplatform_archive()
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r") as src:
+        kept = {m.name: src.extractfile(m).read()
+                for m in src.getmembers() if m.isfile()}
+    index = json.loads(kept["index.json"])
+    index["manifests"] = [{"mediaType": _OCI_INDEX, "digest": "sha256:" + "f0" * 32}]
+    kept["index.json"] = json.dumps(index).encode()
+
+    result = _scan(_tar_bytes(kept))
+    assert result.status == "flagged"
+    assert "no readable image config" in _checks(result)["manifest_sanity"].detail
 
 
 def test_unrecognised_base_is_flagged_not_denied():
