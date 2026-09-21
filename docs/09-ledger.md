@@ -236,47 +236,91 @@ inputs and what it drives. It is a cached rollup, recomputed on a schedule from
 
 ### 5.2 Dynamics
 
-Enrollment starts at `REP_ENROLL = 0.25` — a new machine is low-trust. Each clean
-accepted submission and passed spot-check raises it a small increment (asymptotic
-to 1.0). A spot-check failure or minority disagreement drops it sharply (≈ ×0.5
-plus a floor subtraction); a `validate()` rejection drops it modestly.
+Enrollment starts at `REP_ENROLL = 0.25` — a new machine is low-trust. The score
+is a **pure function of the trailing 30-day window**: `ledger.reputation_for`
+takes the five counts that window yields (accepted, passed probes, rejections,
+failed probes, minority disagreements) and returns a score. Nothing carries over
+between sweeps.
 
-> **This section and §5's "a cached rollup, recomputed on a schedule from recorded
-> outcomes" are in tension, and the implementation fell into the gap between them
-> (review, 2026-09-21).** "Recomputed from recorded outcomes" describes a *pure
-> function of history*. "Each submission raises it a small increment, asymptotic
-> to 1.0" describes an *accumulator* — a pure function of a 30-day window cannot
-> asymptote to anything, since the window's contribution is bounded (the code caps
-> it at `min(acc, 8) * REP_CLEAN_STEP = 0.16`).
->
-> `ledger.recompute_reputation` does both at once, and that is the defect: it
-> starts from the **stored** score, then applies **trailing-window totals** — not
-> deltas; there is no watermark column — so every sweep re-convicts a machine for
-> the same historical events. The per-rejection recurrence `s' = (s + inc)*0.5 −
+Each clean accepted submission and passed spot-check closes a fixed *share of the
+remaining distance to 1.0* — `REP_CLEAN_STEP`, and twice that for a corroborated
+pass — so the score is asymptotic to 1.0 in the **volume of clean work in the
+window**, and reaches `REP_GOOD` at 32 accepted submissions. A spot-check failure
+or minority disagreement drops it sharply (≈ ×0.5 plus a floor subtraction); a
+`validate()` rejection drops it modestly. Convictions apply worst-first, so a
+machine with several lands where the worst one puts it rather than where the
+order of evaluation left it.
+
+> **Why the word "asymptotic" changed meaning here (review, 2026-09-21).** This
+> section and §5's "a cached rollup, recomputed on a schedule from recorded
+> outcomes" used to be in tension, and the implementation fell into the gap.
+> "Recomputed from recorded outcomes" describes a *pure function of history*;
+> "each submission raises it a small increment, asymptotic to 1.0" describes an
+> *accumulator*. `recompute_reputation` did both at once: it started from the
+> **stored** score and applied **trailing-window totals** — not deltas; there is
+> no watermark column — so every sweep re-convicted a machine for the same
+> historical events. The per-rejection recurrence `s' = (s + inc)*0.5 −
 > REP_REJECT_FLOOR` has fixed point `inc − 0.20`, and with spot checks off (the
-> default) `inc ≤ 0.16` sits below it. **Any machine with one rejection in its
-> 30-day window therefore decays to 0.0 and is `revoked`** — terminal for accrual
-> per §5.3, admin-only to reverse — after about two sweeps. `scripts/ledger.py`
-> recommends running that sweep *once a minute*.
+> default) `inc ≤ 0.16` sat below it, so any machine with one rejection in its
+> window decayed to 0.0 and was `revoked` — terminal, admin-only to reverse —
+> in about two sweeps, at a recommended cadence of once a minute. Standing was a
+> function of cron cadence rather than of conduct.
 >
-> Deciding this is deciding what the scalar *means*, so it is recorded here rather
-> than patched: either count each event exactly once (a watermark column, hence a
-> migration) and keep the accumulator, or make the score a pure function of the
-> window and drop the "asymptotic to 1.0" language above. Pinned by
-> `tests/test_ledger.py::test_the_reputation_sweep_is_idempotent`
-> (`xfail(strict=True)`) and its companion that asserts today's decay.
+> Resolved in favour of the pure function. "Asymptotic to 1.0" survives, but it
+> is now asymptotic *in the volume of clean work inside the window* rather than
+> in the number of times the sweep has run, which is the reading that makes both
+> sentences true at once. The `min(acc, 8)` cap is gone with the thing it existed
+> to bound. Pinned by `test_the_reputation_sweep_is_idempotent` and
+> `test_repetition_alone_never_moves_standing`.
 
 ### 5.3 `workers.standing` transitions
 
 `good ⇄ probation → revoked` (`05`).
 
+Standing is a **classification of the trailing window**, not a walk through
+states — the same property §5.2 demanded of the score, for the same reason.
+Every row below is a question about the window alone, so running the sweep twice
+over an unchanged history lands in the same place. The one exception is
+`probation → good`, which asks what the machine has done *since*, and is
+idempotent because its answer only changes when the machine does something.
+
 | Transition | Trigger |
 | --- | --- |
 | `good → probation` | score `< REP_GOOD` (0.60), **or** one spot-check failure, **or** one minority redundancy disagreement |
 | `probation → good` | score `≥ REP_GOOD` **and** a clean `PROBATION_RECOVERY_DAYS` (7) window with ≥ 1 passed spot-check and no rejection |
-| `probation → revoked` | score `< REP_REVOKE` (0.15), **or** a second spot-check failure while on probation |
+| `→ revoked` | **two** spot-check failures in the trailing window |
 | `→ revoked` (any) | admin action or the fraud rules |
 | `revoked` | terminal for accrual; reinstatement is admin-only, out of scope |
+
+Three things about that table are deliberate and were not obvious (review,
+2026-09-21):
+
+**Revocation is conduct-only; `score < REP_REVOKE` is gone as a trigger.** It
+could not survive the move to a window score. A low score there is dominated by
+low *volume*, not by bad conduct: `REP_ENROLL` (0.25) sits barely above
+`REP_REVOKE` (0.15), so a contributor whose very first submission failed
+validation scored 0.025 and was permanently banned — on the most sympathetic
+case in the system. Against an accumulator that only sank that far through
+repeated misconduct the threshold meant something; against a 30-day window it
+means "new and unlucky", and a trigger that cannot tell those apart must not be
+terminal. A low score still suppresses accrual through the §6 reputation
+weighting — just never terminally. `REP_REVOKE` remains defined as the published
+floor of the probation band.
+
+**"A second failure" is counted in the window, not against probation entry.**
+There is no `standing_changed_at` column, and the stateful substitute — "on
+probation, and a failure in the last 7 days" — re-read the *same* failure on
+every sweep, which is how revocation-by-cron happened. The cost of the window
+form is real and accepted: two failures 30 days apart now revoke even if the
+machine recovered to `good` in between. Adding a column to recover that
+precision is a migration, and is not worth it to preserve a rule that was
+firing on its own trigger.
+
+**Minority disagreements never revoke, at any count** — only spot-check failures
+do. A minority is merely outvoted; a failed probe was caught against an answer
+already known to be right. That ordering is asserted by
+`test_a_failed_probe_costs_more_than_a_minority_disagreement`, and the old table
+blurred it by letting a low enough score revoke on any path.
 
 `revoked` accrues nothing (§1.3.1); `probation` accrues at `PROBATION_FACTOR`
 (§1.3).

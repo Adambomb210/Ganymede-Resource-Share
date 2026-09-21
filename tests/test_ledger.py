@@ -343,23 +343,6 @@ def _one_rejection_and_clean_work(conn, mid, at):
             (tid, accepted, reason, at))
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "Known defect, found by review 2026-09-21 and not fixed here because the "
-    "fix is a semantics decision about contributor credit. recompute_reputation "
-    "starts from the STORED reputation and then applies TRAILING-WINDOW TOTALS "
-    "(_trailing_outcomes / outcomes_for / _minorities_since are window counts, "
-    "not deltas -- there is no watermark column anywhere). So every sweep "
-    "re-convicts the machine for the same historical events. Solving the "
-    "per-rejection recurrence s' = (s + inc)*0.5 - REP_REJECT_FLOOR gives a "
-    "fixed point of inc - 0.20, and with spot checks off by default inc is "
-    "capped at min(acc,8)*REP_CLEAN_STEP = 0.16 -- so ANY machine with one "
-    "rejection in its 30-day window converges to 0.0 and is REVOKED, which is "
-    "terminal for accrual and admin-only to reverse. scripts/ledger.py's own "
-    "docstring recommends running this ONCE A MINUTE and asserts 'the sweep is "
-    "idempotent and recomputes to a fixpoint' -- so the doc states exactly the "
-    "property this test checks, and the code does not have it. Fix by counting "
-    "each event once (a watermark column, needing a migration) or by making "
-    "the score a pure function of the window rather than a mutated scalar."))
 def test_the_reputation_sweep_is_idempotent(conn, make_contributor):
     """Running the sweep twice over an unchanged history must not move the
     score. Anything else makes standing a function of cron cadence rather than
@@ -387,18 +370,18 @@ def test_the_reputation_sweep_is_idempotent(conn, make_contributor):
     assert second["standing"] == first["standing"]
 
 
-def test_the_reputation_sweep_currently_revokes_on_repetition_alone(
-    conn, make_contributor
-):
-    """The companion to the xfail above: this pins the behaviour as it actually
-    is today, so the severity is visible in the suite rather than only in a
-    review comment, and so whoever fixes it sees exactly what changes.
+def test_repetition_alone_never_moves_standing(conn, make_contributor):
+    """The bug this replaced: the sweep used to start from the *stored* score
+    and re-apply 30-day window totals on top of it, so one ordinary rejection
+    walked good -> probation -> revoked purely by running the sweep, which
+    scripts/ledger.py recommends doing once a minute. ``revoked`` is terminal
+    for accrual and admin-only to reverse, so standing was a function of cron
+    cadence rather than of conduct.
 
-    A single ordinary rejection plus five accepted submissions -- nothing else
-    ever happening -- walks good -> probation -> revoked purely by running the
-    sweep, which scripts/ledger.py recommends doing every minute.
+    Now the score is a pure function of the window, so sweeping repeatedly over
+    an unchanged history is a no-op after the first one.
     """
-    cid, _ = make_contributor(name="rep-decay")
+    cid, _ = make_contributor(name="rep-stable")
     mid = _make_machine(conn, cid)
     _one_rejection_and_clean_work(conn, mid, _iso(9, 30))
     conn.commit()
@@ -406,15 +389,145 @@ def test_the_reputation_sweep_currently_revokes_on_repetition_alone(
     now = rounds.utcnow().replace(day=10, hour=12, minute=0, second=0,
                                   microsecond=0)
     seen = []
-    for _ in range(3):
+    for _ in range(6):
         ledger.recompute_reputation(conn, mid, now=now)
         r = conn.execute(
             "SELECT reputation, standing FROM workers WHERE id = ?", (mid,)
         ).fetchone()
         seen.append((r["reputation"], r["standing"]))
 
-    assert seen[0][1] == "probation"
-    assert seen[1][1] == "revoked", seen
-    assert seen[1][0] == 0.0
-    # Terminal: further sweeps cannot bring it back.
-    assert seen[2] == seen[1]
+    assert len(set(seen)) == 1, f"the sweep is still moving on its own: {seen}"
+    assert seen[0][1] != "revoked", seen
+
+
+# --- the pure scorer itself -------------------------------------------------
+
+
+def _failed_probe(conn, mid, tag, at):
+    """A decided spot-check failure against this machine (docs/13 §5)."""
+    tid = f"t-probe-{tag}-{mid}"
+    conn.execute(
+        """INSERT INTO tasks (id, run_id, round_idx, job_id, buckets_json,
+             input_ref_json, attempt_group, local_steps, status, worker_id,
+             lease_expires_at, attempts, created_at)
+           VALUES (?, NULL, NULL, NULL, '[]', NULL, NULL, 1, 'submitted',
+                   ?, NULL, 1, ?)""",
+        (tid, mid, at))
+    conn.execute(
+        """INSERT INTO spot_check_issues (task_id, source_task_id, issued_at,
+             outcome, decided_at)
+           VALUES (?, ?, ?, 'failed', ?)""",
+        (tid, tid, at, at))
+
+
+def test_a_first_submission_that_fails_validation_is_not_a_life_sentence(
+        conn, make_contributor):
+    """The trap that the obvious pure rewrite fell into, kept nailed down.
+
+    docs/09 §5.3 used to revoke on ``score < REP_REVOKE``. That reads fine
+    against an accumulator, which only sank that low through repeated
+    misconduct. Against a *window* score it is a different rule, because a low
+    score there is dominated by low **volume**: REP_ENROLL (0.25) sits barely
+    above REP_REVOKE (0.15), so a contributor whose very first submission is
+    rejected scores 0.025 -- terminal, admin-only to reverse, on someone who
+    has done exactly one thing wrong and nothing else at all.
+
+    Revocation is therefore conduct-only now. One ordinary rejection is
+    probation no matter how empty the history behind it.
+    """
+    cid, _ = make_contributor(name="rep-newbie")
+    mid = _make_machine(conn, cid)
+    _reject(conn, mid, _iso(11, 0))
+    now = rounds.utcnow().replace(day=10, hour=12, minute=0, second=0,
+                                  microsecond=0)
+    for _ in range(10):                      # and no amount of sweeping does it
+        ledger.recompute_reputation(conn, mid, now=now)
+    w = conn.execute("SELECT reputation, standing FROM workers WHERE id = ?",
+                     (mid,)).fetchone()
+    assert w["reputation"] < ledger.REP_REVOKE, "the score really is that low"
+    assert w["standing"] == "probation", "...and it still must not be terminal"
+
+
+def test_revocation_is_still_reachable_on_conduct(conn, make_contributor):
+    """The companion to the test above: having established that a bad *score*
+    cannot revoke anyone, check the fraud path was not disabled along with it.
+    Two failed probes in the window is terminal, and stays terminal."""
+    cid, _ = make_contributor(name="rep-fraud")
+    mid = _make_machine(conn, cid)
+    now = rounds.utcnow().replace(day=10, hour=12, minute=0, second=0,
+                                  microsecond=0)
+    _failed_probe(conn, mid, "a", _iso(9, 30))
+    conn.commit()
+    for _ in range(3):
+        ledger.recompute_reputation(conn, mid, now=now)
+    assert conn.execute("SELECT standing FROM workers WHERE id = ?",
+                        (mid,)).fetchone()["standing"] == "probation", \
+        "one failure is not terminal, however often the sweep runs"
+
+    _failed_probe(conn, mid, "b", _iso(9, 31))
+    conn.commit()
+    for _ in range(3):
+        ledger.recompute_reputation(conn, mid, now=now)
+    assert conn.execute("SELECT standing FROM workers WHERE id = ?",
+                        (mid,)).fetchone()["standing"] == "revoked"
+
+
+def test_a_machine_with_no_history_scores_exactly_the_enrolment_value():
+    assert ledger.reputation_for(
+        acc=0, passed=0, rej=0, failed=0, minorities=0) == ledger.REP_ENROLL
+
+
+def test_clean_work_approaches_one_without_ever_reaching_it_early():
+    """docs/09 §5.2's "asymptotic to 1.0", now a function of the *volume* of
+    clean work in the window rather than of how many times the sweep ran."""
+    scores = [ledger.reputation_for(acc=n, passed=0, rej=0, failed=0, minorities=0)
+              for n in (0, 10, 32, 100, 200)]
+    assert scores == sorted(scores), scores          # monotonic
+    assert all(x < 1.0 for x in scores)              # never actually 1.0
+    assert scores[2] >= ledger.REP_GOOD              # 32 clean crosses "good"
+    assert scores[1] < ledger.REP_GOOD               # ...and 10 does not
+    assert scores[4] > 0.98                          # but it does get close
+
+    # 32 is the *first* such count, so the boundary is pinned from both sides
+    # rather than merely bracketed.
+    assert ledger.reputation_for(
+        acc=31, passed=0, rej=0, failed=0, minorities=0) < ledger.REP_GOOD
+
+
+def test_volume_alone_cannot_buy_immunity_from_a_conviction():
+    """"Lost fast" is invariant 2: each conviction halves what is left and
+    subtracts a floor, so even a near-perfect machine is demoted by one."""
+    perfect = ledger.reputation_for(acc=500, passed=0, rej=0, failed=0, minorities=0)
+    assert perfect > 0.99
+    after = ledger.reputation_for(acc=500, passed=0, rej=0, failed=1, minorities=0)
+    assert after < ledger.REP_GOOD
+    # ...but a failed probe is the *largest* single penalty (docs/09 §5.1),
+    # worse than a minority, which is worse than an ordinary rejection.
+    minority = ledger.reputation_for(acc=500, passed=0, rej=0, failed=0, minorities=1)
+    rejection = ledger.reputation_for(acc=500, passed=0, rej=1, failed=0, minorities=0)
+    assert after < minority < rejection
+
+
+def test_convictions_are_applied_worst_first_so_order_cannot_matter():
+    """A machine with one of each must land where the failed probe puts it,
+    not where the order of the loops happened to leave it."""
+    both = ledger.reputation_for(acc=100, passed=0, rej=1, failed=1, minorities=1)
+    assert both == ledger.reputation_for(
+        acc=100, passed=0, rej=1, failed=1, minorities=1)
+    assert both < ledger.reputation_for(
+        acc=100, passed=0, rej=1, failed=0, minorities=0)
+
+
+def test_a_corroborated_pass_is_worth_more_than_a_plain_acceptance():
+    """A passed probe matched an answer already trusted; an acceptance only
+    says the submission was well-formed."""
+    assert ledger.reputation_for(acc=0, passed=10, rej=0, failed=0, minorities=0) > \
+        ledger.reputation_for(acc=10, passed=0, rej=0, failed=0, minorities=0)
+
+
+def test_the_scorer_is_a_function_of_its_counts_and_nothing_else():
+    """Called a hundred times with the same counts, it returns the same score
+    -- the property the whole rewrite exists for."""
+    args = dict(acc=37, passed=2, rej=1, failed=0, minorities=1)
+    first = ledger.reputation_for(**args)
+    assert all(ledger.reputation_for(**args) == first for _ in range(100))

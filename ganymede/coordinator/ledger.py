@@ -47,6 +47,10 @@ PROBATION_MONTHLY_CAP_HOURS = 40.0
 # Reputation thresholds (docs/09 5.2). Earned slowly, lost fast.
 REP_ENROLL = 0.25
 REP_GOOD = 0.60
+# No longer a transition trigger: see the revocation branch of
+# ``recompute_reputation`` for why a window score cannot be a terminal one.
+# Kept as the published floor of the probation band (docs/09 §5.3) and as the
+# number the dashboards describe "barely trusted" with.
 REP_REVOKE = 0.15
 # A machine on probation is promoted back to good only after a clean window of
 # this many days with no rejection.
@@ -57,11 +61,17 @@ K_GOOD = 48
 K_PROBATION = 3
 # How far back the reputation score looks for rejections / accepted work.
 REP_TRAILING_DAYS = 30
-# Reputation deltas (docs/13 §5.5). Earned slowly, lost fast -- invariant 2.
+# Reputation rates (docs/13 §5.5). Earned slowly, lost fast -- invariant 2.
 #
-# A passed probe is worth twice a clean submission because it is *corroborated*:
-# an ordinary acceptance says the answer was well-formed, a passed probe says it
-# matched an answer already trusted.
+# These are **geometric rates, not additive increments**: each clean submission
+# closes ``REP_CLEAN_STEP`` of the remaining distance between ``REP_ENROLL`` and
+# 1.0, so the curve approaches 1.0 asymptotically with the *volume of clean work
+# in the window* and never by how many times the sweep has run. See
+# ``recompute_reputation`` for why that distinction is the whole design.
+#
+# A passed probe closes twice as much as a clean submission because it is
+# *corroborated*: an ordinary acceptance says the answer was well-formed, a
+# passed probe says it matched an answer already trusted.
 REP_CLEAN_STEP = 0.02
 REP_PROBE_PASS_STEP = 0.04
 # The two convictions, and the gap between them is the whole point. A failed
@@ -517,12 +527,68 @@ def _minorities_since(conn: sqlite3.Connection, machine_id: str,
     return len(rows)
 
 
+def reputation_for(*, acc: int, passed: int, rej: int, failed: int,
+                   minorities: int) -> float:
+    """The reputation score for one machine's trailing window. **Pure.**
+
+    Same counts in, same score out, every time -- which is the property this
+    function exists to have, and the one the previous implementation did not.
+    It read the *stored* score and then applied these same window totals on top
+    of it, so every sweep re-convicted a machine for events it had already been
+    punished for. The recurrence ``s' = (s + inc)*0.5 - REP_REJECT_FLOOR``
+    converges to ``inc - 0.20``, and with spot checks off (the default) ``inc``
+    was capped at ``min(acc, 8) * REP_CLEAN_STEP = 0.16``, below it -- so a
+    single ordinary rejection decayed to 0.0 and ``revoked`` in about two
+    sweeps, terminal and admin-only to reverse, no matter how much clean work
+    the machine had done. ``scripts/ledger.py`` recommends running that sweep
+    once a minute. Standing was a function of cron cadence, not of conduct.
+
+    **Asymptotic to 1.0 in the volume of clean work, not in sweep count.**
+    docs/09 §5.2 asks for a score that approaches 1.0 as clean work
+    accumulates, and §5 asks for a rollup recomputed from recorded outcomes;
+    those read as contradictory only if "accumulates" is taken to mean "across
+    sweeps". Taken to mean "within the window" -- which is what the window
+    counts already measure -- both hold at once. Each clean submission closes
+    ``REP_CLEAN_STEP`` of the distance still remaining to 1.0, so:
+
+        no history        -> REP_ENROLL exactly (a new machine is low-trust)
+        32 accepted       -> crosses REP_GOOD (the first count that does)
+        ~200 accepted     -> ~0.99
+
+    and the old ``min(acc, 8)`` cap is gone with the thing it existed to bound.
+
+    **Convictions, worst first** -- so a machine with both a failed probe and a
+    rejection lands where the failed probe puts it rather than where the order
+    of the loops happened to leave it. Each halves what is left and subtracts a
+    floor, which is what "lost fast" means and why volume alone cannot buy
+    immunity: from a perfect 1.0, one failed probe still lands at 0.30.
+    """
+    remaining = 1.0 - REP_ENROLL
+    remaining *= (1.0 - REP_CLEAN_STEP) ** max(acc, 0)
+    remaining *= (1.0 - REP_PROBE_PASS_STEP) ** max(passed, 0)
+    score = 1.0 - remaining
+
+    for _ in range(max(failed, 0)):
+        score = max(0.0, score * 0.5 - REP_PROBE_FAIL_FLOOR)
+    for _ in range(max(minorities, 0)):
+        score = max(0.0, score * 0.5 - REP_MINORITY_FLOOR)
+    for _ in range(max(rej, 0)):
+        score = max(0.0, score * 0.5 - REP_REJECT_FLOOR)
+    return score
+
+
 def recompute_reputation(conn: sqlite3.Connection, machine_id: str,
                          now: datetime | None = None) -> None:
     """Update one machine's ``reputation`` scalar and drive its ``standing``
-    transitions (docs/09 5.1-5.3). Earned slowly (asymptotic to 1.0 on clean
-    accepted work), lost fast (each rejection knocks it down). A cached
-    rollup, recomputed on the sweep.
+    transitions (docs/09 §5.1-5.3). Earned slowly (asymptotic to 1.0 in the
+    *volume* of clean accepted work), lost fast (each conviction knocks it
+    down). A cached rollup, recomputed from recorded outcomes on every sweep.
+
+    **Both halves are pure functions of the trailing window**: the score via
+    ``reputation_for`` above, and the standing transitions below. Running this
+    twice over an unchanged history is a no-op by construction, which it was
+    emphatically not before -- see ``reputation_for``'s docstring for what that
+    cost, and docs/09 §5.2.
 
     All three of docs/09 §5.1's inputs are live as of docs/13 §5.5: the
     ``validate()`` rejection / acceptance stream, spot-check outcomes, and
@@ -537,60 +603,74 @@ def recompute_reputation(conn: sqlite3.Connection, machine_id: str,
         ).fetchone()
         if row is None:
             return
-        score = float(row["reputation"])
         standing = row["standing"] or "good"
         window = _iso(now - timedelta(days=REP_TRAILING_DAYS))
         rej, acc = _trailing_outcomes(conn, machine_id, now)
         passed, failed = spotcheck.outcomes_for(conn, machine_id, window)
         minorities = _minorities_since(conn, machine_id, window)
 
-        # Increment toward 1.0 on clean work, faster on corroborated work.
-        score = min(1.0, score + min(acc, 8) * REP_CLEAN_STEP
-                    + min(passed, 8) * REP_PROBE_PASS_STEP)
-        # Then the convictions, worst first, so a machine with both a failed
-        # probe and a rejection lands where the failed probe puts it rather than
-        # where the order of the loops happened to leave it.
-        for _ in range(failed):
-            score = max(0.0, score * 0.5 - REP_PROBE_FAIL_FLOOR)
-        for _ in range(minorities):
-            score = max(0.0, score * 0.5 - REP_MINORITY_FLOOR)
-        for _ in range(rej):
-            score = max(0.0, score * 0.5 - REP_REJECT_FLOOR)
+        score = reputation_for(acc=acc, passed=passed, rej=rej,
+                               failed=failed, minorities=minorities)
 
-        # Transitions (docs/09 5.3). ``revoked`` is terminal for accrual;
-        # reinstatement is admin-only and not this module's job.
-        new_standing = standing
+        # Transitions (docs/09 §5.3): a *classification of the window*, not a
+        # walk through states. Standing has to be as idempotent as the score
+        # above, and for the same reason -- the old code asked "what should
+        # this machine's standing become, given where it is now?", which meant
+        # one failed probe read as a fresh conviction on every sweep and walked
+        # good -> probation -> revoked at whatever cadence cron happened to
+        # run. Each branch below is a question about the window alone, so
+        # sweeping twice over an unchanged history lands in the same place.
+        #
+        # ``revoked`` is terminal for accrual; reinstatement is admin-only and
+        # not this module's job.
         if standing == "revoked":
-            pass
-        elif standing == "good":
-            # A single failed probe forces probation regardless of score
-            # (docs/09 §5.3). A machine with months of clean work has enough
-            # headroom that the multiplier alone would leave it in good
-            # standing, which is exactly the machine this rule is for.
-            if score < REP_GOOD or failed or minorities:
-                new_standing = "probation"
+            new_standing = "revoked"
+        elif failed >= 2:
+            # "A second spot-check failure" (docs/09 §5.3), counted in the
+            # window rather than against probation entry -- there is no
+            # ``standing_changed_at`` column to ask the stateful question
+            # against, and inventing one to preserve a rule that was firing on
+            # its own trigger seemed the wrong trade. The cost is recorded in
+            # docs/09 §5.3: two failures 30 days apart now revoke even if the
+            # machine recovered to good in between.
+            #
+            # This is the *only* automatic route to ``revoked``. §5.3 also
+            # listed ``score < REP_REVOKE``; that clause could not survive the
+            # move to a window score, where a low score means "new and unlucky"
+            # at least as often as it means bad conduct -- see §5.3 for the
+            # case that killed it. A low score still suppresses accrual through
+            # the §6 reputation weighting, just never terminally.
+            new_standing = "revoked"
+        elif score < REP_GOOD or failed or minorities:
+            # A single failed probe or minority disagreement forces probation
+            # regardless of score (docs/09 §5.3) -- the rule exists for the
+            # machine with months of clean work behind it. As the constants
+            # stand this is belt-and-braces: any one conviction halves the
+            # score and subtracts a floor, so it cannot leave REP_GOOD intact
+            # from any starting point below 1.0. It is spelled out anyway so
+            # the rule survives a change to the floors.
+            new_standing = "probation"
         elif standing == "probation":
+            # Recovery: score back above REP_GOOD *and* a clean
+            # PROBATION_RECOVERY_DAYS window -- no rejection in it, and
+            # docs/09 §5.3's at least one *passed* probe. That second clause is
+            # why recovery cannot be waited out in silence: a machine that
+            # stops working stops being able to earn its way back, which is the
+            # point. Reaching this branch already implies a conviction-free
+            # window, so what is really being tested here is the probe.
             probation_since = _iso(now - timedelta(days=PROBATION_RECOVERY_DAYS))
-            recent_fail = spotcheck.failures_since(conn, machine_id, probation_since)
-            if score < REP_REVOKE or recent_fail:
-                # A second failure while on probation is terminal (docs/09 §5.3).
-                new_standing = "revoked"
-            elif score >= REP_GOOD:
-                # A clean PROBATION_RECOVERY_DAYS window: no rejection in it,
-                # and -- docs/09 §5.3 -- at least one *passed* probe. That
-                # second clause is why recovery cannot be waited out in silence:
-                # a machine that stops working stops being able to earn its way
-                # back, which is the point.
-                dirty = conn.execute(
-                    """SELECT 1 FROM submissions s
-                         JOIN tasks t ON t.id = s.task_id AND t.worker_id = ?
-                        WHERE s.accepted = 0 AND s.received_at >= ? LIMIT 1""",
-                    (machine_id, probation_since),
-                ).fetchone()
-                recovered_passes, _ = spotcheck.outcomes_for(
-                    conn, machine_id, probation_since)
-                if dirty is None and recovered_passes:
-                    new_standing = "good"
+            dirty = conn.execute(
+                """SELECT 1 FROM submissions s
+                     JOIN tasks t ON t.id = s.task_id AND t.worker_id = ?
+                    WHERE s.accepted = 0 AND s.received_at >= ? LIMIT 1""",
+                (machine_id, probation_since),
+            ).fetchone()
+            recovered_passes, _ = spotcheck.outcomes_for(
+                conn, machine_id, probation_since)
+            new_standing = ("good" if dirty is None and recovered_passes
+                            else "probation")
+        else:
+            new_standing = "good"
         conn.execute(
             "UPDATE workers SET reputation = ?, standing = ? WHERE id = ?",
             (round(score, 6), new_standing, machine_id),

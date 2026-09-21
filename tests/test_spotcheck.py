@@ -407,33 +407,93 @@ def _probe_outcome(conn, worker_id: str, outcome: str, task_id: str) -> None:
     conn.commit()
 
 
+def _clean_work(conn, worker_id: str, n: int, *, accepted: int = 1) -> None:
+    """``n`` recorded submissions for this machine, inside the reputation
+    window. Reputation is a pure function of these counts, so this -- not an
+    ``UPDATE workers SET reputation`` -- is how a test says "a machine with a
+    lot of clean work behind it"."""
+    now = rounds._iso(rounds.utcnow())
+    for i in range(n):
+        tid = f"t-{accepted}-{i}-{worker_id}"
+        conn.execute(
+            """INSERT INTO tasks (id, job_id, buckets_json, local_steps, status,
+                                  worker_id, attempts, created_at)
+               VALUES (?, 'j1', '[]', 8, 'submitted', ?, 1, ?)""",
+            (tid, worker_id, now),
+        )
+        conn.execute(
+            """INSERT INTO submissions (task_id, artifact_ref, steps_completed,
+                                        accepted, received_at)
+               VALUES (?, 'ref', 100, ?, ?)""",
+            (tid, accepted, now),
+        )
+    conn.commit()
+
+
+def _rep(conn, worker_id: str):
+    row = conn.execute(
+        "SELECT reputation, standing FROM workers WHERE id = ?", (worker_id,)
+    ).fetchone()
+    return row["reputation"], row["standing"]
+
+
 def test_one_failed_probe_forces_probation_on_a_spotless_machine(conn, job,
                                                                   worker):
     """docs/09 §5.3: *one* spot-check failure, regardless of score. A machine
     with months of clean work has enough headroom that the multiplier alone
     would leave it in good standing -- which is exactly the machine this rule
-    exists for."""
+    exists for.
+
+    "Spotless" is 200 recorded acceptances rather than a seeded scalar: since
+    the score became a pure function of the window, seeding ``reputation`` sets
+    a value the next sweep immediately overwrites, so a test that asserts
+    arithmetic on it is testing nothing.
+    """
     wid = worker("a")
-    conn.execute("UPDATE workers SET reputation = 0.99, standing = 'good' "
-                 "WHERE id = ?", (wid,))
-    conn.commit()
+    _clean_work(conn, wid, 200)
+
+    # Establish the headroom this rule exists to overrule.
+    ledger.recompute_reputation(conn, wid)
+    before, standing = _rep(conn, wid)
+    assert standing == "good"
+    assert before > 0.98
+
     _probe_outcome(conn, wid, spotcheck.FAILED, "p1")
     ledger.recompute_reputation(conn, wid)
-    row = conn.execute("SELECT reputation, standing FROM workers WHERE id = ?",
-                       (wid,)).fetchone()
-    assert row["standing"] == "probation"
-    assert row["reputation"] == pytest.approx(0.99 * 0.5 - 0.20)
+    after, standing = _rep(conn, wid)
+    assert standing == "probation"
+    # docs/09 §5.2's "≈ ×0.5 plus a floor subtraction", now applied to a score
+    # derived from the window instead of to whatever the last sweep left behind.
+    assert after == pytest.approx(round(before * 0.5 - ledger.REP_PROBE_FAIL_FLOOR, 6))
+    assert after < ledger.REP_GOOD
 
 
 def test_a_second_failure_on_probation_revokes(conn, job, worker):
+    """docs/09 §5.3's terminal rule, and the one place the move to a pure
+    function changed the meaning rather than the mechanism. "A second failure
+    *while on probation*" needs to know when probation began; there is no
+    ``standing_changed_at`` column, and the stateful substitute -- "on
+    probation, and a failure in the last 7 days" -- re-read the *same* failure
+    on every sweep and revoked by cron cadence. It is now two failures in the
+    trailing window, which is a question the window can answer. docs/09 §5.3
+    records what that costs.
+    """
     wid = worker("a")
-    conn.execute("UPDATE workers SET reputation = 0.80, standing = 'probation' "
-                 "WHERE id = ?", (wid,))
-    conn.commit()
+    _clean_work(conn, wid, 200)
+
     _probe_outcome(conn, wid, spotcheck.FAILED, "p1")
     ledger.recompute_reputation(conn, wid)
-    assert conn.execute("SELECT standing FROM workers WHERE id = ?",
-                        (wid,)).fetchone()["standing"] == "revoked"
+    assert _rep(conn, wid)[1] == "probation", "one failure is not terminal"
+
+    # ...and sweeping again does not make it terminal either, which is the
+    # whole bug: the machine has not done anything new.
+    for _ in range(5):
+        ledger.recompute_reputation(conn, wid)
+    assert _rep(conn, wid)[1] == "probation", "revoked by cron cadence alone"
+
+    _probe_outcome(conn, wid, spotcheck.FAILED, "p2")
+    ledger.recompute_reputation(conn, wid)
+    assert _rep(conn, wid)[1] == "revoked"
 
 
 def test_a_failed_probe_costs_more_than_a_minority_disagreement(conn, job,
@@ -442,7 +502,9 @@ def test_a_failed_probe_costs_more_than_a_minority_disagreement(conn, job,
     question which side is wrong. A minority is merely outvoted."""
     probe_w, minority_w = worker("p"), worker("m")
     for wid in (probe_w, minority_w):
-        conn.execute("UPDATE workers SET reputation = 0.80 WHERE id = ?", (wid,))
+        _clean_work(conn, wid, 100)          # identical histories but for the
+    ledger.recompute_reputation(conn, probe_w)   # one conviction each
+    clean = _rep(conn, probe_w)[0]
     _probe_outcome(conn, probe_w, spotcheck.FAILED, "p1")
     conn.execute(
         "INSERT INTO audit (at, event, detail_json) VALUES (?, ?, ?)",
@@ -458,7 +520,8 @@ def test_a_failed_probe_costs_more_than_a_minority_disagreement(conn, job,
     minority_score = conn.execute("SELECT reputation FROM workers WHERE id = ?",
                                   (minority_w,)).fetchone()["reputation"]
     assert probe_score < minority_score
-    assert minority_score < 0.80  # but still a hard hit
+    assert minority_score < clean          # but still a hard hit
+    assert minority_score < ledger.REP_GOOD  # hard enough to cost standing
 
 
 def test_recovery_from_probation_needs_a_passed_probe(conn, job, worker):
@@ -466,29 +529,55 @@ def test_recovery_from_probation_needs_a_passed_probe(conn, job, worker):
     silence: a machine that stops working stops being able to earn its way
     back."""
     wid = worker("a")
-    conn.execute("UPDATE workers SET reputation = 0.95, standing = 'probation' "
-                 "WHERE id = ?", (wid,))
+    # Enough clean work to be back over REP_GOOD on score alone -- so the probe
+    # is demonstrably the only thing still standing between it and "good".
+    _clean_work(conn, wid, 200)
+    conn.execute("UPDATE workers SET standing = 'probation' WHERE id = ?", (wid,))
     conn.commit()
+
     ledger.recompute_reputation(conn, wid)
-    assert conn.execute("SELECT standing FROM workers WHERE id = ?",
-                        (wid,)).fetchone()["standing"] == "probation"
+    score, standing = _rep(conn, wid)
+    assert score >= ledger.REP_GOOD, "score is not what is holding it back"
+    assert standing == "probation"
+
+    # Repeated sweeps must not let it drift back on their own either.
+    for _ in range(5):
+        ledger.recompute_reputation(conn, wid)
+    assert _rep(conn, wid)[1] == "probation"
 
     _probe_outcome(conn, wid, spotcheck.PASSED, "p1")
     ledger.recompute_reputation(conn, wid)
-    assert conn.execute("SELECT standing FROM workers WHERE id = ?",
-                        (wid,)).fetchone()["standing"] == "good"
+    assert _rep(conn, wid)[1] == "good"
 
 
 def test_a_passed_probe_is_worth_twice_a_clean_submission(conn, job, worker):
-    """Corroborated, not merely well-formed."""
+    """Corroborated, not merely well-formed.
+
+    "Twice" is now the share of the *remaining distance to 1.0* that each one
+    closes, not two additive increments -- the steps became geometric rates
+    when the score became a pure function of the window. The ratio the rule is
+    actually about survives that change intact; the absolute arithmetic the old
+    test asserted (0.50 -> 0.54) did not.
+    """
     assert ledger.REP_PROBE_PASS_STEP == 2 * ledger.REP_CLEAN_STEP
-    wid = worker("a")
-    conn.execute("UPDATE workers SET reputation = 0.50 WHERE id = ?", (wid,))
-    conn.commit()
-    _probe_outcome(conn, wid, spotcheck.PASSED, "p1")
-    ledger.recompute_reputation(conn, wid)
-    assert conn.execute("SELECT reputation FROM workers WHERE id = ?",
-                        (wid,)).fetchone()["reputation"] == pytest.approx(0.54)
+
+    base = ledger.reputation_for(acc=0, passed=0, rej=0, failed=0, minorities=0)
+    gap = 1.0 - base
+    one_clean = ledger.reputation_for(acc=1, passed=0, rej=0, failed=0, minorities=0)
+    one_probe = ledger.reputation_for(acc=0, passed=1, rej=0, failed=0, minorities=0)
+
+    assert one_clean - base == pytest.approx(gap * ledger.REP_CLEAN_STEP)
+    assert one_probe - base == pytest.approx(gap * ledger.REP_PROBE_PASS_STEP)
+    assert one_probe - base == pytest.approx(2 * (one_clean - base))
+
+    # And the same thing end to end, through recorded history rather than the
+    # scorer, so the two cannot drift apart.
+    probe_w, clean_w = worker("probe"), worker("clean")
+    _clean_work(conn, clean_w, 1)
+    _probe_outcome(conn, probe_w, spotcheck.PASSED, "p1")
+    ledger.recompute_reputation(conn, probe_w)
+    ledger.recompute_reputation(conn, clean_w)
+    assert _rep(conn, probe_w)[0] > _rep(conn, clean_w)[0]
 
 
 # ==========================================================================
