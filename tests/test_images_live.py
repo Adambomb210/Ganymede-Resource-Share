@@ -26,7 +26,15 @@ runs the real scan over a synthetic tar. Both halves are sound; they had just
 never been joined.
 
 Skipped, not failed, where no daemon is reachable, matching
-``test_contained_live.py``.
+``test_contained_live.py``. The OCI cases can skip on their own too -- the
+multi-platform one needs the network for the arm64 base, and it is the case
+most likely to be missing on a cold runner. That is survivable rather than a
+hole, and deliberately so: the same nested-index and attestation shapes are
+covered unconditionally by ``oci_multiplatform_archive()`` in
+``test_images.py``, which needs no daemon at all. These tests corroborate that
+the synthetic shapes match what real tooling emits; they are not the only thing
+standing between the defect and a release. Every skip names its own reason, so
+a case that vanishes says so.
 """
 
 from __future__ import annotations
@@ -112,7 +120,16 @@ def built(tmp_path_factory):
         if platforms is not None:
             argv += ["--platform", platforms]
         r = subprocess.run(argv + ["."], cwd=build, capture_output=True, timeout=900)
-        out[name] = dest.read_bytes() if r.returncode == 0 and dest.exists() else None
+        if r.returncode == 0 and dest.exists():
+            out[name] = dest.read_bytes()
+            out[f"{name}_why"] = None
+        else:
+            # Kept, so the skip says which of the two it was: an older buildx,
+            # or no network for the arm64 base. A skip whose reason is "the
+            # bytes are absent" tells the next reader nothing.
+            out[name] = None
+            out[f"{name}_why"] = (r.stderr.decode(errors="replace")[-300:]
+                                  or f"exit {r.returncode}, no {dest.name}")
 
     return out
 
@@ -159,7 +176,7 @@ def test_a_real_docker_save_archive_is_read(built):
 
 def test_a_real_single_platform_oci_export_is_read(built):
     if built["oci"] is None:
-        pytest.skip("buildx produced no OCI export")
+        pytest.skip(f"buildx produced no OCI export: {built['oci_why']}")
     result = _scan(built["oci"], built["base"])
     assert result.status == "clean", result.detail()
     assert "oci-layout" in _checks(result)["manifest_sanity"].detail
@@ -173,7 +190,8 @@ def test_a_real_multi_platform_export_selects_the_amd64_variant(built):
     flag on a base it cannot recognise even if the platform check passed.
     """
     if built["multi"] is None:
-        pytest.skip("buildx produced no multi-platform export")
+        pytest.skip(f"no multi-platform export (the arm64 base needs the "
+                    f"network): {built['multi_why']}")
     result = _scan(built["multi"], built["base"])
     assert result.status == "clean", result.detail()
     assert "linux/amd64" in _checks(result)["manifest_sanity"].detail
@@ -187,7 +205,7 @@ def test_the_two_formats_agree_about_the_same_image(built):
     selected OCI manifest's ``layers``.
     """
     if built["oci"] is None:
-        pytest.skip("buildx produced no OCI export")
+        pytest.skip(f"buildx produced no OCI export: {built['oci_why']}")
     save = _checks(_scan(built["save"], built["base"]))
     oci = _checks(_scan(built["oci"], built["base"]))
     assert save["entrypoint"].detail == oci["entrypoint"].detail
