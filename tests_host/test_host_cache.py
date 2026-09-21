@@ -12,7 +12,36 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from ganymede.host import cache
+
+
+def _symlink_or_skip(link: Path, target: Path, **kwargs) -> None:
+    """``link.symlink_to(target)``, or skip this test loudly if the OS refuses.
+
+    Every cache tree here is built with a real snapshot symlink on purpose --
+    that is the layout HF actually writes, and ``repo_size`` exists precisely
+    to not double-count it, so faking it with a plain file would test the
+    wrong thing.
+
+    Windows refuses ``os.symlink`` to an unprivileged process unless Developer
+    Mode is on (``OSError: [WinError 1314] A required privilege is not held by
+    the client``). That is a property of the machine, not a defect in
+    ``ganymede/host/cache`` -- but a bare ``OSError`` raised out of a fixture
+    helper reads exactly like one, and fifteen of them read like the cache is
+    broken. A skip that names the cause keeps the suite honest: it stays
+    visibly *not run* rather than either passing hollowly or failing falsely,
+    and it un-skips itself the moment the privilege exists.
+    """
+    try:
+        link.symlink_to(target, **kwargs)
+    except OSError as exc:
+        pytest.skip(
+            f"this OS refuses os.symlink ({type(exc).__name__}: {exc}); a real "
+            "HF cache layout needs one. On Windows enable Developer Mode, or "
+            "run the suite elevated. Not a defect in ganymede/host/cache."
+        )
 
 
 def _make_repo(
@@ -44,7 +73,7 @@ def _make_repo(
 
     snap_dir = repo / "snapshots" / revision
     snap_dir.mkdir(parents=True)
-    (snap_dir / "config.json").symlink_to(blob_file)
+    _symlink_or_skip(snap_dir / "config.json", blob_file)
 
     refs = repo / "refs"
     refs.mkdir(parents=True)
@@ -145,7 +174,7 @@ def test_scan_never_follows_a_symlinked_repo_out_of_the_cache(tmp_path):
     hub.mkdir()
     outside = tmp_path / "outside" / "models--org--evil"
     outside.mkdir(parents=True)
-    (hub / "models--org--evil").symlink_to(outside, target_is_directory=True)
+    _symlink_or_skip(hub / "models--org--evil", outside, target_is_directory=True)
 
     assert cache.scan(hub) == []
 
