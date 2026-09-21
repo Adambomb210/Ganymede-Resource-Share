@@ -166,6 +166,27 @@ class GpuDeviceStatus:
     busy: dict[int, str]
 
 
+def _compute_memory_mb(field: str) -> int | None:
+    """The MiB figure nvidia-smi attributed to a compute process, or ``None``
+    when it attributed none.
+
+    ``used_memory`` comes back as ``"1234 MiB"`` where the driver knows, and as
+    ``"[N/A]"`` or ``"[Insufficient Permissions]"`` where it does not -- the
+    latter two being the only thing Windows/WDDM ever reports, for every
+    process, including real CUDA ones. Returning ``None`` for anything that is
+    not a number is what lets the caller treat "no memory attributed" as "not
+    evidence of a compute client" rather than as "a compute client using zero".
+    """
+    field = field.strip()
+    if not field or field.startswith("["):
+        return None
+    number = field.split()[0]
+    try:
+        return int(float(number))
+    except ValueError:
+        return None
+
+
 def _gpu_device_status(config: HostConfig) -> tuple[GpuDeviceStatus | None, str]:
     """The per-device busy map, plus a reason.
 
@@ -211,7 +232,8 @@ def _gpu_device_status(config: HostConfig) -> tuple[GpuDeviceStatus | None, str]
 
     try:
         apps_proc = subprocess.run(
-            [nvidia_smi, "--query-compute-apps=gpu_uuid,pid,process_name",
+            [nvidia_smi,
+             "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
              "--format=csv,noheader"],
             capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SEC,
         )
@@ -225,13 +247,41 @@ def _gpu_device_status(config: HostConfig) -> tuple[GpuDeviceStatus | None, str]
         line = line.strip()
         if not line:
             continue
-        # Exactly three CSV fields requested above; a process name can itself
-        # contain a comma on some platforms, so everything after the second
-        # comma is the name, not just the third field.
-        parts = [p.strip() for p in line.split(",", 2)]
+        # Four CSV fields requested above, and a process name can itself
+        # contain a comma on some platforms -- so the *last* field is split
+        # off the right first, and the name is then whatever remains after
+        # uuid and pid on the left.
+        head, _, mem = line.rpartition(",")
+        parts = [p.strip() for p in head.split(",", 2)]
         if len(parts) != 3:
             continue
         uuid, pid, name = parts
+        if _compute_memory_mb(mem) is None:
+            # No memory attributed to this process, so nvidia-smi is not
+            # telling us it is a *compute* client -- and the spec's rule is
+            # about CUDA processes specifically (`01` §"No non-Ganymede CUDA
+            # process holds the GPU", `02` 6.9). On Windows/WDDM this is the
+            # difference between a check that works and one that can never
+            # pass: `--query-compute-apps` there enumerates every process
+            # holding any graphics context -- explorer.exe, the shell, a
+            # browser, a chat app, forty of them on an idle desktop -- and
+            # attributes `[N/A]` memory to all of them, including a genuine
+            # torch CUDA process (measured on a real RTX 3060 box). With no
+            # memory figure there is nothing that distinguishes the compositor
+            # from a training run, so the query cannot *prove* the card busy,
+            # and this module's rule for that is unambiguous and stated three
+            # times: "the check can only ever prove the GPU busy, never prove
+            # it free". Counting these rows is why `require_gpu_free` -- which
+            # defaults to True -- made the host agent refuse to start the
+            # worker forever on every Windows contributor's machine, which is
+            # precisely backwards for the platform most likely to have an idle
+            # gaming GPU to donate.
+            #
+            # On Linux the driver reports real per-process memory, so every
+            # genuine CUDA client keeps its row and behaviour is unchanged.
+            # A row skipped here is never a row that *would* have been
+            # actionable: it is one nvidia-smi declined to describe.
+            continue
         idx = index_map.get(uuid)
         if idx is None:
             continue
@@ -343,11 +393,32 @@ def _idle_seconds_windows() -> float | None:
         info.cbSize = ctypes.sizeof(_LastInputInfo)
         if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):  # type: ignore[attr-defined]
             return None
-        tick_count = ctypes.windll.kernel32.GetTickCount()  # type: ignore[attr-defined]
+        # ``restype`` is set explicitly, and it is load-bearing. ctypes
+        # defaults an unspecified return type to ``c_int`` -- *signed* -- but
+        # ``GetTickCount`` returns a ``DWORD``, and ``dwTime`` above is a
+        # ``c_uint``. Left at the default, the two stop agreeing the moment
+        # the tick count passes 2^31 ms, which is **24.9 days of uptime**, not
+        # the 49.7-day wrap the guard below is about: ``tick_count`` reads as a
+        # large negative number while ``dwTime`` is still a large positive one,
+        # so ``idle_ms`` is about -4294967296 on every call and this function
+        # returns ``None`` forever after.
+        #
+        # ``None`` means "unknown", and ``_user_idle_check`` treats unknown as
+        # *idle* -- deliberately, so a headless box can contribute. So the
+        # failure is silent and it fails open: past 24.9 days of uptime a
+        # Windows contributor's machine would read as idle while they were
+        # actively typing on it, and the worker would run anyway. That is now
+        # the only user-facing protection left on Windows, since `_gpu_busy`
+        # there cannot prove a card busy either (see its docstring), which is
+        # what makes this worth a line of ctypes rather than a comment.
+        get_tick_count = ctypes.windll.kernel32.GetTickCount  # type: ignore[attr-defined]
+        get_tick_count.restype = ctypes.c_uint
+        tick_count = get_tick_count()
         idle_ms = tick_count - info.dwTime
         if idle_ms < 0:
-            # GetTickCount wraps every ~49.7 days; a negative delta means it
-            # wrapped between the two reads. Wrong answer is worse than no
+            # Both are now unsigned 32-bit, so this is the genuine article:
+            # GetTickCount wraps every ~49.7 days, and a negative delta means
+            # it wrapped between the two reads. Wrong answer is worse than no
             # answer here, so this is "unknown", not "just active".
             return None
         return idle_ms / 1000.0

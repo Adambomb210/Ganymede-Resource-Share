@@ -1567,6 +1567,23 @@ is treated as idle. A headless Linux box is the single most likely donated
 machine and has no input device at all; refusing to run there would exclude
 exactly the contributors the project most wants.
 
+**Because unknown means idle, a probe that silently starts answering "unknown"
+turns the check off rather than making it strict** — and the Windows probe did
+exactly that. `GetLastInputInfo`'s `dwTime` is a `c_uint`, but ctypes defaults an
+unspecified `restype` to *signed* `c_int`, so `GetTickCount()` was read back
+signed. Past 2^31 ms of uptime — **24.9 days**, not the 49.7-day wrap the
+function's own guard was written for — the tick count reads large-negative while
+`dwTime` is still large-positive, the delta is negative on every call, and the
+probe returns `None` forever. A Windows contributor's machine would then read as
+idle while they were actively typing on it. Fixed by setting `restype` to
+`c_uint` so both sides are unsigned 32-bit; the negative-delta guard then catches
+only the genuine wrap it was meant for. The probe had no test at all before this,
+because every *other* platform probe is a mockable subprocess and this one is
+ctypes — `tests_host/test_host_idle.py` now covers both the arithmetic
+(everywhere) and the live WinAPI call (on the Windows runner). This matters more
+since `14` §9: `_gpu_busy` on Windows can no longer prove a card busy either, so
+user-idle is the only contributor-facing protection left there.
+
 **Verify before the rented-host phase:** whether running your own workload on a listed
 GPU affects platform reliability scoring (Review Finding M).
 

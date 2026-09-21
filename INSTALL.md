@@ -207,7 +207,7 @@ picks it up. Everything is optional except the coordinator URL and the key.
 | `memory`, `cpus` | `16g`, `4` | What the worker may use |
 | `pids_limit` | `256` | Process ceiling |
 | `user_idle_sec` | `900` | Seconds untouched before your machine counts as idle. `0` disables the check — right for a headless server nobody sits at |
-| `require_gpu_free` | `true` | Never share the GPU with your own work |
+| `require_gpu_free` | `true` | Never share the GPU with your own work. Detects another program on the card by the GPU memory `nvidia-smi` attributes to it — **on Windows the driver attributes none to anything, so this check cannot see your work there** and `user_idle_sec` is what protects you |
 | `active_window` | *(any hour)* | Restrict to a local-time window, e.g. `"23:00-07:00"` |
 | `runtime` | `docker` | `docker` or `native` |
 | `image_tag` | *(from coordinator)* | Pin an image instead of following the run |
