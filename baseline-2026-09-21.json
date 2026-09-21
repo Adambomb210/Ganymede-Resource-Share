@@ -1,0 +1,500 @@
+{
+  "version": 1,
+  "created_at": "2026-09-21T17:03:37Z",
+  "run": {
+    "base_model": "Qwen/Qwen3-1.7B-Base",
+    "base_precision": "bf16",
+    "lora_cfg": {
+      "rank": 16,
+      "alpha": 32,
+      "dropout": 0.05,
+      "target_modules": [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj"
+      ]
+    },
+    "dataset_ref": "hf://databricks/databricks-dolly-15k",
+    "num_buckets": 64,
+    "dataset_rows": 15011
+  },
+  "protocol": {
+    "total_steps": 2000,
+    "eval_every": 250,
+    "eval_size": 750,
+    "eval_examples": null,
+    "samples_per_step": 16,
+    "prompt_format": "dolly-v1",
+    "seeds": [
+      1,
+      2,
+      3
+    ],
+    "device": "cuda"
+  },
+  "hyperparams": {
+    "lr": 0.0002,
+    "weight_decay": 0.0,
+    "max_grad_norm": 1.0,
+    "seq_len": 1024,
+    "micro_batch": 2,
+    "grad_accum": 8,
+    "prompt_format": "dolly-v1",
+    "completion_only": true,
+    "data_seed": 20260826,
+    "eval_size": 750,
+    "gradient_checkpointing": null,
+    "samples_per_bucket": 222,
+    "target_passes": 1.0
+  },
+  "per_seed": [
+    {
+      "seed": 1,
+      "curve": [
+        {
+          "step": 0,
+          "train_sec": 0.0,
+          "loss": 1.84763,
+          "perplexity": 6.3448,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 55.88
+        },
+        {
+          "step": 250,
+          "train_sec": 1265.53,
+          "loss": 1.7833,
+          "perplexity": 5.9494,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 1378.58
+        },
+        {
+          "step": 500,
+          "train_sec": 2543.75,
+          "loss": 1.77825,
+          "perplexity": 5.9195,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 2714.08
+        },
+        {
+          "step": 750,
+          "train_sec": 3788.08,
+          "loss": 1.77863,
+          "perplexity": 5.9217,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 4014.28
+        },
+        {
+          "step": 1000,
+          "train_sec": 4980.58,
+          "loss": 1.78087,
+          "perplexity": 5.935,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 5262.77
+        },
+        {
+          "step": 1250,
+          "train_sec": 6182.19,
+          "loss": 1.78371,
+          "perplexity": 5.9519,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 6520.2
+        },
+        {
+          "step": 1500,
+          "train_sec": 7436.19,
+          "loss": 1.78581,
+          "perplexity": 5.9644,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 7830.45
+        },
+        {
+          "step": 1750,
+          "train_sec": 8635.89,
+          "loss": 1.7861,
+          "perplexity": 5.9662,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 9089.09
+        },
+        {
+          "step": 2000,
+          "train_sec": 9854.58,
+          "loss": 1.81157,
+          "perplexity": 6.12,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 10363.52
+        }
+      ],
+      "initial_loss": 1.84763,
+      "final_loss": 1.81157,
+      "steps": 2000,
+      "train_sec": 9854.58,
+      "steps_per_min": 12.177,
+      "train_loss_tail_mean": 1.30681,
+      "smoke": [
+        {
+          "instruction": "What is the capital of France?",
+          "completion": "Paris is the capital of France"
+        },
+        {
+          "instruction": "Explain photosynthesis in two sentences.",
+          "completion": "Photosynthesis is the process by which plants use sunlight, water, and carbon dioxide to produce oxygen and energy in the form of sugar."
+        },
+        {
+          "instruction": "List three uses for baking soda.",
+          "completion": "Baking soda can be used to make baked goods rise, to clean your toilet, and to remove stains from your clothes."
+        },
+        {
+          "instruction": "Who wrote the novel Moby-Dick?",
+          "completion": "Moby-Dick was written by Herman Melville"
+        },
+        {
+          "instruction": "Summarize the passage.",
+          "completion": "The Kuiper belt is a circumstellar disc in the outer Solar System, extending from the orbit of Neptune to approximately 50 AU from the Sun."
+        },
+        {
+          "instruction": "Translate to French: The weather is cold today.",
+          "completion": "Le temps est froid aujourd'hui."
+        },
+        {
+          "instruction": "What is 17 multiplied by 4?",
+          "completion": "68"
+        },
+        {
+          "instruction": "Write a one-line description of a lighthouse.",
+          "completion": "A lighthouse is a tower that is used to signal ships at sea"
+        },
+        {
+          "instruction": "Give me a recipe for scrambled eggs.",
+          "completion": "Here is a recipe for scrambled eggs:\n\n1. Crack 2 eggs into a bowl\n2. Add 1 tablespoon of milk\n3. Add 1 teaspoon of salt\n4. Whisk the eggs until they are well combined\n5. Heat a non-stick pan over medium heat\n6. Add "
+        },
+        {
+          "instruction": "Classify the sentiment: 'The service was slow but the food was excellent.'",
+          "completion": "Positive"
+        },
+        {
+          "instruction": "What are the primary colors?",
+          "completion": "The primary colors are red, blue, and green."
+        },
+        {
+          "instruction": "Extract the year mentioned in the text.",
+          "completion": "1937"
+        },
+        {
+          "instruction": "Name two programming languages used for data science.",
+          "completion": "Python and R are two popular programming languages used for data science."
+        },
+        {
+          "instruction": "Why do leaves change color in autumn?",
+          "completion": "Leaves change color in autumn because the chlorophyll in the leaves breaks down. Chlorophyll is the green pigment that plants use to absorb sunlight for photosynthesis. As the chlorophyll breaks down, other pigments in the leaves become visible."
+        },
+        {
+          "instruction": "Rewrite this sentence to be more concise.",
+          "completion": "It was raining, so we stayed indoors."
+        },
+        {
+          "instruction": "What is the boiling point of water at sea level?",
+          "completion": "The boiling point of water is 100 degrees Celsius or 212 degrees Fahrenheit at sea level"
+        },
+        {
+          "instruction": "Describe the difference between a comet and an asteroid.",
+          "completion": "Comets are made of ice and dust and are typically found in the outer regions of the solar system. When a comet approaches the sun, the heat from the sun causes the ice to vaporize and form a tail of gas and dust. Asteroids are rocky and metallic objects that are typically found in the inner regions of"
+        },
+        {
+          "instruction": "Suggest a name for a coffee shop near a university.",
+          "completion": "A coffee shop near a university could be called \"The Study Spot\" or \"The Study Corner\"."
+        },
+        {
+          "instruction": "How many continents are there?",
+          "completion": "There are 7 continents"
+        },
+        {
+          "instruction": "Write a haiku about winter.",
+          "completion": "Snowflakes fall\nWinter's chill is felt\nWinter's beauty"
+        }
+      ]
+    },
+    {
+      "seed": 2,
+      "curve": [
+        {
+          "step": 0,
+          "train_sec": 0.0,
+          "loss": 1.84763,
+          "perplexity": 6.3448,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 56.02
+        },
+        {
+          "step": 250,
+          "train_sec": 1226.88,
+          "loss": 1.78139,
+          "perplexity": 5.9381,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 1338.74
+        },
+        {
+          "step": 500,
+          "train_sec": 2445.64,
+          "loss": 1.77953,
+          "perplexity": 5.9271,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 2613.19
+        },
+        {
+          "step": 750,
+          "train_sec": 3666.8,
+          "loss": 1.77677,
+          "perplexity": 5.9108,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 3890.17
+        },
+        {
+          "step": 1000,
+          "train_sec": 4878.45,
+          "loss": 1.77847,
+          "perplexity": 5.9208,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 5157.62
+        },
+        {
+          "step": 1250,
+          "train_sec": 6063.14,
+          "loss": 1.78417,
+          "perplexity": 5.9546,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 6398.12
+        },
+        {
+          "step": 1500,
+          "train_sec": 7279.24,
+          "loss": 1.78669,
+          "perplexity": 5.9697,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 7670.45
+        },
+        {
+          "step": 1750,
+          "train_sec": 8656.74,
+          "loss": 1.78721,
+          "perplexity": 5.9727,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 9112.7
+        },
+        {
+          "step": 2000,
+          "train_sec": 10313.14,
+          "loss": 1.80759,
+          "perplexity": 6.0957,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 10827.7
+        }
+      ],
+      "initial_loss": 1.84763,
+      "final_loss": 1.80759,
+      "steps": 2000,
+      "train_sec": 10313.14,
+      "steps_per_min": 11.636,
+      "train_loss_tail_mean": 1.27431,
+      "smoke": null
+    },
+    {
+      "seed": 3,
+      "curve": [
+        {
+          "step": 0,
+          "train_sec": 0.0,
+          "loss": 1.84763,
+          "perplexity": 6.3448,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 95.42
+        },
+        {
+          "step": 250,
+          "train_sec": 1239.56,
+          "loss": 1.78211,
+          "perplexity": 5.9424,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 1391.0
+        },
+        {
+          "step": 500,
+          "train_sec": 2453.09,
+          "loss": 1.77801,
+          "perplexity": 5.9181,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 2661.59
+        },
+        {
+          "step": 750,
+          "train_sec": 3679.56,
+          "loss": 1.77564,
+          "perplexity": 5.9041,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 3943.98
+        },
+        {
+          "step": 1000,
+          "train_sec": 4935.45,
+          "loss": 1.77931,
+          "perplexity": 5.9258,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 5255.61
+        },
+        {
+          "step": 1250,
+          "train_sec": 6131.58,
+          "loss": 1.78707,
+          "perplexity": 5.9719,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 6507.8
+        },
+        {
+          "step": 1500,
+          "train_sec": 7390.31,
+          "loss": 1.78423,
+          "perplexity": 5.955,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 7823.06
+        },
+        {
+          "step": 1750,
+          "train_sec": 8622.72,
+          "loss": 1.78501,
+          "perplexity": 5.9596,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 9111.72
+        },
+        {
+          "step": 2000,
+          "train_sec": 9858.55,
+          "loss": 1.80549,
+          "perplexity": 6.083,
+          "tokens": 64322,
+          "examples": 750,
+          "wall_sec": 10403.98
+        }
+      ],
+      "initial_loss": 1.84763,
+      "final_loss": 1.80549,
+      "steps": 2000,
+      "train_sec": 9858.55,
+      "steps_per_min": 12.172,
+      "train_loss_tail_mean": 1.5621,
+      "smoke": null
+    }
+  ],
+  "summary": {
+    "seeds": 3,
+    "final_mean": 1.80822,
+    "final_stdev": 0.00309,
+    "final_min": 1.80549,
+    "final_max": 1.81157,
+    "curve": [
+      {
+        "step": 0,
+        "mean": 1.84763,
+        "stdev": 0.0,
+        "min": 1.84763,
+        "max": 1.84763,
+        "train_sec_mean": 0.0
+      },
+      {
+        "step": 250,
+        "mean": 1.78227,
+        "stdev": 0.00096,
+        "min": 1.78139,
+        "max": 1.7833,
+        "train_sec_mean": 1243.99
+      },
+      {
+        "step": 500,
+        "mean": 1.7786,
+        "stdev": 0.00082,
+        "min": 1.77801,
+        "max": 1.77953,
+        "train_sec_mean": 2480.83
+      },
+      {
+        "step": 750,
+        "mean": 1.77701,
+        "stdev": 0.00151,
+        "min": 1.77564,
+        "max": 1.77863,
+        "train_sec_mean": 3711.48
+      },
+      {
+        "step": 1000,
+        "mean": 1.77955,
+        "stdev": 0.00122,
+        "min": 1.77847,
+        "max": 1.78087,
+        "train_sec_mean": 4931.49
+      },
+      {
+        "step": 1250,
+        "mean": 1.78498,
+        "stdev": 0.00182,
+        "min": 1.78371,
+        "max": 1.78707,
+        "train_sec_mean": 6125.64
+      },
+      {
+        "step": 1500,
+        "mean": 1.78558,
+        "stdev": 0.00125,
+        "min": 1.78423,
+        "max": 1.78669,
+        "train_sec_mean": 7368.58
+      },
+      {
+        "step": 1750,
+        "mean": 1.78611,
+        "stdev": 0.0011,
+        "min": 1.78501,
+        "max": 1.78721,
+        "train_sec_mean": 8638.45
+      },
+      {
+        "step": 2000,
+        "mean": 1.80822,
+        "stdev": 0.00309,
+        "min": 1.80549,
+        "max": 1.81157,
+        "train_sec_mean": 10008.76
+      }
+    ],
+    "tolerance": {
+      "k": 2.0,
+      "upper_from_stdev": 1.81439,
+      "observed_max": 1.81157,
+      "pass_if_final_loss_at_most": 1.81439
+    }
+  }
+}
