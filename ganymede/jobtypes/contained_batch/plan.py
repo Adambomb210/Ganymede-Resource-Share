@@ -18,6 +18,7 @@ import json
 import sqlite3
 import uuid
 
+from ganymede.coordinator import store as store_mod
 from ganymede.jobtypes.base import TaskSpec
 
 _SCHEMA_TYPES = {"str", "int", "float", "bool"}
@@ -45,6 +46,24 @@ def validate_spec(spec) -> None:
 
     if not isinstance(spec.get("output_prefix"), str) or not spec["output_prefix"]:
         raise ValueError("spec.output_prefix must be a non-empty string")
+    # A submitter names their inputs by object key, and those keys are handed
+    # to ``presign_get`` to mint a URL a worker fetches. Nothing else
+    # constrains them, so a key inside the coordinator's own namespace would
+    # make the coordinator sign a read of its own internal state on the
+    # submitter's behalf -- another run's outer momentum or round base
+    # adapter, possibly for a run whose data_classification this submitter has
+    # no clearance for. Refused here, at submission, so the submitter is told
+    # rather than finding out as a mysterious mid-run failure; the presign
+    # helpers in ``inputs.py`` refuse again as defence in depth.
+    for i, shard in enumerate(shards):
+        if store_mod.is_reserved_key(shard["ref"]):
+            raise ValueError(
+                f"spec.shards[{i}].ref may not address the coordinator's own "
+                f"storage namespace ({', '.join(store_mod.RESERVED_KEY_PREFIXES)})")
+    if store_mod.is_reserved_key(spec["output_prefix"]):
+        raise ValueError(
+            "spec.output_prefix may not write into the coordinator's own "
+            "storage namespace")
 
     schema = spec.get("output_schema")
     if not isinstance(schema, dict) or not schema:

@@ -80,6 +80,69 @@ def momentum_key(run_id: str) -> str:
     return f"runs/{run_id}/momentum.safetensors"
 
 
+#: Every prefix the coordinator writes under itself. Everything above this
+#: comment -- submissions, round base adapters, outer momentum, uploaded image
+#: archives -- lands under one of these two, and nothing a *submitter* supplies
+#: ever legitimately does.
+RESERVED_KEY_PREFIXES = ("runs/", "images/")
+
+
+def normalize_key(ref: str) -> str:
+    """The object key ``ref`` actually addresses, with the cosmetic variations
+    that would otherwise hide a prefix from a string comparison removed.
+
+    S3 keys are opaque byte strings -- the store does **not** resolve ``..`` or
+    collapse ``//`` the way a filesystem would -- so this is not about what the
+    store will fetch. It is about ``is_reserved_key`` below not being trivially
+    evadable by spelling the same intent differently, and it deliberately
+    normalizes *more* aggressively than the store does: ``runs/../runs/x`` is a
+    key the store would treat as literal and never find, so refusing it costs a
+    submitter nothing, while letting it through would mean the guard reads one
+    string and any future resolver reads another.
+
+    Case is left alone on purpose: S3 keys are case-sensitive, so ``Runs/x`` is
+    a genuinely different object from ``runs/x`` and is not the coordinator's.
+    """
+    key = ref.strip().replace("\\", "/")
+    if "://" in key:
+        key = key.split("://", 1)[1]
+        key = key.partition("/")[2]          # drop the bucket/host component
+    parts: list[str] = []
+    for seg in key.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(seg)
+    return "/".join(parts)
+
+
+def is_reserved_key(ref: str) -> bool:
+    """True if ``ref`` addresses something in the coordinator's own namespace.
+
+    A job spec names its inputs by object key (``spec.shards[i].ref``,
+    ``spec.model_ref``) and those keys are handed to ``presign_get`` to mint a
+    URL a worker can fetch. Nothing else constrains them, so without this a
+    submitter could name *any* key and have the coordinator sign a read of it
+    on their behalf -- including another run's ``momentum.safetensors`` or
+    round base adapter, which are reduce-internal state no worker is ever
+    handed through the legitimate round protocol, and which may belong to a run
+    whose ``data_classification`` that submitter has no clearance for.
+
+    This is a deny-list of what the coordinator owns rather than an allow-list
+    of what a submitter owns, because there is no submitter namespace to allow:
+    shards are placed in the bucket out of band and the codebase has no
+    convention for where. Closing the hole that exists is worth doing now;
+    inventing that convention is a design decision and is recorded in
+    ``docs/11-sandbox.md`` instead.
+    """
+    key = normalize_key(ref)
+    return any(key == p.rstrip("/") or key.startswith(p)
+               for p in RESERVED_KEY_PREFIXES)
+
+
 class Store:
     """Thin wrapper over one long-lived boto3 S3 client."""
 

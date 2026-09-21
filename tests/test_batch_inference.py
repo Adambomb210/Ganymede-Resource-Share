@@ -18,6 +18,7 @@ import torch
 from ganymede.coordinator import close, eligibility, rounds
 from ganymede.jobtypes import resolve
 from ganymede.jobtypes.batch_inference import BatchInference
+from ganymede.jobtypes.batch_inference import inputs as bi_inputs
 from ganymede.jobtypes.batch_inference import plan as bi_plan
 from ganymede.jobtypes.batch_inference import validate as bi_validate
 from ganymede.jobtypes.batch_inference.run import InferResult, InferTask, canonical_digest
@@ -1073,3 +1074,86 @@ def test_a_real_worker_declines_nothing_and_takes_no_lease_when_the_job_is_done(
     assert conn.execute(
         "SELECT COUNT(*) AS n FROM tasks WHERE status = 'leased'"
     ).fetchone()["n"] == 0
+
+
+# --------------------------------------------------------------------------
+# A job spec may not name the coordinator's own storage namespace
+# (review finding, 2026-09-21)
+# --------------------------------------------------------------------------
+
+
+class _SigningStore:
+    """Signs whatever key it is given, like the real store does."""
+
+    def __init__(self):
+        self.signed = []
+
+    def presign_get(self, key):
+        self.signed.append(key)
+        return (f"https://signed.example/{key}", {})
+
+
+@pytest.mark.parametrize("ref", [
+    "runs/victim/momentum.safetensors",
+    "runs/victim/rounds/00000/base.safetensors",
+    "images/someone-elses.tar",
+    "/runs/victim/momentum.safetensors",
+    "./runs/victim/momentum.safetensors",
+    "runs//victim/momentum.safetensors",
+    "anything/../runs/victim/momentum.safetensors",
+    "s3://bucket/runs/victim/momentum.safetensors",
+])
+def test_a_shard_ref_may_not_address_coordinator_storage(ref):
+    """``spec.shards[i].ref`` is handed straight to ``presign_get``, so without
+    this an approved submitter could have the coordinator mint a signed read of
+    *its own internal state* on their behalf.
+
+    ``runs/<id>/momentum.safetensors`` is the DiLoCo outer-momentum blob and
+    ``rounds/<n>/base.safetensors`` the round base adapter -- reduce-internal
+    objects no worker is ever handed through the legitimate round protocol, and
+    belonging to a run whose ``data_classification`` the submitter may have no
+    clearance for. The key is guessable from a ``run_id``, and ``/ui/`` shows
+    every run's id to any authenticated contributor.
+
+    The spellings below are all the same key; the guard normalises before
+    comparing so it cannot be stepped around with a leading slash or a ``..``.
+    """
+    spec = _spec([{"ref": ref, "rows": 4}])
+    with pytest.raises(ValueError, match="coordinator's own storage namespace"):
+        BatchInference().validate_spec(spec)
+
+
+def test_a_model_ref_may_not_address_coordinator_storage():
+    spec = _spec([{"ref": "s0", "rows": 4}])
+    spec["model_ref"] = "runs/victim/momentum.safetensors"
+    with pytest.raises(ValueError, match="coordinator's own storage namespace"):
+        BatchInference().validate_spec(spec)
+
+
+def test_an_output_prefix_may_not_write_into_coordinator_storage():
+    spec = _spec([{"ref": "s0", "rows": 4}])
+    spec["output_prefix"] = "runs/victim/rounds/00000"
+    with pytest.raises(ValueError, match="coordinator's own storage namespace"):
+        BatchInference().validate_spec(spec)
+
+
+def test_ordinary_submitter_keys_are_untouched():
+    """The guard is a deny-list of what the coordinator owns, not an allow-list
+    of what a submitter owns -- there is no submitter namespace convention in
+    this codebase, so anything outside ``runs/`` and ``images/`` must still
+    work exactly as before."""
+    for ref in ("s0", "shards/0", "Runs/mine", "runsaway/x", "my/runs/x"):
+        BatchInference().validate_spec(_spec([{"ref": ref, "rows": 4}]))
+
+
+def test_the_presign_helper_refuses_independently_of_validate_spec():
+    """Defence in depth: a ``tasks`` row that predates the submission-time
+    check, or reaches ``inputs_for`` another way, must not get signed either --
+    signing it anyway is the entire bug."""
+    store = _SigningStore()
+    with pytest.raises(ValueError, match="coordinator's own storage namespace"):
+        bi_inputs._shard_get_url(store, "runs/victim/momentum.safetensors")
+    assert store.signed == [], "nothing may be signed on the refusal path"
+
+    # ...and an ordinary key still signs.
+    assert bi_inputs._shard_get_url(store, "s0") == "https://signed.example/s0"

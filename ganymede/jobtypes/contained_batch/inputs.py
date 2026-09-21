@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 
+from ganymede.coordinator import store as store_mod
 from ganymede.jobtypes.base import InputRefs
 
 
@@ -27,6 +28,13 @@ def _shard_get_url(store, shard_ref: str) -> str:
     """
     if shard_ref.startswith(("http://", "https://")):
         return shard_ref
+    if store_mod.is_reserved_key(shard_ref):
+        # Defence in depth: validate_spec already refused this at submission.
+        # Reaching here means a row predates that check or bypassed it, and
+        # signing the read anyway would be the whole bug.
+        raise ValueError(
+            "refusing to presign a shard ref inside the coordinator's own "
+            f"storage namespace: {shard_ref!r}")
     return store.presign_get(shard_ref)[0]
 
 

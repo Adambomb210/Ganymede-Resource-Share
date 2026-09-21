@@ -10,6 +10,35 @@ to a private host — not someone attacking the runtime. That buys resource caps
 default-deny egress, and read-only mounts; it does not buy gVisor / Kata or the
 assumption that job code is hostile (§5).*
 
+**That threat model is about the image's *code*, and it does not extend to the job
+*spec* (review, 2026-09-21).** A spec names its inputs by object key —
+`spec.shards[i].ref`, `spec.model_ref` — and `inputs_for` hands those keys straight to
+`store.presign_get` to mint a URL the worker fetches. Nothing constrained them, so an
+approved submitter could name **any** key and have the coordinator sign a read of it on
+their behalf. The reachable targets are the coordinator's own reduce-internal state:
+`runs/<id>/momentum.safetensors` (the DiLoCo outer momentum) and
+`runs/<id>/rounds/<n>/base.safetensors`, neither of which any worker is handed through
+the legitimate round protocol, and both of which may belong to a run whose
+`data_classification` that submitter has no clearance for. The `run_id` needed to build
+the key is not secret: `/ui/` renders every run's id to any authenticated contributor,
+with none of the `clearance_and_terms_permit` filtering `/v1/manifest` applies to the
+same data.
+
+Closed by `store.is_reserved_key`: a spec may not address `runs/` or `images/`, checked
+at submission (a 422, so the submitter is told) and again in the presign helpers as
+defence in depth. Keys are normalised first — leading `/`, `./`, `//`, `..` segments,
+backslashes and an `s3://bucket/` prefix all collapse — so the guard cannot be stepped
+around by respelling. Case is deliberately *not* folded: S3 keys are case-sensitive, so
+`Runs/x` is genuinely a different object and is not the coordinator's.
+
+**Deliberately a deny-list, not an allow-list, and that is the part still open.** There
+is no submitter namespace to permit: shards are placed in the bucket out of band and
+this codebase has no convention for where they live. Giving submitter data its own
+prefix and requiring specs to stay inside it is the real fix and is a design decision,
+not a patch. **Also still open:** `readmodel.dashboard()` selects every `runs` row with
+no clearance filter while `/v1/manifest` filters the same data — the two disagree about
+what a given contributor may even learn a `run_id` for.
+
 ---
 
 ## 1. Image pipeline: upload → finalize → scan → pull
