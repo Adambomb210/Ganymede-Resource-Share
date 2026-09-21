@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from ganymede.coordinator import fairness, ledger, rounds
+from ganymede.coordinator import devices, fairness, ledger, rounds
 from ganymede.coordinator.app import _selectable_jobs
 
 # --------------------------------------------------------------------------
@@ -51,18 +51,31 @@ def owner(conn, make_contributor):
 
 @pytest.fixture
 def worker(conn, make_contributor):
-    """A real ``workers`` row. ``tasks.worker_id`` is a foreign key, so a
-    string literal will not do."""
+    """A real ``workers`` row, with the one device a real register call would
+    have given it.
+
+    ``tasks.worker_id`` is a foreign key, so a string literal will not do --
+    and since docs/14 the device ledger is a second such dependency: a claim
+    allocates a device, so a worker with no ``worker_devices`` row is refused
+    every job. Both production paths that create a ``workers`` row
+    (``register`` and ``claim-enrollment``) call
+    ``devices.reconcile_inventory``, which synthesizes exactly this one device
+    from the flat profile when a worker reports no ``devices`` list. A fixture
+    that inserts the row by hand has to do the same, or it is modelling a
+    machine that cannot exist.
+    """
     def _make(name: str = "w"):
         cid, _ = make_contributor(name=f"c-{name}-{uuid.uuid4().hex[:6]}")
         wid = uuid.uuid4().hex
         now = rounds._iso(rounds.utcnow())
+        profile = {"gpu_model": "CPU", "vram_mb": 1024}
         conn.execute(
             """INSERT INTO workers (id, contributor_id, compute_profile_json,
                                     first_seen, last_seen)
-               VALUES (?, ?, '{"gpu_model": "CPU", "vram_mb": 1024}', ?, ?)""",
-            (wid, cid, now, now),
+               VALUES (?, ?, ?, ?, ?)""",
+            (wid, cid, json.dumps(profile), now, now),
         )
+        devices.reconcile_inventory(conn, wid, profile)
         conn.commit()
         return wid
     return _make
@@ -534,7 +547,8 @@ def test_a_preempted_task_goes_back_in_the_pool_and_burns_no_attempt(
     class _S:
         lease_duration_sec = 900
 
-    spec, _ = _claim_static_task(conn, _JT(), None, job, worker(), _S())
+    spec, _ = _claim_static_task(conn, _JT(), None, job, worker(), _S(),
+                                 free_devices=[0])
     assert spec is not None
     row = conn.execute("SELECT status, attempts FROM tasks WHERE id = 't1'").fetchone()
     assert row["status"] == "leased"
@@ -559,7 +573,8 @@ def test_an_ordinary_reserve_still_burns_an_attempt(conn, owner, worker):
     class _S:
         lease_duration_sec = 900
 
-    _claim_static_task(conn, _JT(), None, job, worker(), _S())
+    _claim_static_task(conn, _JT(), None, job, worker(), _S(),
+                       free_devices=[0])
     assert conn.execute(
         "SELECT attempts FROM tasks WHERE id = 't1'").fetchone()["attempts"] == 4
 

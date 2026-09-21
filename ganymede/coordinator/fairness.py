@@ -197,6 +197,7 @@ def effective_rank(priority_rank: int, spread: float, share_fraction: float) -> 
 
 OVER_CONCURRENCY = "over_concurrency_quota"
 OVER_BUDGET = "over_monthly_budget"
+OVER_GPU_CONCURRENCY = "over_concurrent_gpus"
 
 
 def quota_for(conn: sqlite3.Connection, user_id: str) -> sqlite3.Row | None:
@@ -212,6 +213,32 @@ def concurrency_used(conn: sqlite3.Connection, owner_id: str) -> int:
     return conn.execute(
         """SELECT COUNT(*) AS n FROM tasks t JOIN jobs j ON j.id = t.job_id
             WHERE j.owner_id = ? AND t.status = 'leased'""",
+        (owner_id,),
+    ).fetchone()["n"]
+
+
+def gpus_used(conn: sqlite3.Connection, owner_id: str) -> int:
+    """Devices this submitter's jobs hold right now (docs/14 §3, §9).
+
+    Counted from ``task_devices`` -- live, unreleased rows joined out to the
+    owner through ``tasks`` and ``jobs`` -- rather than from
+    ``SUM(tasks.gpu_count) WHERE status = 'leased'``. The two are not
+    guaranteed to agree: ``spotcheck.maybe_issue`` mints and leases a probe
+    task without allocating through the device ledger (a known gap, docs/14
+    §4 and ``devices.py``'s own module docstring), so a count built from
+    ``tasks`` alone could overstate what this owner is actually holding by
+    however many probes are outstanding, or -- if a bug ever left a task
+    ``leased`` with no device behind it -- understate what ``concurrency_used``
+    would show for the same owner. ``task_devices`` is the ledger
+    ``devices.allocate`` itself enforces the one-task-per-device invariant
+    against (the partial unique index), so it is the one source this quota
+    cannot disagree with the allocator about. A submitter with no leases at
+    all correctly counts zero, not an error."""
+    return conn.execute(
+        """SELECT COUNT(*) AS n FROM task_devices td
+             JOIN tasks t ON t.id = td.task_id
+             JOIN jobs j ON j.id = t.job_id
+            WHERE j.owner_id = ? AND td.released_at IS NULL""",
         (owner_id,),
     ).fetchone()["n"]
 
@@ -258,13 +285,33 @@ def quota_refusal(conn: sqlite3.Connection, owner_id: str,
                   now: datetime | None = None) -> str | None:
     """The refusal reason this submitter is over, or ``None``.
 
-    Both caps are checked in the claim walk as a ``continue`` with a recorded
-    ``eligibility.Verdict``, not as a silent filter in ``_selectable_jobs``. A
-    ``continue`` is every bit as absolute -- the job is not offered, full stop --
-    and it buys the *explanation*: the refusal lands in ``worker_eligibility``
-    and surfaces through ``explain()``, so a submitter whose jobs have stopped
-    moving is told "you are at your cap" rather than watching a queued job sit
-    there. A quota nobody can see hitting is a support ticket.
+    All three caps are checked in the claim walk as a ``continue`` with a
+    recorded ``eligibility.Verdict``, not as a silent filter in
+    ``_selectable_jobs``. A ``continue`` is every bit as absolute -- the job is
+    not offered, full stop -- and it buys the *explanation*: the refusal lands
+    in ``worker_eligibility`` and surfaces through ``explain()``, so a
+    submitter whose jobs have stopped moving is told "you are at your cap"
+    rather than watching a queued job sit there. A quota nobody can see
+    hitting is a support ticket (docs/13 §3.2), and docs/14 §9's argument for
+    ``max_concurrent_gpus`` is the identical one: the box that reports it hit
+    should not be a mystery.
+
+    ``max_concurrent_gpus`` is a coarse pre-check, deliberately the same shape
+    as ``max_concurrent_tasks`` above it rather than a tighter one: it reads
+    "is this owner already at or over their cap", not "would granting this
+    specific job's ``gpu_count`` push them over it". The two agree whenever a
+    claim can only ever add one unit at a time, which was true of every task
+    before this document and is still true of ``max_concurrent_tasks`` today.
+    A wide job's *single* claim can allocate several devices in one
+    transaction (``devices.allocate(..., gpu_count, ...)``), so a submitter
+    sitting one device under the cap can still be granted a job that lands
+    several over it in that one step -- bounded by how many devices one
+    machine can ever offer one task, never unbounded, but a real gap worth
+    naming rather than silently accepting. Tightening it to
+    ``gpus_used(...) + job["gpu_count"] > cap`` would need the walk to stop
+    memoizing this check per owner (different jobs from the same owner can
+    carry different ``gpu_count``), which is a larger change than this step
+    makes; see the step's own report.
     """
     row = quota_for(conn, owner_id)
     if row is None:
@@ -272,6 +319,9 @@ def quota_refusal(conn: sqlite3.Connection, owner_id: str,
     cap = row["max_concurrent_tasks"]
     if cap is not None and concurrency_used(conn, owner_id) >= int(cap):
         return OVER_CONCURRENCY
+    gpu_cap = row["max_concurrent_gpus"]
+    if gpu_cap is not None and gpus_used(conn, owner_id) >= int(gpu_cap):
+        return OVER_GPU_CONCURRENCY
     budget = row["monthly_task_hours"]
     if budget is not None and month_hours(conn, owner_id, now) >= float(budget):
         return OVER_BUDGET

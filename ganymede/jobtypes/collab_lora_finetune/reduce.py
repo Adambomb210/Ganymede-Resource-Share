@@ -19,6 +19,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 
+from ganymede.coordinator import devices as devices_mod
 from ganymede.coordinator import rounds
 from ganymede.coordinator.db import immediate
 from ganymede.coordinator.store import base_adapter_key, momentum_key
@@ -165,11 +166,35 @@ def _close_claimed_round(
             (rounds._iso(now), result_ref, contributors, divergence, run_id, round_idx),
         )
         # Any lease still outstanding belongs to a round that no longer exists.
-        conn.execute(
-            """UPDATE tasks SET status = 'expired', lease_expires_at = NULL
-               WHERE run_id = ? AND round_idx = ? AND status = 'leased'""",
+        # This is a fourth terminal path outside ``rounds.expire_leases``'s
+        # three -- a straggler here is reclaimed the instant the round closes,
+        # not on the TTL sweep's own schedule -- so it needs the same device
+        # release (docs/14 §5.5) the other three get, or a round that closes
+        # early leaves every straggler's card permanently dark. Select the
+        # ids before the bulk ``UPDATE`` because ``devices.release`` takes one
+        # task id at a time and this can match more than one straggler across
+        # more than one worker.
+        #
+        # ``release_reason`` is ``round_closed``, deliberately distinct from
+        # ``expire_leases``'s ``expired`` even though the task's own
+        # ``status`` column still reads ``expired`` here (unchanged,
+        # pre-existing behaviour) -- docs/14 §3's "why is card 2 dark" is
+        # answered better by the reason that actually applies: this straggler
+        # was never a TTL timeout, it was reclaimed early because the round
+        # it belonged to finished without it.
+        straggler_ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM tasks WHERE run_id = ? AND round_idx = ? "
+            "AND status = 'leased'",
             (run_id, round_idx),
-        )
+        ).fetchall()]
+        if straggler_ids:
+            conn.execute(
+                "UPDATE tasks SET status = 'expired', lease_expires_at = NULL "
+                "WHERE id IN (%s)" % ",".join("?" * len(straggler_ids)),
+                straggler_ids,
+            )
+            for tid in straggler_ids:
+                devices_mod.release(conn, tid, "round_closed")
 
     # Fold observed throughput back in, so the next round's budgets are measured
     # rather than guessed. This is what makes the cold-start default cheap.

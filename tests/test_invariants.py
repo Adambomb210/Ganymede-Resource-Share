@@ -12,21 +12,39 @@ import json
 import uuid
 from datetime import timedelta
 
-from ganymede.coordinator import invariants, rounds
+from ganymede.coordinator import devices, invariants, rounds
 from ganymede.jobtypes.collab_lora_finetune import plan
 
 
-def _worker(conn, contributor_id, worker_id="w1"):
+def _worker(conn, contributor_id, worker_id="w1", device_count=1):
+    """A worker with the device inventory a real register call would give it.
+
+    ``devices.reconcile_inventory`` synthesizes one device from a flat profile,
+    which is what every single-GPU machine in the fleet has. ``device_count``
+    above 1 models the multi-GPU host docs/14 exists for.
+    """
     now = rounds._iso(rounds.utcnow())
     conn.execute(
         """INSERT INTO workers (id, contributor_id, compute_profile_json, first_seen, last_seen)
            VALUES (?, ?, '{}', ?, ?)""",
         (worker_id, contributor_id, now, now),
     )
+    profile = {"devices": [
+        {"index": i, "name": "test", "vram_mb": 1024} for i in range(device_count)
+    ]}
+    devices.reconcile_inventory(conn, worker_id, profile)
     return worker_id
 
 
-def _task(conn, run_id, worker_id, buckets, status="leased", round_idx=0, expires_in=900):
+def _task(conn, run_id, worker_id, buckets, status="leased", round_idx=0,
+          expires_in=900, device=0):
+    """A task row, plus the device allocation a real claim would have made.
+
+    ``device=None`` deliberately skips the allocation, which is how a test
+    builds the ``lease_without_device`` state -- a lease whose card still reads
+    as free. Everything else gets one, because a leased task that holds no
+    device is precisely the broken state, not a neutral default.
+    """
     task_id = uuid.uuid4().hex
     expires = (
         None if expires_in is None
@@ -39,6 +57,8 @@ def _task(conn, run_id, worker_id, buckets, status="leased", round_idx=0, expire
         (task_id, run_id, round_idx, json.dumps(buckets), status, worker_id,
          expires, rounds._iso(rounds.utcnow())),
     )
+    if status == "leased" and worker_id is not None and device is not None:
+        devices.allocate(conn, worker_id, task_id, 1, [device])
     return task_id
 
 
@@ -55,32 +75,53 @@ def test_a_healthy_run_reports_nothing(conn, seeded_run, make_contributor):
 
 
 # --------------------------------------------------------------------------
-# double_lease
+# lease_without_device
 # --------------------------------------------------------------------------
 
 
-def test_two_live_leases_for_one_worker_in_one_round_is_a_violation(
+def test_a_leased_task_holding_no_device_is_a_violation(
     conn, seeded_run, make_contributor
 ):
+    """The state the device ledger's unique index cannot see. The card reads as
+    free while it is being used, so the next claim double-books it -- silently,
+    since both tasks run and only their throughput suffers."""
     run_id = seeded_run()
     cid, _ = make_contributor()
     worker = _worker(conn, cid)
-    _task(conn, run_id, worker, [0])
-    _task(conn, run_id, worker, [1])
+    _task(conn, run_id, worker, [0], device=None)
 
-    assert "double_lease" in _checks(conn)
+    assert "lease_without_device" in _checks(conn)
 
 
-def test_one_lease_per_round_across_two_rounds_is_fine(conn, seeded_run, make_contributor):
-    """A worker that worked round 0 and now holds round 1 is the normal case --
-    grouping on worker alone would report every healthy multi-round run."""
+def test_two_leases_for_one_worker_in_one_round_on_two_devices_is_fine(
+    conn, seeded_run, make_contributor
+):
+    """docs/14 §7: this is the whole point of the feature, not a violation.
+    A two-card host takes two bucket assignments in one round, and its two
+    submissions are two independent local runs that happen to share a chassis.
+    The retired ``double_lease`` check reported exactly this as broken."""
+    run_id = seeded_run()
+    cid, _ = make_contributor()
+    worker = _worker(conn, cid, device_count=2)
+    _task(conn, run_id, worker, [0], device=0)
+    _task(conn, run_id, worker, [1], device=1)
+
+    assert _checks(conn) == set()
+
+
+def test_a_released_allocation_does_not_count_as_holding_the_device(
+    conn, seeded_run, make_contributor
+):
+    """``released_at IS NULL`` is the whole predicate. A task whose allocation
+    was released but whose row is still ``leased`` is the same dark-card bug as
+    one that never allocated, and history rows must not paper over it."""
     run_id = seeded_run()
     cid, _ = make_contributor()
     worker = _worker(conn, cid)
-    _task(conn, run_id, worker, [0], status="submitted", round_idx=0)
-    _task(conn, run_id, worker, [1], round_idx=1)
+    task_id = _task(conn, run_id, worker, [0])
+    devices.release(conn, task_id, "expired")
 
-    assert "double_lease" not in _checks(conn)
+    assert "lease_without_device" in _checks(conn)
 
 
 # --------------------------------------------------------------------------

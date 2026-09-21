@@ -70,9 +70,53 @@ def _vram_gb(profile: dict) -> float | None:
     return None if mb is None else mb / 1024
 
 
+def _devices(profile: dict) -> list[dict] | None:
+    # docs/14 §2 puts the per-device report on the profile precisely so this
+    # stays a dict lookup rather than a DB read -- ``check_constraints`` is
+    # pure by contract (module docstring). Worker-side reporting is a later
+    # step, so ``None`` here is every machine in the fleet today, not an
+    # anomaly.
+    ds = profile.get("devices")
+    return ds if isinstance(ds, list) and ds else None
+
+
+def _gpu_count(profile: dict) -> int:
+    # docs/14 §5: a pre-009 worker carries no ``devices`` list at all, and
+    # that must resolve to 1, not to ``None`` -- the fail-closed rule every
+    # other field in this table gets would otherwise make every such machine
+    # ineligible for a plain ``gpu_count: 1`` constraint, which is every
+    # machine in the fleet until a later step ships per-device reporting.
+    # ``vram_gb``'s existing "flat fields stay, populated from device 0"
+    # guarantee (docs/14 §2) is exactly why "no report" and "one device" are
+    # the same fact here.
+    ds = _devices(profile)
+    return len(ds) if ds else 1
+
+
+def _total_vram_gb(profile: dict) -> float | None:
+    # Same fallback as ``_gpu_count`` and for the same reason: no ``devices``
+    # report means one device, so the "total" is the flat figure ``vram_gb``
+    # already reads -- not ``None``, which would fail this field closed for
+    # every machine that has not been told about ``devices`` yet.
+    ds = _devices(profile)
+    if not ds:
+        return _vram_gb(profile)
+    total_mb = 0.0
+    for d in ds:
+        if not isinstance(d, dict):
+            continue
+        try:
+            total_mb += float(d.get("vram_mb") or 0)
+        except (TypeError, ValueError):
+            continue
+    return total_mb / 1024
+
+
 _RESOLVERS: dict[str, Any] = {
     "vram_gb": _vram_gb,
     "vram_mb": _vram_mb,
+    "gpu_count": _gpu_count,
+    "total_vram_gb": _total_vram_gb,
     "gpu_model": lambda p: p.get("device_name"),
     "backend": lambda p: p.get("backend"),
     "compute_capability": lambda p: p.get("compute_capability"),

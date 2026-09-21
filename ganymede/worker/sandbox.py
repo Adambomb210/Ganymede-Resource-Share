@@ -84,7 +84,18 @@ class SandboxConfig:
     runtime_bin: str = "docker"
     memory: str = "16g"
     cpus: str = "0.9"
-    gpus: str | None = "all"
+    # The operator's override, not a default GPU grant. Before docs/14, one
+    # task ever ran on a machine at a time (Decision 4), so "all" was a
+    # harmless default -- the one task on the box already owned every card.
+    # Now several leases can share a multi-GPU host concurrently, and "all"
+    # unconditionally would hand each of their containers every card,
+    # including the ones a *sibling* lease holds -- exactly the double-booking
+    # docs/14's ledger exists to prevent. ``None`` (unset) therefore no longer
+    # means "all devices"; it means "no override", and ``run_argv`` derives
+    # the actual flag from the lease's own ``devices`` via ``device_argv``. An
+    # operator who sets this explicitly still gets it verbatim -- see
+    # ``run_argv``'s docstring for why that is deliberate and what it costs.
+    gpus: str | None = None
     pids_limit: int = 512
     scratch_gb: int = 50
     # §2.2: the ceiling on spec.max_runtime_sec, not the value itself.
@@ -111,7 +122,9 @@ class SandboxConfig:
             runtime_bin=env.get("GANYMEDE_JOB_RUNTIME", "docker"),
             memory=env.get("GANYMEDE_JOB_MEMORY", "16g"),
             cpus=env.get("GANYMEDE_JOB_CPUS", "0.9"),
-            gpus=env.get("GANYMEDE_JOB_GPUS", "all") or None,
+            # No default here either (see the field's docstring): unset or
+            # empty means "no override", not "all".
+            gpus=env.get("GANYMEDE_JOB_GPUS") or None,
             pids_limit=int(env.get("GANYMEDE_JOB_PIDS_LIMIT", "512")),
             scratch_gb=int(env.get("GANYMEDE_JOB_SCRATCH_GB", "50")),
             job_max_runtime_sec=int(env.get("GANYMEDE_JOB_MAX_RUNTIME_SEC", "86400")),
@@ -147,10 +160,131 @@ def detect_runtime(runner=None, runtime_bin: str | None = None) -> str | None:
     return Path(binary).stem
 
 
+# Backends where a container given no device flags at all gets *no* accelerator,
+# as opposed to cpu/mps where there is nothing to hand it in the first place.
+# The distinction matters only in one place -- ``run_argv``'s empty-lease
+# branch -- but it matters a lot there: on these three, "pin nothing" and "pin
+# everything" are opposite outcomes rather than the same one.
+_DISCRETE_BACKENDS = frozenset({"cuda", "rocm", "xpu"})
+
+
+def device_argv(backend: str | None, indices: list[int]) -> list[str] | None:
+    """The container flags that confine a job to exactly this lease's devices
+    (docs/14 §2's "container pin" column). The container-launch counterpart of
+    ``worker.loop._pin_env``, which does the identical job for an in-process
+    child -- read that function's docstring first; this one only differs where
+    a container's confinement genuinely differs from a process's.
+
+    Returns ``None`` to mean *refuse*: docs/14 §2 says a backend with no known
+    pinning form "refuses to launch rather than falling back to 'all
+    devices'". Handing a container every card on the box while the
+    coordinator's ledger believes this lease holds only ``indices`` is exactly
+    the double-booking the ledger exists to prevent -- and unlike the
+    in-process case, a container that gets no device flags at all does not
+    fall back to "sees everything" the way an unpinned process does; it falls
+    back to "sees nothing", which is a different failure but not a safer one
+    to produce silently.
+
+    An empty ``indices`` is not a refusal. It means nothing was named to pin
+    to -- unreachable for a real lease once ``devices.allocate`` has run (it
+    raises on ``count <= 0``), but reachable from a payload built before
+    docs/14 landed (``jobtypes.base.TaskSpec.devices`` defaults to ``[]`` for
+    exactly this reason -- see its docstring). Inventing a pin for a device
+    that was never named would be worse than pinning none.
+    """
+    idx = sorted(indices)
+    if not idx:
+        return []
+    if backend == "cuda":
+        # Docker's ``--gpus`` value is parsed as a CSV key=value list of its
+        # own (count=, capabilities=, driver=, device=), so an *unquoted*
+        # multi-index value like ``device=0,2`` is ambiguous with that outer
+        # grammar: everything after the first comma reads as further fields
+        # rather than more of ``device``'s value, and the failure is silent --
+        # a wrong device set, not an error. The fix is embedding **literal**
+        # double-quote characters in the flag's value (not shell quoting --
+        # these two characters travel inside the single argv element), which
+        # tells Docker's CSV parser to treat the whole thing as one quoted
+        # field. Confirmed against Docker's own example
+        # (docs.docker.com/engine/containers/gpu/): `--gpus '"device=0,2"'`,
+        # where the outer `'...'` is the shell's and the inner `"..."` is the
+        # value Docker actually receives. A single index does not strictly
+        # need it, but a quoted single field parses identically to an
+        # unquoted one, so there is no reason to keep two code paths -- one of
+        # which is the one this footgun would come back through.
+        csv = ",".join(str(i) for i in idx)
+        return ["--gpus", f'"device={csv}"']
+    if backend == "rocm":
+        # docs/14 §2. ``/dev/kfd`` is the single shared compute-queue device
+        # for the whole box; ``/dev/dri/renderD{128+N}`` is the per-card DRM
+        # render node, numbered from 128 by kernel convention, so index N is
+        # node 128+N *if* index N is also how the kernel orders render nodes --
+        # unverified on real ROCm hardware, and the doc's own formula, not
+        # something this step can confirm without a card to test on (see the
+        # step report). ``--group-add video`` is what makes those
+        # group-owned nodes readable by ``--user 1000:1000`` rather than root.
+        argv = ["--device=/dev/kfd"]
+        argv += [f"--device=/dev/dri/renderD{128 + i}" for i in idx]
+        argv += ["--group-add", "video"]
+        return argv
+    if backend == "xpu":
+        # Same render-node convention as ROCm, no ``/dev/kfd`` analogue --
+        # Intel's compute stack talks to the render node directly. Same
+        # unverified-formula caveat as above.
+        return [f"--device=/dev/dri/renderD{128 + i}" for i in idx]
+    if backend == "cpu":
+        # docs/14 §2's table lists ``--cpuset-cpus`` as cpu's analogue, but
+        # nothing feeds it a real value to pin *to*: ``probe._cpu_devices``
+        # hands out ``range(slots)`` as pure ordinal labels (its own
+        # docstring), not physical core ids, and the module has no topology
+        # query anywhere that could turn index N into a real core number.
+        # ``loop._pin_env`` already documents this exact gap for the
+        # in-process pin and leaves cpu unpinned rather than invent a mapping;
+        # this does the same, for the same reason, rather than fabricate a
+        # ``--cpuset-cpus`` value that could pin two sibling containers to the
+        # same physical core while both believe they are isolated -- worse
+        # than the accepted gap it would replace. This also keeps the
+        # overwhelming common case (``GANYMEDE_CPU_SLOTS`` at its default of
+        # 1, one task, the whole box already exclusively its own) working
+        # exactly as before: nothing to add, nothing needed.
+        return []
+    # mps, or any name this table does not know. mps is always exactly one
+    # device by construction (unified memory, no index), and its *in-process*
+    # pin is correctly a no-op (``_pin_env`` returns ``{}`` for it) -- torch's
+    # MPS backend has no visible-device concept, so an unpinned process
+    # already sees the one GPU there is. A *container* is a different
+    # question with a different answer: Docker Desktop for Mac runs
+    # containers inside a Linux VM with no Metal passthrough at all, so there
+    # is no flag -- quoted, unquoted, or otherwise -- that hands a container
+    # that GPU. docs/14 §2 spells this "none", distinct from cpu's "n/a": cpu
+    # genuinely has nothing to restrict (single implicit tenant); mps has
+    # something to restrict to and no mechanism to do it with. Refusing here
+    # is therefore not the same kind of refusal as an unrecognised backend's --
+    # it is honesty about a platform gap, not a ledger violation -- but the
+    # consequence for the caller is identical, and it beats the alternative of
+    # a container starting, running the submitter's job with no GPU at all,
+    # and nobody finding out until the output looks wrong.
+    return None
+
+
 _LOADED_ID = re.compile(r"sha256:[0-9a-f]{64}")
 # `Loaded image: name:tag` -- what a *tagged* archive reports, which is every
 # archive docs/11 §1.1's upload path can produce.
 _LOADED_TAG = re.compile(r"Loaded image:\s*(\S+)")
+
+
+def container_name_for(task_id: str) -> str:
+    """The name a contained job's container answers to, deterministically.
+
+    Split out so it can be computed by someone who has not started (or does
+    not own) the ``JobContainer`` -- the worker's heartbeat thread names the
+    target of a cancel this way (``loop.Worker._run_contained``) without
+    constructing one, and it is what a lease crumb's ``container`` field
+    records so the host agent's reaper (``host.agent.reap_orphaned_jobs``) can
+    ask the runtime about the same name later, from a different process,
+    knowing only the task id.
+    """
+    return f"ganymede-job-{task_id[:12]}"
 
 
 @dataclass
@@ -166,7 +300,7 @@ class JobContainer:
     def __post_init__(self) -> None:
         self._run = self.runner or _run
         if not self.container_name:
-            self.container_name = f"ganymede-job-{self.task_id[:12]}"
+            self.container_name = container_name_for(self.task_id)
 
     # -- scratch (§2.3) ---------------------------------------------------
 
@@ -285,7 +419,8 @@ class JobContainer:
                    self.config.job_max_runtime_sec)
 
     def run_argv(self, image_id: str, *, env: dict[str, str] | None = None,
-                 max_runtime_sec: int | None = None) -> list[str]:
+                 max_runtime_sec: int | None = None, backend: str | None = None,
+                 devices: list[int] | None = None) -> list[str]:
         """The flag template. §4.6's baseline plus §2.2's additions.
 
         Notes on the ones that are not obvious:
@@ -305,8 +440,32 @@ class JobContainer:
         - ``--user`` is forced to a non-root uid regardless of what the image's
           own ``USER`` says. The scan flags a root image (docs/11 §1.3) but a
           flag is advice; this is the enforcement.
+        - ``--gpus`` (or its ROCm/XPU equivalent): ``config.gpus`` is an
+          **explicit operator override** and wins outright over ``devices``
+          when set -- the same relationship every other §2.2 field has to the
+          task (``job_max_runtime_sec`` clamps ``max_runtime_sec``, never the
+          other way around), and the deliberate escape hatch docs/14 §2 keeps
+          open for a deployment that knows better. That trust cuts both ways:
+          an operator who sets ``GANYMEDE_JOB_GPUS=all`` on a host running
+          several concurrent leases re-opens the exact double-booking docs/14
+          exists to close, on purpose, and this only warns about it rather
+          than refusing -- refusing an explicit operator setting is not this
+          module's call to make. Left unset (the default, see the field's own
+          docstring), ``devices`` -- this lease's actual allocation -- decides,
+          through ``device_argv``, which raises ``SandboxError`` rather than
+          start the container if the backend has no known way to honour it.
         """
         cfg = self.config
+        if cfg.gpus and devices:
+            # ``cfg.gpus`` empty-but-not-``None`` is an explicit *withhold*
+            # (see the ``if cfg.gpus:`` below), not an override that
+            # contradicts the ledger, so it does not warrant this warning.
+            log.warning(
+                "task %s: GANYMEDE_JOB_GPUS=%r overrides the lease's own "
+                "devices %s -- this container is not confined to what the "
+                "coordinator's ledger believes it holds",
+                self.task_id, cfg.gpus, sorted(devices),
+            )
         argv = [
             cfg.runtime_bin, "run",
             "--detach",
@@ -332,8 +491,47 @@ class JobContainer:
         ]
         if cfg.storage_opt_size:
             argv += ["--storage-opt", f"size={cfg.scratch_gb}G"]
-        if cfg.gpus:
-            argv += ["--gpus", cfg.gpus]
+        if cfg.gpus is not None:
+            # The operator's override, verbatim -- see the docstring above.
+            if cfg.gpus:
+                argv += ["--gpus", cfg.gpus]
+        elif not devices and backend in _DISCRETE_BACKENDS:
+            # No devices named, on a backend where that would mean handing the
+            # container no accelerator at all.
+            #
+            # This is **version skew, not a ledger violation**, and the two
+            # want opposite answers. A coordinator that allocates devices
+            # always names at least one (``devices.allocate`` raises on a
+            # non-positive count), so an empty list here says the coordinator
+            # predates docs/14 -- and a coordinator that predates docs/14 is
+            # still enforcing one lease per machine, which makes ``all`` both
+            # safe and exactly what this host used to get. Emitting nothing
+            # instead would silently run a submitter's GPU job on CPU: it
+            # "works", 50x slower, and nobody finds out.
+            #
+            # The refusal below is for the genuinely different case -- devices
+            # *were* named and this backend has no way to honour them, where
+            # obeying loosely would double-book a card the ledger has already
+            # promised to someone else. If a NEW coordinator ever reaches here
+            # it is a bug on its side, and the ``lease_without_device``
+            # invariant catches it there rather than this branch papering over
+            # it silently.
+            log.warning(
+                "task %s: the coordinator named no devices for a %s host; "
+                "falling back to every device, as a pre-docs/14 coordinator "
+                "would have. If this coordinator does allocate devices, this "
+                "is a bug on its side.", self.task_id, backend,
+            )
+            argv += ["--gpus", "all"]
+        else:
+            pin = device_argv(backend, devices or [])
+            if pin is None:
+                raise SandboxError(
+                    f"backend {backend!r} has no known way to confine a "
+                    f"container to devices {devices} (docs/14 §2); refusing "
+                    f"to start task {self.task_id} unconfined"
+                )
+            argv += pin
         for name in sorted(env or {}):
             # Name only, never NAME=value: a value here lands in the host
             # process table and in `inspect` output for the life of the
@@ -347,8 +545,10 @@ class JobContainer:
         return argv
 
     def start(self, image_id: str, *, env: dict[str, str] | None = None,
-              max_runtime_sec: int | None = None) -> str:
-        argv = self.run_argv(image_id, env=env, max_runtime_sec=max_runtime_sec)
+              max_runtime_sec: int | None = None, backend: str | None = None,
+              devices: list[int] | None = None) -> str:
+        argv = self.run_argv(image_id, env=env, max_runtime_sec=max_runtime_sec,
+                             backend=backend, devices=devices)
         child_env = dict(os.environ)
         child_env.update(env or {})
         child_env["GANYMEDE_SCRATCH"] = CONTAINER_SCRATCH
@@ -420,10 +620,23 @@ class JobContainer:
 # The lease crumb (docs/11 §3, wedged-worker path)
 # --------------------------------------------------------------------------
 
+# One task, one crumb file, under this subdirectory of the job scratch root.
+# Originally a single ``lease.json`` was enough -- one task per host, one
+# lease to renew. A host that runs several tasks concurrently needs each
+# task's renewal recorded separately: a shared file would have the second
+# task's heartbeat overwrite the first's record, and the reaper would then see
+# only one task's liveness for two containers, with no way to tell which.
+_LEASE_CRUMB_DIR = "leases"
+
+
+def _crumb_path(scratch_root: Path, task_id: str) -> Path:
+    return scratch_root / _LEASE_CRUMB_DIR / f"{task_id}.json"
+
 
 def write_lease_crumb(scratch_root: Path, task_id: str, renewed_at: str,
                       container: str | None = None) -> Path:
-    """Record that the lease was renewed, where the *host agent* can read it.
+    """Record that this task's lease was renewed, where the *host agent* can
+    read it.
 
     Not in the state dir, which is mounted read-only into the worker precisely
     so the worker cannot forge the contributor's kill switch (host/runtime
@@ -431,8 +644,8 @@ def write_lease_crumb(scratch_root: Path, task_id: str, renewed_at: str,
     the host agent can see and the worker may write -- and it exists already,
     because §2.3's bind mount needs it.
     """
-    scratch_root.mkdir(parents=True, exist_ok=True)
-    path = scratch_root / "lease.json"
+    path = _crumb_path(scratch_root, task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"task_id": task_id, "renewed_at": renewed_at, "container": container}
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload), encoding="utf-8")
@@ -440,16 +653,62 @@ def write_lease_crumb(scratch_root: Path, task_id: str, renewed_at: str,
     return path
 
 
-def read_lease_crumb(scratch_root: Path) -> dict | None:
+def read_lease_crumb(scratch_root: Path, task_id: str) -> dict | None:
+    """This task's own crumb, or ``None`` if it has none (or it does not parse)."""
     try:
-        return json.loads((scratch_root / "lease.json").read_text(encoding="utf-8"))
+        return json.loads(_crumb_path(scratch_root, task_id).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
 
 
-def clear_lease_crumb(scratch_root: Path) -> None:
+def read_all_lease_crumbs(scratch_root: Path) -> list[tuple[str | None, dict]]:
+    """Every crumb on disk, each paired with the key ``clear_lease_crumb``
+    needs to remove exactly that one file.
+
+    Used by the reaper, which must weigh every task's liveness, not just one
+    (concurrent contained jobs mean concurrent orphans). The pairing key is the
+    crumb file's own name (``path.stem``), not the ``task_id`` field inside its
+    JSON -- the two should always agree, but the name is what
+    ``clear_lease_crumb`` actually needs, and trusting the file over its own
+    content is the cheaper invariant to keep.
+
+    Tolerates a legacy single-file ``lease.json`` a worker built before crumbs
+    were split per task -- paired with ``None``, which tells
+    ``clear_lease_crumb`` to remove that file specifically rather than a
+    per-task one. A crumb that fails to parse names no container to act on
+    (there is nothing here to weigh it against), so it is dropped rather than
+    surfaced as an unresolvable entry -- the same fate an unparseable crumb met
+    under the single-file scheme.
+    """
+    crumbs: list[tuple[str | None, dict]] = []
+    crumb_dir = scratch_root / _LEASE_CRUMB_DIR
+    if crumb_dir.is_dir():
+        for path in sorted(crumb_dir.glob("*.json")):
+            try:
+                crumb = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            crumbs.append((path.stem, crumb))
+    legacy = scratch_root / "lease.json"
+    if legacy.is_file():
+        try:
+            crumbs.append((None, json.loads(legacy.read_text(encoding="utf-8"))))
+        except (OSError, ValueError):
+            pass
+    return crumbs
+
+
+def clear_lease_crumb(scratch_root: Path, task_id: str | None = None) -> None:
+    """Remove one task's crumb -- or, with ``task_id=None``, the legacy
+    single-file crumb (see ``read_all_lease_crumbs``). Best-effort: the crumb
+    is bookkeeping for the reaper, not state anything else depends on being
+    gone, and a task whose crumb could not be cleared is simply a crumb the
+    next sweep looks at again.
+    """
+    path = _crumb_path(scratch_root, task_id) if task_id is not None \
+        else scratch_root / "lease.json"
     try:
-        (scratch_root / "lease.json").unlink()
+        path.unlink()
     except OSError:
         pass
 

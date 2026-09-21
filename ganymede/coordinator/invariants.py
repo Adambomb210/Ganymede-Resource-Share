@@ -74,29 +74,43 @@ def _parse(ts: str) -> datetime:
 # --------------------------------------------------------------------------
 
 
-def _one_lease_per_worker_per_round(conn: sqlite3.Connection) -> list[Violation]:
-    """A worker holds at most one lease in a round.
+def _every_lease_holds_a_device(conn: sqlite3.Connection) -> list[Violation]:
+    """Every leased task holds at least one device.
 
-    ``claim_task`` returns the lease a worker already holds rather than issuing
-    a second one, so a worker retrying after a network blip resumes instead of
-    forking its own work into two shards. Two live leases for one worker means
-    that guard lost a race -- and the two halves would both submit, both pass
-    the gates, and both be weighted as independent contributions.
+    This replaces an earlier "one lease per worker per round" check, which
+    docs/14 retired: a multi-GPU host holding two leases on one round is now
+    correct, not a violation -- four cards doing four bucket assignments is the
+    point of the feature.
+
+    What that check was really protecting survives here in a stronger form.
+    Its worry was a lease forked in two that would submit twice and be weighted
+    twice; the device ledger's partial unique index
+    (``idx_task_devices_busy``) makes the fork impossible *provided the lease
+    went through the ledger at all*. So the state worth hunting is the one the
+    index cannot see: a task leased without an allocation. Its card reads as
+    free while it is being used, and the very next claim double-books it --
+    silently, because both tasks run and only their throughput suffers.
+
+    ``spotcheck.maybe_issue`` is the known live instance: it mints and leases a
+    probe task outside the allocating claim paths. Harmless only while
+    ``spotcheck_rate`` is 0.0, which is the default; this check is what makes
+    turning it on fail loudly instead of quietly.
     """
     rows = conn.execute(
-        """SELECT worker_id, run_id, round_idx, COUNT(*) AS n,
-                  GROUP_CONCAT(id) AS ids
-           FROM tasks
-           WHERE status = 'leased' AND worker_id IS NOT NULL
-           GROUP BY worker_id, run_id, round_idx
-           HAVING n > 1"""
+        """SELECT t.id, t.worker_id
+             FROM tasks t
+            WHERE t.status = 'leased'
+              AND t.worker_id IS NOT NULL
+              AND NOT EXISTS (
+                    SELECT 1 FROM task_devices d
+                     WHERE d.task_id = t.id AND d.released_at IS NULL)"""
     ).fetchall()
     return [
         Violation(
-            "double_lease",
-            f"worker {r['worker_id']} holds {r['n']} leases in round "
-            f"{r['run_id']}#{r['round_idx']}",
-            (r["ids"] or "").split(","),
+            "lease_without_device",
+            f"task {r['id']} is leased to worker {r['worker_id']} but holds no "
+            "device; its card reads as free and the next claim will double-book it",
+            [r["id"]],
         )
         for r in rows
     ]
@@ -277,7 +291,7 @@ def check(
     """Every invariant, in one pass. An empty list means healthy."""
     now = now or datetime.now(timezone.utc)
     return [
-        *_one_lease_per_worker_per_round(conn),
+        *_every_lease_holds_a_device(conn),
         *_coverage_before_repetition(conn),
         *_no_stuck_leases(conn, now, lease_grace_sec),
         *_no_stuck_closes(conn, now, closing_grace_sec),

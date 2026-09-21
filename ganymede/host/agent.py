@@ -187,59 +187,70 @@ def reap_orphaned_jobs(config: HostConfig, *, runner=None, now=None) -> list[str
     lease behind it any more.
 
     The signal is the lease crumb the worker rewrites on every heartbeat
-    (``sandbox.write_lease_crumb``). Older than one lease means the coordinator
-    has already reclaimed the shard, so whatever the container is still
-    computing is work nobody will accept. The soft/hard distinction collapses
-    to hard here by construction -- there is nobody left to drain gracefully,
-    and the latency bound is one host-timer interval rather than one heartbeat.
+    (``sandbox.write_lease_crumb``), one per task since a host can run more
+    than one contained job at once. Every crumb on disk is weighed on its own:
+    older than one lease means the coordinator has already reclaimed that
+    shard, so whatever its container is still computing is work nobody will
+    accept. The soft/hard distinction collapses to hard here by construction
+    -- there is nobody left to drain gracefully, and the latency bound is one
+    host-timer interval rather than one heartbeat.
 
-    Returns the container names it killed, for the log line and the tests.
+    Returns the container names it killed, for the log line and the tests --
+    a sweep may kill more than one when more than one task has gone quiet.
     """
     from ganymede.worker import sandbox as sandbox_mod
 
     scratch = config.resolved_job_scratch_dir()
     if scratch is None:
         return []
-    crumb = sandbox_mod.read_lease_crumb(scratch)
-    container = (crumb or {}).get("container")
-    if not container:
-        return []
 
     now = now or datetime.now(timezone.utc)
-    try:
-        renewed = datetime.fromisoformat(str(crumb.get("renewed_at")))
-    except (TypeError, ValueError):
-        # An unparseable crumb is not evidence of a live lease. Treating it as
-        # stale is the fail-safe direction: the cost is killing a container
-        # that might have been fine, and the alternative is never killing one.
-        renewed = None
-    if renewed is not None:
-        if renewed.tzinfo is None:
-            renewed = renewed.replace(tzinfo=timezone.utc)
-        if (now - renewed).total_seconds() <= config.lease_seconds:
-            return []
-
     # sandbox's runner, not runtime's: this one answers a missing binary or a
     # wedged daemon with a return code, where runtime._run raises. The reaper
     # runs inside the tick's blanket except, so anything that raises here goes
     # to a log line and the backstop quietly stops working -- exactly the
     # failure it exists to prevent, one level up.
     run = runner or sandbox_mod._run
-    inspect = run([config.docker_bin, "inspect", "-f", "{{.State.Running}}",
-                   container], timeout=runtime_mod.DOCKER_TIMEOUT_SEC)
-    if inspect.returncode != 0 or (inspect.stdout or "").strip() != "true":
-        # Nothing running under that name: the crumb outlived its container,
-        # which is the normal end of a task that finished while the agent slept.
-        sandbox_mod.clear_lease_crumb(scratch)
-        return []
 
-    log.warning("job container %s outlived its worker's lease; killing", container)
-    run([config.docker_bin, "kill", container],
-        timeout=runtime_mod.DOCKER_TIMEOUT_SEC)
-    run([config.docker_bin, "rm", "-f", container],
-        timeout=runtime_mod.DOCKER_TIMEOUT_SEC)
-    sandbox_mod.clear_lease_crumb(scratch)
-    return [container]
+    killed: list[str] = []
+    for clear_key, crumb in sandbox_mod.read_all_lease_crumbs(scratch):
+        container = (crumb or {}).get("container")
+        if not container:
+            continue
+
+        try:
+            renewed = datetime.fromisoformat(str(crumb.get("renewed_at")))
+        except (TypeError, ValueError):
+            # An unparseable timestamp is not evidence of a live lease.
+            # Treating it as stale is the fail-safe direction: the cost is
+            # killing a container that might have been fine, and the
+            # alternative is never killing one. Decided per crumb -- one
+            # task's bad timestamp must not excuse another's.
+            renewed = None
+        if renewed is not None:
+            if renewed.tzinfo is None:
+                renewed = renewed.replace(tzinfo=timezone.utc)
+            if (now - renewed).total_seconds() <= config.lease_seconds:
+                continue
+
+        inspect = run([config.docker_bin, "inspect", "-f", "{{.State.Running}}",
+                       container], timeout=runtime_mod.DOCKER_TIMEOUT_SEC)
+        if inspect.returncode != 0 or (inspect.stdout or "").strip() != "true":
+            # Nothing running under that name: the crumb outlived its
+            # container, which is the normal end of a task that finished
+            # while the agent slept.
+            sandbox_mod.clear_lease_crumb(scratch, clear_key)
+            continue
+
+        log.warning("job container %s outlived its worker's lease; killing", container)
+        run([config.docker_bin, "kill", container],
+            timeout=runtime_mod.DOCKER_TIMEOUT_SEC)
+        run([config.docker_bin, "rm", "-f", container],
+            timeout=runtime_mod.DOCKER_TIMEOUT_SEC)
+        sandbox_mod.clear_lease_crumb(scratch, clear_key)
+        killed.append(container)
+
+    return killed
 
 
 def worker_env(config: HostConfig) -> dict[str, str]:

@@ -66,6 +66,12 @@ class TaskSpec:
     # step 5). A worker that cannot honour it abandons before downloading
     # anything rather than submitting an artifact from the wrong stack.
     required_image: str | None = None
+    # The device indices this lease actually holds on its worker (docs/14
+    # §5.4) -- what ``_task_payload`` serialises verbatim as ``devices:
+    # [int]``. Defaults to empty rather than ``[0]`` so a type that never
+    # heard of docs/14 (there is only one today) does not have to name a
+    # device it never allocated.
+    devices: list[int] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -165,7 +171,23 @@ class JobType(Protocol):
     # --- optional claim seam (docs/05 "Stage 1 reconciliation", docs/10 §3) ---
     # A type that omits both gets static plan() output and never returns 409.
     # They exist so claim_task's body and the RoundClosed path MOVE VERBATIM.
+    #
+    # ``free_devices`` / ``gpu_count`` / ``active_task_ids`` are docs/14 §5.3's
+    # additive kwargs: the generic walk computes the free set and validates
+    # ``gpu_count`` (``devices.allocate`` raises on a non-positive count, and
+    # an exception raised mid-walk would be a ``break``, so that check has to
+    # happen before this is ever called), then hands both through so the type
+    # can call ``ganymede.coordinator.devices.allocate`` itself, inside the
+    # same ``immediate()`` block that creates the lease -- the type owns its
+    # own transaction (docs/10 §3), so the generic walk cannot allocate on its
+    # behalf without reaching into it. ``collab_lora_finetune`` is the one
+    # implementation today; a future type adopts the same three kwargs rather
+    # than inventing its own allocation seam. All three default to "no
+    # devices, one required, nothing known" so a type that predates docs/14
+    # needs no change.
     def shape_claim(self, job: Any, profile: Any, settings: Any,
-                    conn: Any, now: Any) -> TaskSpec | ClaimRefusal: ...
+                    conn: Any, now: Any, *, free_devices: list[int],
+                    gpu_count: int = 1,
+                    active_task_ids: Any = None) -> TaskSpec | ClaimRefusal: ...
 
     def still_accepting(self, job: Any, task: Any, conn: Any) -> Any: ...

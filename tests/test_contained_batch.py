@@ -240,6 +240,30 @@ def test_a_shard_runs_end_to_end_through_the_sandbox(cfg):
     assert result.metrics["image_ref"] == "img1"
 
 
+def test_the_leases_devices_reach_the_container_launch(cfg):
+    """docs/14 §5.4's ``devices`` field on the task payload, threaded end to
+    end: ``ContainedTask.from_payload`` reads it off the task, and ``backend``
+    -- the *worker's*, not the task's -- comes in through ``run``'s own kwarg
+    the way ``worker.loop._run_contained`` supplies it from ``self.profile``.
+    The ``docker run`` argv the fake runtime actually saw must carry the
+    lease's own device, never 'all'."""
+    spec = _spec()
+    ts = cb_plan.plan(_job_row(spec), conn=None)[0]
+    task = _task(spec, ts, devices=[2])
+    runner = FakeRunner(on_start=_writes_output(cfg, task.task_id))
+
+    resolve("contained_batch").run(
+        task, InputRefs(artifacts={"shard": "http://store/shard"}, params={}),
+        None, None, config=cfg, runner=runner, download=_download,
+        upload=lambda b: None, sleep=lambda _s: None, backend="cuda",
+    )
+
+    run_argv = runner.argv_for("run")
+    assert run_argv is not None
+    assert "--gpus" in run_argv
+    assert run_argv[run_argv.index("--gpus") + 1] == '"device=2"'
+
+
 def test_the_archive_is_hashed_before_anything_loads_it(cfg):
     """docs/11 §2.3. ``docker load`` parses an archive the submitter controls,
     so running it on bytes that failed their check would be trusting the thing

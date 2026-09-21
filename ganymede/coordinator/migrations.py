@@ -646,6 +646,257 @@ def _m008_fairness(conn: sqlite3.Connection) -> None:
 
 
 # --------------------------------------------------------------------------
+# 009 -- multi-GPU hosts (docs/14). Schema only: this migration creates the
+# device ledger and backfills it against today's data, but nothing in the
+# codebase reads these tables yet -- the allocation logic, the claim-path
+# changes, the worker changes and the API changes are later steps. Every new
+# column defaults to 1 / uncapped, which is "nothing has changed" for a fleet
+# of single-GPU hosts, following 008's own inertness discipline.
+# --------------------------------------------------------------------------
+
+_M009_TABLES = [
+    # Per-device inventory (docs/14 §2, §3). Device enumeration -- populating
+    # device_index > 0 for a real multi-GPU box -- is a later step; this table
+    # exists now so ``task_devices`` and ``device_reservations`` have somewhere
+    # to point, and so the worker backfill below has somewhere to land.
+    # ``retired_at`` is NULL for a live device; nothing sets it yet.
+    """
+    CREATE TABLE IF NOT EXISTS worker_devices (
+        worker_id          TEXT    NOT NULL REFERENCES workers(id),
+        device_index       INTEGER NOT NULL,
+        device_name        TEXT    NOT NULL,
+        vram_mb            INTEGER NOT NULL,
+        compute_capability TEXT,
+        supports_json      TEXT    NOT NULL DEFAULT '[]',
+        alloc_max_mb       INTEGER,
+        bench_score        REAL,
+        retired_at         TEXT,
+        PRIMARY KEY (worker_id, device_index)
+    )
+    """,
+    # The allocation ledger (docs/14 §1, §3-4). Append-only: a release stamps
+    # ``released_at`` rather than deleting the row, so one table carries both
+    # the invariant (via the partial unique index below) and the per-device
+    # utilisation history. Nothing allocates through this table yet -- that is
+    # the later allocation-logic step -- except the live-lease backfill below,
+    # which has to run inside this migration: a migration that leaves an
+    # in-flight lease unaccounted lets the very next claim double-book the card
+    # that task is already holding.
+    #
+    # The key is a surrogate rowid, deliberately, and NOT ``(task_id,
+    # device_index)``. Task ids are recycled: ``_claim_static_task`` re-leases
+    # the *same* ``tasks`` row after an expiry, an abandon or a preemption
+    # (``UPDATE tasks SET status='leased' ... WHERE id = ?``) rather than
+    # minting a new id. A task that lands on the same device twice therefore
+    # produces two legitimate rows for one (task, device) pair -- one released,
+    # one live -- and a composite key over those columns would reject the
+    # second allocation with an IntegrityError. History has no natural key
+    # here; the *invariant* lives entirely in the partial unique index below,
+    # which is the only uniqueness this table should enforce.
+    """
+    CREATE TABLE IF NOT EXISTS task_devices (
+        id             INTEGER PRIMARY KEY,
+        task_id        TEXT    NOT NULL REFERENCES tasks(id),
+        worker_id      TEXT    NOT NULL REFERENCES workers(id),
+        device_index   INTEGER NOT NULL,
+        allocated_at   TEXT    NOT NULL,
+        released_at    TEXT,
+        release_reason TEXT
+    )
+    """,
+    # docs/14 §6: a blocked wide job accumulates a reservation on devices as
+    # they free, with a TTL so a dead job cannot hold cards forever. Nothing
+    # writes here yet -- the reservation logic is a later step -- but the
+    # primary key is the per-device half of §6's uniqueness requirement. The
+    # other half ("at most one job may hold reservations on a given worker at
+    # a time") is not a key constraint and is enforced in that later step's
+    # application logic, not here.
+    """
+    CREATE TABLE IF NOT EXISTS device_reservations (
+        worker_id    TEXT    NOT NULL REFERENCES workers(id),
+        device_index INTEGER NOT NULL,
+        job_id       TEXT    NOT NULL REFERENCES jobs(id),
+        reserved_at  TEXT    NOT NULL,
+        expires_at   TEXT    NOT NULL,
+        PRIMARY KEY (worker_id, device_index)
+    )
+    """,
+]
+
+_M009_INDEXES = [
+    # The load-bearing invariant of the whole feature (docs/14 §1, §3): at most
+    # one *unreleased* row per (worker, device), enforced by SQLite rather than
+    # by application logic, so two concurrent claims cannot double-book a card
+    # even if the free-set computation that led to them raced. A released row
+    # (``released_at IS NOT NULL``) drops out of the index and stops occupying
+    # the slot while staying on the record -- many released rows for the same
+    # device are fine and expected.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_devices_busy "
+    "ON task_devices(worker_id, device_index) WHERE released_at IS NULL",
+    # The operator / ledger read path (docs/14 §4 ``device_history``).
+    "CREATE INDEX IF NOT EXISTS idx_task_devices_history "
+    "ON task_devices(worker_id, allocated_at)",
+    # ``devices.release`` looks a task's live rows up by task id on every
+    # terminal path -- submit, abandon, expire, cancel, preempt -- and neither
+    # index above can serve that. Partial on the same predicate as
+    # ``idx_task_devices_busy``, so it stays the size of the *currently held*
+    # set rather than growing with the append-only history behind it: the one
+    # index here that would otherwise get slower every day the fleet runs
+    # (§8.3 anticipates pruning that history, but nothing prunes it yet).
+    "CREATE INDEX IF NOT EXISTS idx_task_devices_live "
+    "ON task_devices(task_id) WHERE released_at IS NULL",
+]
+
+
+def _int_or(value: object, default: int) -> int:
+    """Coerce a JSON-decoded value to ``int``, falling back rather than
+    raising. A probe field that is present but the wrong shape (a string that
+    is not a number, a bool, a list) must not abort a migration that runs on
+    every coordinator startup (``db.init_schema`` -> ``apply_pending``)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _backfill_worker_devices(conn: sqlite3.Connection) -> None:
+    """One synthesized ``worker_devices`` row at ``device_index = 0`` per
+    existing worker (docs/14 §3), built from its flat ``compute_profile_json``
+    -- the shape ``worker/probe.py``'s ``run_probe`` produces: ``device_name``,
+    ``vram_mb``, ``compute_capability`` and ``supports`` at the top level,
+    ``alloc_max_mb`` / ``bench_score`` nested under ``probe``.
+
+    A worker whose profile is missing, not JSON, or not an object falls back
+    to the exact pair ``run_probe`` itself uses when its own ``describe()``
+    call raises (``probe.py``: ``"backend:unknown"``-shaped name, ``vram_mb``
+    0) -- a name that reads as unknown rather than a fabricated one, and zero
+    VRAM, which is fail-closed in the same sense docs/14 §2 invokes for a
+    concurrent probe: it makes the worker ineligible for work rather than
+    silently inventing capacity that may not exist.
+
+    ``INSERT OR IGNORE`` against the ``(worker_id, device_index)`` primary key
+    makes this safe to call more than once against the same database -- the
+    runner's idempotency requirement (re-running ``apply_pending`` on an
+    up-to-date database is a no-op) -- without needing this function to first
+    check what ``_m009_multi_gpu_hosts`` already guarantees by construction.
+    Mirrors the same defensiveness as the ``task_devices`` insert below.
+    """
+    for row in conn.execute(
+        "SELECT id, compute_profile_json FROM workers"
+    ).fetchall():
+        try:
+            profile = json.loads(row["compute_profile_json"])
+            if not isinstance(profile, dict):
+                profile = {}
+        except (TypeError, ValueError):
+            profile = {}
+        probe = profile.get("probe")
+        if not isinstance(probe, dict):
+            probe = {}
+        supports = profile.get("supports")
+        if not isinstance(supports, list):
+            supports = []
+        device_name = profile.get("device_name")
+        if not isinstance(device_name, str) or not device_name:
+            device_name = "unknown"
+        conn.execute(
+            """INSERT OR IGNORE INTO worker_devices
+                 (worker_id, device_index, device_name, vram_mb,
+                  compute_capability, supports_json, alloc_max_mb, bench_score)
+               VALUES (?, 0, ?, ?, ?, ?, ?, ?)""",
+            (row["id"], device_name, _int_or(profile.get("vram_mb"), 0),
+             profile.get("compute_capability"), json.dumps(supports),
+             probe.get("alloc_max_mb"), probe.get("bench_score")),
+        )
+
+
+def _backfill_task_devices(conn: sqlite3.Connection) -> None:
+    """One ``task_devices`` row at ``device_index = 0`` per currently-``leased``
+    task (docs/14 §3) -- required for correctness, not tidiness: a migration
+    that leaves a live lease unaccounted lets the very next claim double-book
+    the card that task is already holding.
+
+    ``allocated_at`` is taken from ``tasks.leased_at``, not this migration's
+    own clock, so the history this table starts is honest about when the
+    lease actually began. ``leased_at`` can be NULL -- migration 008
+    backfills it from ``created_at`` for every non-``planned`` row at the
+    moment 008 runs, but that is a point-in-time backfill, not a constraint,
+    so a row that reaches ``leased`` status afterward without ever setting
+    ``leased_at`` is possible in principle. ``COALESCE(leased_at, created_at)``
+    is 008's own fallback for exactly this gap, and ``tasks.created_at`` is
+    ``NOT NULL``, so the COALESCE can never itself be NULL going into
+    ``task_devices.allocated_at TEXT NOT NULL``.
+
+    Only ``status = 'leased'`` rows hold a device. A preempted task (docs/13
+    §4: ``preempt_mode`` set, or ``status = 'preempted'`` after
+    ``expire_leases``) has already given its card back and is waiting to be
+    re-claimed, not holding one.
+
+    Decision 4 (docs/07 §1, superseded by docs/14 §1) -- "a machine holds at
+    most one leased task" -- was an application-level invariant, not a
+    database one (see ``invariants.py``, which exists because it can be
+    violated), so a pre-existing double-book on one worker is possible in
+    principle. Two such rows would both target ``(worker_id, 0)``; ordering by
+    the same ``COALESCE(leased_at, created_at)`` used for ``allocated_at``,
+    then ``id``, makes the earlier lease win deterministically, and
+    ``INSERT OR IGNORE`` -- backed by ``idx_task_devices_busy`` -- silently
+    drops the second rather than raising. Refusing to open the database over a
+    pre-existing anomaly would be worse than surfacing it as a dark second
+    card, which is exactly what docs/14 §4's "the row that never got its
+    released_at names the task that failed to release" is for once someone
+    reads the ledger.
+
+    ``worker_id IS NOT NULL`` is required because ``tasks.worker_id`` is
+    nullable but ``task_devices.worker_id`` is not -- a ``leased`` row with no
+    worker is already a data anomaly this migration should not be the one to
+    raise on.
+    """
+    rows = conn.execute(
+        """SELECT id, worker_id, leased_at, created_at FROM tasks
+            WHERE status = 'leased' AND worker_id IS NOT NULL
+            ORDER BY COALESCE(leased_at, created_at), id"""
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            """INSERT OR IGNORE INTO task_devices
+                 (task_id, worker_id, device_index, allocated_at)
+               VALUES (?, ?, 0, ?)""",
+            (row["id"], row["worker_id"], row["leased_at"] or row["created_at"]),
+        )
+
+
+def _m009_multi_gpu_hosts(conn: sqlite3.Connection) -> None:
+    with immediate(conn):
+        for stmt in _M009_TABLES:
+            conn.execute(stmt)
+        for stmt in _M009_INDEXES:
+            conn.execute(stmt)
+
+        # docs/14 §3. A job/task defaults to one GPU, and a submitter defaults
+        # to uncapped -- both "nothing has changed" for every job and every
+        # submitter that already exists, matching 008's own inertness
+        # discipline for its additive columns.
+        if "gpu_count" not in _columns(conn, "jobs"):
+            conn.execute(
+                "ALTER TABLE jobs ADD COLUMN gpu_count INTEGER NOT NULL DEFAULT 1"
+            )
+        if "gpu_count" not in _columns(conn, "tasks"):
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN gpu_count INTEGER NOT NULL DEFAULT 1"
+            )
+        if "max_concurrent_gpus" not in _columns(conn, "submitter_quotas"):
+            conn.execute(
+                "ALTER TABLE submitter_quotas "
+                "ADD COLUMN max_concurrent_gpus INTEGER"
+            )
+
+        _backfill_worker_devices(conn)
+        _backfill_task_devices(conn)
+
+        _record(conn, 9)
+
+
+# --------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------
 
@@ -658,6 +909,7 @@ MIGRATIONS: list[tuple[int, str, Migration]] = [
     (6, "contributor_agreement", _m006_contributor_agreement),
     (7, "job_terminal_at", _m007_job_terminal_at),
     (8, "fairness", _m008_fairness),
+    (9, "multi_gpu_hosts", _m009_multi_gpu_hosts),
 ]
 
 

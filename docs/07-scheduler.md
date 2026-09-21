@@ -85,6 +85,14 @@ commits). Freeze this ordering — a later tidy-up of the loop is what breaks it
 
 ### One lease per machine (Decision 4) — explicit
 
+> **Superseded by `14`.** Decision 4 is replaced by *a device holds at most one
+> task*: a worker registers a device inventory and may hold several leases whose
+> device sets do not overlap. What Decision 4 was actually protecting — an
+> uncontended, therefore meaningful, `calibration.json` throughput number — survives
+> intact, because contention was always about the card and never about the chassis.
+> The rest of this section describes the pre-`14` behaviour and is kept because the
+> re-serve and expiry reasoning below is unchanged.
+
 **Invariant: a machine holds at most one `leased` task across all jobs.**
 
 - Cheap pre-check in `app.py` before the walk:
@@ -101,7 +109,9 @@ commits). Freeze this ordering — a later tidy-up of the loop is what breaks it
   resumes; it never forks a second task.
 - Consequence (invariant 3): the scheduler never puts a second task on a busy
   host, so `calibration.json`'s throughput number stays meaningful. MPS/MIG
-  partitioning stays out of scope.
+  partitioning stays out of scope. **Under `14` the second clause still holds —
+  whole devices only — while the first narrows to "never a second task on a busy
+  *device*", which is what made the throughput number meaningful in the first place.**
 - `rounds.expire_leases` unchanged — a crashed holder's task returns to the pool.
 
 ---

@@ -135,31 +135,71 @@ def expire_leases(conn: sqlite3.Connection, now: datetime | None = None) -> int:
     Order matters: preempted first, then cancelled, then the rest. A task that is
     both preempted and on a cancelled job is *cancelled* -- the job going away
     outranks a scheduling decision about it -- so the preempt arm excludes those.
+
+    All three outcomes release the device(s) the reclaimed task held (docs/14
+    §5.5), each with its own ``release_reason`` -- an unreleased row here is
+    exactly the permanently-dark card the ledger exists to prevent, since
+    ``expire_leases`` is the *only* path that reclaims a lease nobody
+    voluntarily gave back. Selecting the affected ids before each ``UPDATE``
+    (rather than reading ``rowcount``) is what makes that possible: a bulk
+    sweep can reclaim many workers' tasks in one call, and ``devices.release``
+    takes one task id at a time. ``devices`` is imported lazily -- it imports
+    ``_iso`` / ``utcnow`` from this module, so an import at module level here
+    would be circular.
     """
+    from ganymede.coordinator import devices as devices_mod
+
     now = now or utcnow()
     with immediate(conn):
-        preempted = conn.execute(
-            """UPDATE tasks SET status = 'preempted', lease_expires_at = NULL,
-                                worker_id = NULL, preempt_mode = NULL
-               WHERE status = 'leased' AND lease_expires_at IS NOT NULL
-                 AND lease_expires_at < ? AND preempt_mode IS NOT NULL
-                 AND job_id NOT IN (SELECT id FROM jobs WHERE status = 'cancelled')""",
+        preempted_ids = [r["id"] for r in conn.execute(
+            """SELECT id FROM tasks
+                WHERE status = 'leased' AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < ? AND preempt_mode IS NOT NULL
+                  AND job_id NOT IN (SELECT id FROM jobs WHERE status = 'cancelled')""",
             (_iso(now),),
-        ).rowcount
-        cancelled = conn.execute(
-            """UPDATE tasks SET status = 'cancelled', lease_expires_at = NULL
-               WHERE status = 'leased' AND lease_expires_at IS NOT NULL
-                 AND lease_expires_at < ?
-                 AND job_id IN (SELECT id FROM jobs WHERE status = 'cancelled')""",
+        ).fetchall()]
+        if preempted_ids:
+            conn.execute(
+                """UPDATE tasks SET status = 'preempted', lease_expires_at = NULL,
+                                    worker_id = NULL, preempt_mode = NULL
+                    WHERE id IN (%s)""" % ",".join("?" * len(preempted_ids)),
+                preempted_ids,
+            )
+            for tid in preempted_ids:
+                devices_mod.release(conn, tid, "preempted")
+
+        cancelled_ids = [r["id"] for r in conn.execute(
+            """SELECT id FROM tasks
+                WHERE status = 'leased' AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < ?
+                  AND job_id IN (SELECT id FROM jobs WHERE status = 'cancelled')""",
             (_iso(now),),
-        ).rowcount
-        expired = conn.execute(
-            """UPDATE tasks SET status = 'expired'
-               WHERE status = 'leased' AND lease_expires_at IS NOT NULL
-                 AND lease_expires_at < ?""",
+        ).fetchall()]
+        if cancelled_ids:
+            conn.execute(
+                """UPDATE tasks SET status = 'cancelled', lease_expires_at = NULL
+                    WHERE id IN (%s)""" % ",".join("?" * len(cancelled_ids)),
+                cancelled_ids,
+            )
+            for tid in cancelled_ids:
+                devices_mod.release(conn, tid, "cancelled")
+
+        expired_ids = [r["id"] for r in conn.execute(
+            """SELECT id FROM tasks
+                WHERE status = 'leased' AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < ?""",
             (_iso(now),),
-        ).rowcount
-        return preempted + cancelled + expired
+        ).fetchall()]
+        if expired_ids:
+            conn.execute(
+                """UPDATE tasks SET status = 'expired'
+                    WHERE id IN (%s)""" % ",".join("?" * len(expired_ids)),
+                expired_ids,
+            )
+            for tid in expired_ids:
+                devices_mod.release(conn, tid, "expired")
+
+        return len(preempted_ids) + len(cancelled_ids) + len(expired_ids)
 
 
 def heartbeat(
@@ -239,7 +279,21 @@ def abandon(conn: sqlite3.Connection, task_id: str, worker_id: str) -> str:
     ``immediate()`` -- so reading outside leaves a window where a job cancel
     lands between them and the task ends up ``preempted`` (non-terminal) on a
     job that is now terminal. Nothing would ever clear it.
+
+    Releases the device(s) this lease held, with ``release_reason`` set to
+    whichever of the three outcomes this call landed on (docs/14 §5.5) --
+    gated on the ``UPDATE``'s own ``rowcount`` rather than called
+    unconditionally, because ``devices.release`` filters by task id alone,
+    not by worker id: if the ``WHERE worker_id = ? AND status = 'leased'``
+    clause matched nothing (this call lost a race, or is being retried after
+    it already took effect), the task id may by now belong to a *different*
+    lease of the same row (docs/14 §3 -- ids are recycled), and releasing
+    unconditionally would tear down that unrelated holder's allocation.
+    ``devices`` is imported lazily for the same circular-import reason
+    ``expire_leases`` gives.
     """
+    from ganymede.coordinator import devices as devices_mod
+
     with immediate(conn):
         job_cancelled = conn.execute(
             """SELECT 1 FROM tasks t JOIN jobs j ON j.id = t.job_id
@@ -253,18 +307,20 @@ def abandon(conn: sqlite3.Connection, task_id: str, worker_id: str) -> str:
         else:
             status = "abandoned"
         if status == "preempted":
-            conn.execute(
+            changed = conn.execute(
                 """UPDATE tasks SET status = 'preempted', lease_expires_at = NULL,
                                     worker_id = NULL, preempt_mode = NULL
                    WHERE id = ? AND worker_id = ? AND status = 'leased'""",
                 (task_id, worker_id),
-            )
+            ).rowcount
         else:
-            conn.execute(
+            changed = conn.execute(
                 """UPDATE tasks SET status = ?, lease_expires_at = NULL
                    WHERE id = ? AND worker_id = ? AND status = 'leased'""",
                 (status, task_id, worker_id),
-            )
+            ).rowcount
+        if changed:
+            devices_mod.release(conn, task_id, status)
     return status
 
 
@@ -283,7 +339,19 @@ def record_submission(
     Submission and gating are deliberately separate: the bytes are durably
     recorded before any validation runs, so a coordinator crash inside the
     gates cannot lose work a worker already did.
+
+    Releases the device(s) this lease held, reason ``submitted`` (docs/14
+    §5.5) -- unconditionally, unlike ``abandon``: by this point the two
+    ``LeaseLost`` checks above have already confirmed, inside this same
+    transaction, that ``task_id`` is *this* worker's live ``leased`` row, so
+    there is no race window left for the release to misfire against a
+    different holder. Whether the submission is later accepted or rejected is
+    a separate question this function does not answer (module docstring) --
+    the device is freed either way, because the worker is done with it either
+    way. ``devices`` is imported lazily; see ``expire_leases`` for why.
     """
+    from ganymede.coordinator import devices as devices_mod
+
     now = now or utcnow()
     with immediate(conn):
         task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -308,6 +376,7 @@ def record_submission(
             "UPDATE tasks SET status = 'submitted', lease_expires_at = NULL WHERE id = ?",
             (task_id,),
         )
+        devices_mod.release(conn, task_id, "submitted")
         conn.execute(
             "UPDATE workers SET steps_total = steps_total + ?, last_seen = ? WHERE id = ?",
             (steps_completed, _iso(now), worker_id),

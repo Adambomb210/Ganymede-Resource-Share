@@ -182,6 +182,14 @@ class HostConfig:
     user_idle_sec: int = DEFAULT_USER_IDLE_SEC
     # A worker of somebody else's on the GPU means this machine is busy. Off
     # only for the deliberate case of two workers sharing a large card.
+    #
+    # On a multi-GPU host (docs/14 §9) this is now a per-device question
+    # underneath: the worker is allowed to start as long as *at least one*
+    # card has no foreign process on it, not only when *every* card does.
+    # One card occupied by the contributor's own game no longer parks the
+    # whole donated box idle -- see ``host/idle.py``'s ``_gpu_busy``. A
+    # single-GPU host sees no change at all: one busy card is the only card,
+    # so "any" and "every" are the same question there.
     require_gpu_free: bool = True
     # Optional local-time window, "23:00-07:00". Empty means any hour.
     active_window: str = ""

@@ -380,7 +380,8 @@ def test_a_failed_probe_is_not_recycled_as_ordinary_work(conn, store, job, worke
         spotcheck_rate = 0.0
         lease_duration_sec = 900
 
-    spec, _ = _claim_static_task(conn, _JT(), store, job, worker("c"), _Off())
+    spec, _ = _claim_static_task(conn, _JT(), store, job, worker("c"), _Off(),
+                                 free_devices=[0])
     assert spec is None
 
 

@@ -176,6 +176,19 @@ class Settings:
     # (docs/13 §6). The one numerically live switch in Phase D, which is why it
     # is the one with a golden-trace test behind it.
     reputation_weighted_agg: bool = False
+    # --- Multi-GPU hosts: reservation with backfill (docs/14 §6). ---
+    # How long a blocked wide job's device reservation survives without being
+    # refreshed. A blocked job re-reserves on every poll that still refuses it
+    # (``free_devices`` sees through a job's own reservation, so its free set
+    # is never empty once it holds one, which is what keeps the gate refusing
+    # and re-reserving every time) -- so this only has to outlive the *gap*
+    # between two polls of the same worker, not the whole time the job spends
+    # accumulating devices. Five times ``poll_interval_sec``'s default (60s)
+    # is generous against ordinary network jitter and a slow poll cycle, and
+    # still short against ``lease_duration_sec`` (900s): a wide job that dies
+    # mid-accumulation dark-cards its reserved devices for at most a few
+    # minutes, not the better part of a lease.
+    device_reservation_ttl_sec: int = 300
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -215,5 +228,8 @@ class Settings:
             spotcheck_rate=_env_float("GANYMEDE_SPOTCHECK_RATE", 0.0),
             reputation_weighted_agg=_env_bool(
                 "GANYMEDE_REPUTATION_WEIGHTED_AGG", False
+            ),
+            device_reservation_ttl_sec=_env_int(
+                "GANYMEDE_DEVICE_RESERVATION_TTL_SEC", 300
             ),
         )

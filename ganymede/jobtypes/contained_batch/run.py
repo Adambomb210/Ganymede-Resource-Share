@@ -68,6 +68,14 @@ class ContainedTask:
     image_digest: str | None
     image_pull_url: str | None
     max_runtime_sec: int | None = None
+    # The device indices this lease actually holds (docs/14 §5.4), threaded
+    # through to ``sandbox.JobContainer.start`` so the container is pinned to
+    # exactly them rather than however ``SandboxConfig.gpus`` happens to be
+    # set. Defaults to ``[]``, matching ``jobtypes.base.TaskSpec.devices`` --
+    # a payload built before docs/14 (or by hand, as several tests here do)
+    # simply never named one, which ``sandbox.device_argv`` treats as nothing
+    # to pin rather than a refusal.
+    devices: list[int] = field(default_factory=list)
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "ContainedTask":
@@ -94,6 +102,7 @@ class ContainedTask:
             image_digest=payload.get("image_digest"),
             image_pull_url=payload.get("image_pull_url"),
             max_runtime_sec=payload.get("max_runtime_sec"),
+            devices=payload.get("devices") or [],
         )
 
 
@@ -224,6 +233,7 @@ def run(
     upload: Callable[[bytes], None] | None = None,
     poll_sec: float = DEFAULT_POLL_SEC,
     sleep: Callable[[float], None] | None = None,
+    backend: str | None = None,
 ) -> ContainedResult:
     """Run one shard inside the submitter's image.
 
@@ -231,6 +241,12 @@ def run(
     injection points, in the repo's established style: left ``None`` they
     resolve the environment's ``SandboxConfig``, shell out to the configured
     runtime binary, and use the presigned URLs on ``inputs``.
+
+    ``backend`` is the *worker's* compute backend (``cuda`` / ``rocm`` / ...),
+    not part of ``task`` -- it describes the machine, not the lease, the same
+    way ``worker.loop._run_contained`` reads it off ``self.profile`` rather
+    than off the task payload. It is combined with ``task.devices`` (which
+    *is* per-lease) to pin the container -- see ``sandbox.device_argv``.
     """
     from ganymede.worker import sandbox
 
@@ -285,7 +301,8 @@ def run(
         archive.unlink(missing_ok=True)
 
         # -- run ----------------------------------------------------------
-        job.start(image_id, max_runtime_sec=task.max_runtime_sec)
+        job.start(image_id, max_runtime_sec=task.max_runtime_sec,
+                 backend=backend, devices=task.devices)
         signal = _supervise(job, scratch, on_step, should_stop, poll_sec, sleep)
         if signal is not None:
             # Cancelled. Nothing is uploaded: a partial output is shorter than

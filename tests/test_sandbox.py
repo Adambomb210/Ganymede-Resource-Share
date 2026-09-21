@@ -69,6 +69,29 @@ def _flag_values(argv: list[str], flag: str) -> list[str]:
 
 
 # ==========================================================================
+# The container name (shared by JobContainer, the heartbeat thread's cancel
+# handler, and the lease crumb -- three places that must agree on a name
+# without sharing an instance)
+# ==========================================================================
+
+
+def test_container_name_for_is_deterministic_from_the_task_id_alone():
+    assert sandbox.container_name_for("task-abcdef123456") == \
+        sandbox.container_name_for("task-abcdef123456")
+    assert sandbox.container_name_for("task-abcdef123456").startswith("ganymede-job-")
+
+
+def test_a_job_container_names_itself_the_same_way(config):
+    """The name ``loop.Worker._run_contained`` computes for a cancel, and the
+    name a lease crumb records, must be the exact name a freshly constructed
+    ``JobContainer`` (never given one explicitly) picks for itself -- they are
+    never the same instance."""
+    job = sandbox.JobContainer(task_id="task-abcdef123456", config=config,
+                               runner=FakeRunner())
+    assert job.container_name == sandbox.container_name_for("task-abcdef123456")
+
+
+# ==========================================================================
 # The flag template (docs/11 §2.2, §2.3, §2.4)
 # ==========================================================================
 
@@ -175,6 +198,129 @@ def test_gpus_can_be_withheld(config):
         "t", sandbox.SandboxConfig(scratch_root=config.scratch_root, gpus=None),
         runner=FakeRunner())
     assert "--gpus" not in job.run_argv("img")
+
+
+def test_an_explicit_empty_override_withholds_gpus_even_with_devices(config):
+    """``gpus=None`` (above) means "no override, defer to the lease". An
+    explicit empty string is a different thing -- an operator who set
+    ``GANYMEDE_JOB_GPUS=`` on purpose -- and it wins over a real lease
+    allocation exactly like a non-empty override would, just withholding
+    rather than granting."""
+    job = sandbox.JobContainer(
+        "t", sandbox.SandboxConfig(scratch_root=config.scratch_root, gpus=""),
+        runner=FakeRunner())
+    assert "--gpus" not in job.run_argv("img", backend="cuda", devices=[0])
+
+
+# ==========================================================================
+# Backend-aware container device pinning (docs/14 §2)
+# ==========================================================================
+
+
+@pytest.mark.parametrize("backend,indices,expected", [
+    ("cuda", [1], ["--gpus", '"device=1"']),
+    ("cuda", [1, 2, 3], ["--gpus", '"device=1,2,3"']),
+    ("cuda", [3, 1, 2], ["--gpus", '"device=1,2,3"']),  # sorted regardless of input order
+    ("rocm", [1], ["--device=/dev/kfd", "--device=/dev/dri/renderD129",
+                   "--group-add", "video"]),
+    ("rocm", [0, 1], ["--device=/dev/kfd", "--device=/dev/dri/renderD128",
+                      "--device=/dev/dri/renderD129", "--group-add", "video"]),
+    ("xpu", [0], ["--device=/dev/dri/renderD128"]),
+    ("xpu", [0, 2], ["--device=/dev/dri/renderD128", "--device=/dev/dri/renderD130"]),
+    ("cpu", [0], []),
+    ("cpu", [0, 1], []),  # GANYMEDE_CPU_SLOTS > 1: no real core mapping to pin to.
+])
+def test_device_argv_matches_docs_14s_table(backend, indices, expected):
+    assert sandbox.device_argv(backend, indices) == expected
+
+
+def test_device_argv_is_a_noop_with_nothing_to_pin():
+    """Unreachable for a real lease (``devices.allocate`` raises on
+    ``count <= 0``), but reachable from a payload built before docs/14 landed
+    -- must not invent a pin for a device that was never named."""
+    assert sandbox.device_argv("cuda", []) == []
+
+
+def test_device_argv_refuses_mps_with_a_device_to_pin():
+    """mps is always exactly one device and its in-process pin is a correct
+    no-op (``loop._pin_env`` returns ``{}``), but a container has no way to
+    reach that device at all -- Docker Desktop for Mac has no Metal
+    passthrough. Unlike the in-process case, there is no safe unpinned
+    fallback here, so this refuses rather than silently start a GPU-less
+    container."""
+    assert sandbox.device_argv("mps", [0]) is None
+
+
+def test_device_argv_refuses_an_unrecognised_backend_with_devices_to_pin():
+    """docs/14 §2: a backend with no known pinning form refuses to launch
+    rather than falling back to 'all devices'."""
+    assert sandbox.device_argv("some_future_backend", [0, 1]) is None
+
+
+def test_a_single_device_host_pins_to_that_one_device(config):
+    """Backward compatibility: the overwhelmingly common case (one card, one
+    lease) must end up with exactly that device, not 'all'."""
+    job = sandbox.JobContainer("t", config, runner=FakeRunner())
+    argv = job.run_argv("img", backend="cuda", devices=[0])
+    assert _flag_value(argv, "--gpus") == '"device=0"'
+
+
+def test_a_host_that_never_reports_devices_still_starts(config):
+    """A payload with no ``devices`` field at all -- an old coordinator, or a
+    job type that never named one -- must not crash and must not refuse.
+
+    On a discrete backend it also must not quietly hand over *nothing*: an
+    absent field means the coordinator predates docs/14, that coordinator is
+    still enforcing one lease per machine, and ``all`` is both safe and what
+    this host used to get. ``None`` and ``[]`` are the same case and take the
+    same path.
+    """
+    job = sandbox.JobContainer("t", config, runner=FakeRunner())
+    argv = job.run_argv("img", backend="cuda", devices=None)
+    assert _flag_value(argv, "--gpus") == "all"
+
+
+def test_an_unpinnable_backend_refuses_to_start_rather_than_run_unconfined(config):
+    """The container-launch fail-closed rule, exercised through ``start`` --
+    not just ``device_argv`` in isolation. Landing here as ``SandboxError``
+    matters: ``worker.loop._run_contained`` catches exactly that type and
+    abandons-and-backs-off, which is the correct handling for "this host
+    cannot run this safely" (a new exception type would fall through to the
+    abandon-and-*reraise* handler and take the worker down)."""
+    job = sandbox.JobContainer("t", config, runner=FakeRunner())
+    with pytest.raises(sandbox.SandboxError):
+        job.run_argv("img", backend="mps", devices=[0])
+
+
+def test_an_operator_override_wins_over_the_leases_own_devices(config, caplog):
+    """docs/14 §2 keeps ``GANYMEDE_JOB_GPUS`` as an operator escape hatch --
+    the same relationship every other ``SandboxConfig`` field has to the task
+    (``job_max_runtime_sec`` clamps, never the reverse). Trusting it is a
+    deliberate, logged act: setting it on a multi-lease host can re-open the
+    double-booking docs/14 exists to prevent, so it is not silent."""
+    override = sandbox.JobContainer(
+        "t", sandbox.SandboxConfig(scratch_root=config.scratch_root, gpus="all"),
+        runner=FakeRunner())
+    with caplog.at_level("WARNING"):
+        argv = override.run_argv("img", backend="cuda", devices=[2, 3])
+    assert _flag_value(argv, "--gpus") == "all"
+    assert any("GANYMEDE_JOB_GPUS" in r.message for r in caplog.records)
+
+
+def test_pinned_argv_keeps_every_confinement_flag(config):
+    """``device_argv`` adds flags; it must never come at the cost of the
+    §4.6 baseline this file's other tests check one at a time. A golden argv
+    would be rewritten by whoever next adds a flag -- exactly the edit that
+    must not silently drop one of these -- so they are asserted individually,
+    against the *pinned* path specifically, which is easy to exercise only in
+    isolation and never as the integrated argv a real multi-GPU host sends."""
+    job = sandbox.JobContainer("t", config, runner=FakeRunner())
+    argv = job.run_argv("img", backend="cuda", devices=[0, 1])
+    for flag in ("--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only"):
+        assert flag in argv, f"{flag} missing from the pinned path"
+    assert _flag_value(argv, "--user") == f"{sandbox.CONTAINER_UID}:{sandbox.CONTAINER_UID}"
+    assert _flag_value(argv, "--network") == "none"
+    assert _flag_value(argv, "--gpus") == '"device=0,1"'
 
 
 # ==========================================================================
@@ -290,6 +436,23 @@ def test_a_shorter_grace_can_be_forced(config):
     assert _flag_value(runner.argv_for("stop"), "--time") == "5"
 
 
+def test_cancelling_a_container_that_does_not_exist_yet_does_not_raise(config):
+    """A cancel latched on the heartbeat thread can land before ``jt.run`` has
+    called ``start`` -- during the archive pull, which has no should_stop
+    check of its own. ``docker kill``/``stop`` on an unknown name is a nonzero
+    exit, not a subprocess error, and ``cancel`` never inspects the return
+    code -- so acting early must be a harmless no-op, never a raise out of the
+    caller (the worker's heartbeat thread, for ``loop.Worker._run_contained``'s
+    ``on_cancel``)."""
+    runner = FakeRunner({
+        "kill": sandbox.Completed(returncode=1, stderr="Error: No such container"),
+        "stop": sandbox.Completed(returncode=1, stderr="Error: No such container"),
+    })
+    job = sandbox.JobContainer("never-started", config, runner=runner)
+    job.cancel("hard")  # must not raise
+    job.cancel("soft")  # must not raise
+
+
 # ==========================================================================
 # The capability report (docs/11 §4)
 # ==========================================================================
@@ -322,7 +485,7 @@ def test_detect_runtime_survives_a_missing_binary():
 
 def test_the_crumb_round_trips(tmp_path):
     sandbox.write_lease_crumb(tmp_path, "task1", "2026-09-07T00:00:00+00:00", "c1")
-    crumb = sandbox.read_lease_crumb(tmp_path)
+    crumb = sandbox.read_lease_crumb(tmp_path, "task1")
     assert crumb["task_id"] == "task1"
     assert crumb["container"] == "c1"
 
@@ -331,19 +494,35 @@ def test_the_crumb_is_written_atomically(tmp_path):
     """The host agent reads this file on a timer with no locking. A partial
     write would parse as a missing crumb and reap a live job."""
     sandbox.write_lease_crumb(tmp_path, "task1", "2026-09-07T00:00:00+00:00", "c1")
+    sandbox.write_lease_crumb(tmp_path, "task1", "2026-09-07T00:01:00+00:00", "c2")
+    assert sandbox.read_lease_crumb(tmp_path, "task1")["container"] == "c2"
+    assert not list((tmp_path / "leases").glob("*.tmp"))
+
+
+def test_two_tasks_crumbs_do_not_clobber_each_other(tmp_path):
+    """The point of splitting the crumb per task (Step 0): a host running more
+    than one contained job at once must not have the second task's heartbeat
+    stamp over the first's record, the way one shared ``lease.json`` would."""
+    sandbox.write_lease_crumb(tmp_path, "task1", "2026-09-07T00:00:00+00:00", "c1")
     sandbox.write_lease_crumb(tmp_path, "task2", "2026-09-07T00:01:00+00:00", "c2")
-    assert sandbox.read_lease_crumb(tmp_path)["task_id"] == "task2"
-    assert not list(tmp_path.glob("*.tmp"))
+
+    crumb1 = sandbox.read_lease_crumb(tmp_path, "task1")
+    crumb2 = sandbox.read_lease_crumb(tmp_path, "task2")
+    assert crumb1["task_id"] == "task1" and crumb1["container"] == "c1"
+    assert crumb2["task_id"] == "task2" and crumb2["container"] == "c2"
 
 
 def test_reading_an_absent_crumb_is_none_not_an_error(tmp_path):
-    assert sandbox.read_lease_crumb(tmp_path) is None
-    sandbox.clear_lease_crumb(tmp_path)  # must not raise either
+    assert sandbox.read_lease_crumb(tmp_path, "task1") is None
+    sandbox.clear_lease_crumb(tmp_path, "task1")  # must not raise either
+    sandbox.clear_lease_crumb(tmp_path)  # nor the legacy (task_id=None) path
 
 
 def test_a_corrupt_crumb_reads_as_absent(tmp_path):
-    (tmp_path / "lease.json").write_text("{not json")
-    assert sandbox.read_lease_crumb(tmp_path) is None
+    (tmp_path / "leases").mkdir(parents=True)
+    (tmp_path / "leases" / "task1.json").write_text("{not json")
+    assert sandbox.read_lease_crumb(tmp_path, "task1") is None
+    assert sandbox.read_all_lease_crumbs(tmp_path) == []
 
 
 # ==========================================================================
@@ -384,7 +563,7 @@ def test_a_stale_crumb_over_a_running_container_is_reaped(tmp_path):
     assert killed == ["ganymede-job-t1"]
     assert runner.argv_for("kill") is not None
     assert runner.argv_for("rm") is not None
-    assert sandbox.read_lease_crumb(tmp_path) is None
+    assert sandbox.read_lease_crumb(tmp_path, "t1") is None
 
 
 def test_a_stale_crumb_with_no_container_just_clears(tmp_path):
@@ -396,12 +575,15 @@ def test_a_stale_crumb_with_no_container_just_clears(tmp_path):
     runner = FakeRunner({"inspect": sandbox.Completed(1, stderr="No such object")})
     assert agent.reap_orphaned_jobs(_host_config(tmp_path), runner=runner) == []
     assert runner.argv_for("kill") is None
-    assert sandbox.read_lease_crumb(tmp_path) is None
+    assert sandbox.read_lease_crumb(tmp_path, "t1") is None
 
 
-def test_an_unparseable_crumb_is_treated_as_stale(tmp_path):
-    """Fail-safe direction: the cost is killing a container that might have
-    been fine, and the alternative is never killing one."""
+def test_a_legacy_single_file_crumb_is_tolerated_and_treated_as_stale(tmp_path):
+    """A worker built before Step 0 split the crumb per task may still leave a
+    bare ``lease.json`` behind. The reaper must not crash on it, and an
+    unparseable *timestamp* inside it (distinct from unparseable JSON) is the
+    fail-safe direction: the cost is killing a container that might have been
+    fine, and the alternative is never killing one."""
     from ganymede.host import agent
 
     (tmp_path / "lease.json").write_text(json.dumps(
@@ -410,6 +592,38 @@ def test_an_unparseable_crumb_is_treated_as_stale(tmp_path):
     runner = FakeRunner({"inspect": sandbox.Completed(0, stdout="true")})
     assert agent.reap_orphaned_jobs(_host_config(tmp_path), runner=runner) == \
         ["ganymede-job-t1"]
+    assert not (tmp_path / "lease.json").exists()
+
+
+def test_the_reaper_considers_every_live_crumb(tmp_path):
+    """Concurrent tasks mean concurrent orphans; the sweep must not stop at
+    the first crumb it finds a container name in."""
+    from ganymede.host import agent
+
+    sandbox.write_lease_crumb(tmp_path, "t1", _fresh(5000), "ganymede-job-t1")
+    sandbox.write_lease_crumb(tmp_path, "t2", _fresh(5000), "ganymede-job-t2")
+    runner = FakeRunner({"inspect": sandbox.Completed(0, stdout="true")})
+    killed = agent.reap_orphaned_jobs(_host_config(tmp_path), runner=runner)
+
+    assert sorted(killed) == ["ganymede-job-t1", "ganymede-job-t2"]
+    assert sandbox.read_lease_crumb(tmp_path, "t1") is None
+    assert sandbox.read_lease_crumb(tmp_path, "t2") is None
+
+
+def test_the_reaper_leaves_a_fresh_crumb_beside_a_stale_one(tmp_path):
+    """One task going quiet must not implicate another that is still
+    renewing -- exactly the failure a single shared crumb file could not have
+    avoided."""
+    from ganymede.host import agent
+
+    sandbox.write_lease_crumb(tmp_path, "t1", _fresh(30), "ganymede-job-t1")
+    sandbox.write_lease_crumb(tmp_path, "t2", _fresh(5000), "ganymede-job-t2")
+    runner = FakeRunner({"inspect": sandbox.Completed(0, stdout="true")})
+    killed = agent.reap_orphaned_jobs(_host_config(tmp_path), runner=runner)
+
+    assert killed == ["ganymede-job-t2"]
+    assert sandbox.read_lease_crumb(tmp_path, "t1") is not None
+    assert sandbox.read_lease_crumb(tmp_path, "t2") is None
 
 
 def test_the_reaper_survives_its_real_runner(tmp_path):
@@ -460,3 +674,39 @@ def test_the_state_dir_stays_read_only_next_to_the_new_mount(tmp_path):
     argv = runtime_mod.DockerRuntime(_host_config(tmp_path)).run_argv("img", {})
     state_mounts = [m for m in _flag_values(argv, "-v") if m.endswith(":ro")]
     assert state_mounts, "the state dir mount should still be there, read-only"
+
+
+def test_a_gpu_host_whose_coordinator_named_no_devices_still_gets_every_device(
+    job, caplog
+):
+    """Version skew, not a ledger violation -- and the two want opposite
+    answers. A coordinator that allocates always names at least one device, so
+    an empty list means the coordinator predates docs/14; that coordinator is
+    still enforcing one lease per machine, which makes ``all`` both safe and
+    what this host used to get. Emitting nothing would silently run a
+    submitter's GPU job on CPU: it "works", far slower, and nobody finds out.
+    """
+    with caplog.at_level("WARNING"):
+        argv = job.run_argv("img", backend="cuda", devices=[])
+
+    assert _flag_value(argv, "--gpus") == "all"
+    assert any("named no devices" in r.message for r in caplog.records), (
+        "the fallback has to be visible, or a real coordinator bug hides in it"
+    )
+
+
+def test_a_cpu_host_with_no_devices_named_gets_no_device_flags(job):
+    """The same empty list means something different here: there is no
+    accelerator to hand over in the first place, so nothing is the right answer
+    and the discrete-backend fallback must not fire."""
+    argv = job.run_argv("img", backend="cpu", devices=[])
+
+    assert "--gpus" not in argv
+
+
+def test_a_named_device_on_an_unpinnable_backend_still_refuses(job):
+    """The fallback above must not soften the refusal it sits next to. Devices
+    named + no way to honour them is the ledger case: obeying loosely would
+    double-book a card already promised to another lease."""
+    with pytest.raises(sandbox.SandboxError):
+        job.run_argv("img", backend="mps", devices=[0])

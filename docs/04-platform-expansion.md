@@ -133,7 +133,15 @@ fiction, and a round pinned to wall-clock will close on far fewer steps than it
 budgeted for.
 
 "Parallel tasks on one machine" and "cohort-synchronous rounds" pull in opposite
-directions. **Decision: one Ganymede task per machine at a time.** Concurrency is
+directions. **Decision: one Ganymede task per machine at a time.**
+
+> **Amended by `14`.** The decision is now *one task per **device***. The argument
+> below is right about contention and wrong only in where it located it: a task
+> holding a whole exclusive card runs at the rate that card was calibrated at,
+> regardless of what a sibling card in the same chassis is doing. So the
+> cohort-synchronous round keeps the uncontended rate it assumes. Fractional
+> workers and MPS/MIG partitioning remain out of scope for exactly the reasons
+> given here — see `14` §8.2, which carries the numbers. Concurrency is
 across the fleet, not within a host, so this invariant survives untouched — the
 calibrated throughput number stays meaningful and the round closer keeps
 assuming the rate it measured. Fractional workers (throughput re-estimated under

@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from ganymede.coordinator import budget as budget_mod
 from ganymede.coordinator import constraints as constraints_mod
+from ganymede.coordinator import devices as devices_mod
 from ganymede.coordinator import eligibility
 from ganymede.coordinator import fairness
 from ganymede.coordinator import spotcheck, identity, images as images_mod, ledger
@@ -70,6 +71,14 @@ class ComputeProfile(BaseModel):
     # every worker built before the sandbox -- the claim gate reads a missing
     # value as "no", so an old worker simply never matches a submitter job.
     container_runtime: str | None = None
+    # Per-device inventory (docs/14 §2): ``[{index, name, vram_mb,
+    # compute_capability, supports, alloc_max_mb, bench_score}, ...]``.
+    # Worker-side reporting is a later step -- every worker today omits this
+    # -- so both ``constraints.py``'s ``gpu_count`` / ``total_vram_gb``
+    # resolvers and ``devices.reconcile_inventory`` (register) treat its
+    # absence as "one device", never as "unknown device count"; see their own
+    # docstrings for why a fail-closed reading would be wrong here.
+    devices: list[dict[str, Any]] | None = None
 
 
 class RegisterRequest(BaseModel):
@@ -91,6 +100,12 @@ class ClaimRequest(BaseModel):
     cached_base_models: list[str] = Field(default_factory=list)
     run_id: str | None = None
     job_id: str | None = None
+    # The task ids this worker currently believes it holds (docs/14 §5.1).
+    # Absent -- every v1 worker -- means "none", which makes the multi-lease
+    # reconcile below treat every leased task the coordinator has on record
+    # for this worker as unknown and therefore re-servable, exactly the
+    # single-held-task pre-check this replaces.
+    active_task_ids: list[str] = Field(default_factory=list)
 
 
 class JobCreateRequest(BaseModel):
@@ -98,6 +113,11 @@ class JobCreateRequest(BaseModel):
     spec: dict[str, Any] = Field(default_factory=dict)
     image_id: str | None = None
     constraints: dict[str, Any] = Field(default_factory=dict)
+    # How many devices one task of this job needs at once (docs/14 §3, §9).
+    # ``1`` reproduces every job submitted before this field existed, byte for
+    # byte -- the same "absent means today's behaviour" rule the rest of
+    # docs/14 applies to ``active_task_ids`` and the flat profile fields.
+    gpu_count: int = 1
 
 
 class CancelRequest(BaseModel):
@@ -170,6 +190,11 @@ class QuotaRequest(BaseModel):
 
     max_concurrent_tasks: int | None = None
     monthly_task_hours: float | None = None
+    # Devices, not tasks (docs/14 §3, §9): "three cards for project B" once a
+    # job can be wider than one card, and ``max_concurrent_tasks`` stops being
+    # the same number the moment a task can hold more than one device. Same
+    # uncapped-by-default rule as the other two.
+    max_concurrent_gpus: int | None = None
     note: str | None = None
 
 
@@ -357,6 +382,31 @@ def create_job(conn: sqlite3.Connection, user: Contributor,
     except constraints_mod.ConstraintError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    # ``gpu_count`` (docs/14 §3, §5, §9). Two checks, and only the first needs
+    # no fleet at all: a non-positive width is a caller bug regardless of what
+    # hardware exists, the same distinction ``devices.allocate`` draws between
+    # a bad count and a lost race.
+    if body.gpu_count < 1:
+        raise HTTPException(status_code=422, detail="gpu_count must be at least 1")
+    # The second check needs the fleet, and **only when the fleet has told us
+    # something** (docs/14 §5's own "CAREFUL"): on a fresh coordinator, or
+    # before the donated box's first register call, no worker has ever
+    # reconciled an inventory and ``max_inventory_width`` reads that as ``0``.
+    # An unconditional check here would 422 every job -- including the
+    # default ``gpu_count = 1`` -- on day one, before a single machine has
+    # ever been seen. Once at least one worker has registered, a job wider
+    # than the widest machine that could ever claim it is refused now rather
+    # than left as a queued row that polls 204 forever and gives the
+    # submitter nothing to go on.
+    widest = devices_mod.max_inventory_width(conn)
+    if widest > 0 and body.gpu_count > widest:
+        raise HTTPException(
+            status_code=422,
+            detail=f"gpu_count {body.gpu_count} exceeds the widest inventory "
+                   f"the fleet has ever reported ({widest} device(s)); "
+                   "this job could never be claimed",
+        )
+
     # Freeze the resolved pair into the spec and never mutate it again
     # (docs/10 §2). ``jobs`` gets no version column -- this is where the
     # binding lives.
@@ -389,10 +439,11 @@ def create_job(conn: sqlite3.Connection, user: Contributor,
         conn.execute(
             """INSERT INTO jobs
                  (id, owner_id, job_type, spec_json, image_id, status,
-                  priority_rank, constraints_json, cancel_mode, created_at)
-               VALUES (?, ?, ?, ?, ?, 'draft', 0, ?, NULL, ?)""",
+                  priority_rank, constraints_json, cancel_mode, gpu_count,
+                  created_at)
+               VALUES (?, ?, ?, ?, ?, 'draft', 0, ?, NULL, ?, ?)""",
             (job_id, user.id, body.job_type, json.dumps(spec),
-             body.image_id, json.dumps(body.constraints), now),
+             body.image_id, json.dumps(body.constraints), body.gpu_count, now),
         )
     return {"job_id": job_id, "status": "draft"}
 
@@ -558,6 +609,15 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                     (worker_id, contributor.id, json.dumps(profile),
                      body.image_tag, now, now),
                 )
+            # docs/14 §5.6: bring the device ledger's inventory in line with
+            # what this register call reports, and release any allocation
+            # still open on a device that vanished. Inside the same
+            # transaction as the workers upsert above -- both are "this
+            # worker just told us who it is" bookkeeping under one lock, not
+            # two separate writes racing each other. Also what keeps a worker
+            # registering for the first time after migration 009 ran from
+            # ending up with zero ``worker_devices`` rows (module docstring).
+            devices_mod.reconcile_inventory(conn, worker_id, profile)
         # Re-probe (Decision 12, docs/09 3.4): a reweighting is a new
         # ``computed_at`` stamp applied to windows settled *after* it -- never
         # retroactive -- so correctness only requires the fresh row exists.
@@ -599,26 +659,49 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             raise HTTPException(status_code=404, detail="unknown worker")
 
         rounds.expire_leases(conn)
+        # The reservation sweep lives here, beside the lease sweep, for the
+        # same reason (docs/14 §4): the claim poll is already the one seam
+        # that runs on every deployment regardless of what timers an operator
+        # installed, and a dead wide job's reservation must not out-live the
+        # next worker that asks for work. Cheap when there is nothing to
+        # sweep -- a ``DELETE`` that matches zero rows.
+        devices_mod.expire_reservations(conn)
         profile = (body.capabilities.model_dump() if body.capabilities
                    else json.loads(worker["compute_profile_json"]))
+        active_task_ids = set(body.active_task_ids or [])
 
-        # One lease per machine, global (docs/07 §1, Decision 4). Cheap
-        # pre-check before the walk: a machine already holding a leased task is
-        # re-served that task -- resumed through its owning job type for a fresh
-        # presign, never a replay of the expired URLs, and never a second task.
-        held = conn.execute(
-            "SELECT * FROM tasks WHERE worker_id = ? AND status = 'leased' LIMIT 1",
+        # The held-lease pre-check is a reconcile now, not an admission gate
+        # (docs/14 §5.1, §1): a device, not a machine, is the unit of
+        # allocation, so a machine may legitimately hold several leases at
+        # once, one per free device, and merely holding a lease no longer
+        # means "stop and re-serve it". What still means that: a leased task
+        # this worker does not know about -- absent from
+        # ``active_task_ids`` -- which is the crash-recovery case this
+        # re-serve has always existed for (a worker that leased a task, lost
+        # the response, and restarted not remembering it). A held lease the
+        # worker *does* list is left alone and the walk runs below, which is
+        # what lets a second poll fill a second device on the same machine.
+        # An absent ``active_task_ids`` defaults to ``[]`` (``ClaimRequest``),
+        # under which every held lease looks unknown -- today's one-device
+        # fleet's behaviour, reproduced exactly rather than approximated.
+        all_held = conn.execute(
+            "SELECT * FROM tasks WHERE worker_id = ? AND status = 'leased' "
+            "ORDER BY leased_at, id",
             (body.worker_id,),
-        ).fetchone()
+        ).fetchall()
+        held = next((t for t in all_held if t["id"] not in active_task_ids), None)
         # The poll is the availability signal (docs/09 1.1): every worker polls
         # whether or not it gets work, so this is where the ledger hears from
         # the fleet. ``leased`` is informational (the leased-vs-idle split) and
         # never changes the credited amount -- Decision 11 counts idle-available
-        # time. The good-standing gate is evaluated on the tick itself.
-        ledger.record_availability_tick(conn, body.worker_id, leased=held is not None)
+        # time. The good-standing gate is evaluated on the tick itself. Reflects
+        # every held lease, not just an unresumed one -- a worker fully caught
+        # up on ``active_task_ids`` is still a worker holding work.
+        ledger.record_availability_tick(conn, body.worker_id, leased=bool(all_held))
         if held is not None:
             if held["run_id"] is not None:
-                spec = _resume_held(conn, held, worker, contributor, profile, settings)
+                spec = _resume_held(conn, held, worker, contributor, profile, settings,
+                                    active_task_ids=active_task_ids)
                 if spec is not None:
                     # ``tasks.job_id`` is not backfilled by migration 005 (docs/05
                     # pins pre-005 task rows' job_id to NULL), so fall back to the
@@ -637,9 +720,12 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
             else:
                 # A held task from a static (no-``shape_claim``) type: rebuild
                 # the payload from the ``tasks`` row and a fresh ``inputs_for``
-                # presign. Returning here keeps the one-lease-per-machine
-                # invariant -- a machine holding a batch task never reaches the
-                # walk to lease a second.
+                # presign. This is the resume of a lease the worker does not
+                # yet know about (``held`` is filtered by ``active_task_ids``
+                # above); a static type has no per-call held-lease check of
+                # its own the way ``collab_lora_finetune.claim_task`` does, so
+                # this reconcile is its only protection against re-forking a
+                # crash-recovery lease into a second one.
                 resumed = _resume_held_static(conn, store, held, settings)
                 if resumed is not None:
                     spec, task_inputs, jt = resumed
@@ -652,6 +738,12 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                         sdk={"job_type": jt.name, "version": jt.version},
                         image=_image_handles(conn, held["job_id"], store),
                     ))
+
+        # No held lease needed resuming -- none exists, or every one this
+        # worker holds is already in ``active_task_ids`` -- so fall through
+        # to the walk rather than returning. That is what lets a machine with
+        # a free device claim a second (or third...) lease without waiting
+        # for an existing one to end (docs/14 §5.1, §7).
 
         # Map a v1 worker's run_id pin to its parent job (docs/07 §1); job_id is
         # the new pin. A pin still passes through the constraint gate below.
@@ -672,6 +764,18 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         # contributor would act on, and it would send them looking for a fault
         # in a machine that is fine.
         verdicts: list[eligibility.Verdict] = []
+        # docs/14 §6: "only the first job in walk order refused for
+        # insufficient_free_devices may reserve." The walk has no notion of
+        # "head" of its own -- ``jobs`` is just ``_selectable_jobs``'s
+        # rank-ordered list -- so this flag is that policy's entire
+        # implementation: the first eligible refusal below flips it and every
+        # later one in this same poll is skipped without ever calling
+        # ``devices.reserve``. ``reserve`` itself already refuses a second
+        # holder (its own "at most one job" check), so this flag is not what
+        # keeps two jobs from *holding* reservations at once -- it is what
+        # keeps every lower-rank wide job on a busy queue from opening a
+        # ``BEGIN IMMEDIATE`` write transaction every poll only to be told no.
+        reservation_claimed_this_poll = False
         for job in jobs:
             try:
                 jt = resolve(job["job_type"])
@@ -747,6 +851,101 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                 )
                 continue
 
+            # The capacity gate (docs/14 §5.2), immediately after the
+            # constraint gate and following its exact discipline: a recorded
+            # REFUSED verdict and a `continue`, never a `break` -- the walk
+            # reaching a lower-rank job this host can still fit *is* the
+            # capability backfill (Decision 10), same as always. ``gpu_count``
+            # is validated here rather than left to ``devices.allocate``,
+            # which raises on a non-positive count (docs/14 §4: a caller bug,
+            # not a lost race, and the two must not be answered the same way)
+            # -- an exception raised mid-walk would be a `break`, so this has
+            # to be a `continue` instead, before the allocator ever sees it.
+            # ``job["gpu_count"]`` is 1 for every job today (nothing sets it
+            # any higher yet -- docs/14 §9, out of scope here), so this gate
+            # is a no-op refusal for the existing fleet: it refuses exactly
+            # the case the old one-lease-per-machine rule refused (the
+            # worker's single device already busy) and nothing else.
+            gpu_count = job["gpu_count"] if job["gpu_count"] else 1
+            free = devices_mod.free_devices(conn, body.worker_id, job["id"])
+            # Backfill (docs/14 §6): a job the plain free set would refuse may
+            # still be rescuable if some of what is missing is only unavailable
+            # because *another* job has it reserved, and this job's own next
+            # task would finish and hand the device back before that
+            # reservation is due. Two guards keep this from ever running for
+            # the fleet as it exists today, where nothing reserves anything:
+            # ``has_other_reservations`` is a single indexed lookup that comes
+            # back empty whenever ``device_reservations`` is empty, and
+            # dynamic (``shape_claim``) types never reach the peek because
+            # they mint no task ahead of claim time -- there is no
+            # ``max_runtime_sec`` to ask about before ``shape_claim`` runs.
+            # ``free`` starts as the plain set and is only ever *widened* here,
+            # never narrowed -- a peek that finds nothing backfillable leaves
+            # the ordinary refusal untouched.
+            free_plain = free
+            backfilled = False
+            if (len(free) < gpu_count and not hasattr(jt, "shape_claim")
+                    and devices_mod.has_other_reservations(
+                        conn, body.worker_id, job["id"])):
+                peek = _next_unleased_task(conn, job)
+                # A task with no declared ``max_runtime_sec`` cannot be shown
+                # to finish in time -- fail closed, same as everywhere else in
+                # this codebase, by simply not widening ``free`` at all.
+                if peek is not None and peek["max_runtime_sec"] is not None:
+                    widened = devices_mod.free_devices(
+                        conn, body.worker_id, job["id"],
+                        max_runtime_sec=peek["max_runtime_sec"],
+                    )
+                    # Only actually flip ``backfilled`` -- and hand
+                    # ``_claim_static_task`` the extra re-verification query
+                    # it costs -- when the peek found something to widen.
+                    # A peek that lands on the same set the plain call already
+                    # gave is either "nothing was reserved" or "the deadline
+                    # doesn't help," and either way this job is refused right
+                    # below regardless, so there is nothing to re-verify.
+                    if widened != free:
+                        free = widened
+                        backfilled = True
+            if gpu_count <= 0 or len(free) < gpu_count:
+                # Distinguish "this machine's cards are busy" from "this
+                # machine has no cards on record". Both refuse, but they are
+                # different operator problems: the first is the fleet working,
+                # the second is a machine that will sit idle forever and whose
+                # contributor would otherwise be told their hardware is
+                # merely busy. ``inventory`` is empty only if no register
+                # call ever reconciled this worker -- which, after
+                # ``reconcile_inventory`` runs on both worker-creating paths,
+                # should be unreachable. Naming it is what makes it
+                # diagnosable if it ever happens anyway.
+                reason = ("no_devices_reported"
+                          if not devices_mod.inventory(conn, body.worker_id)
+                          else "insufficient_free_devices")
+                # docs/14 §6's reservation half. Eligibility is narrower than
+                # "refused for this reason": a ``gpu_count == 1`` job refused
+                # here has free_devices == 0, and the very next device any
+                # other job releases satisfies it immediately through
+                # ordinary backfill -- it never needs to survive across polls,
+                # so reserving on its behalf would only ever hold a card no
+                # wider job needs, for no reason. Reserving is for a job
+                # ordinary backfill structurally cannot satisfy: one that
+                # needs *several* devices at once, where single-card jobs
+                # taking each one as it frees is exactly the starvation this
+                # exists to prevent. ``free_plain`` (never the backfill-widened
+                # ``free``) is what gets reserved -- a device this job can
+                # only see because some *other* short job might finish in time
+                # is not a device this job may claim as reserved for itself.
+                if (reason == "insufficient_free_devices" and gpu_count > 1
+                        and not reservation_claimed_this_poll):
+                    reservation_claimed_this_poll = True
+                    devices_mod.reserve(
+                        conn, body.worker_id, job["id"], free_plain,
+                        settings.device_reservation_ttl_sec,
+                    )
+                verdicts.append(eligibility.Verdict(
+                    job["id"], eligibility.REFUSED, reason
+                ))
+                continue
+
             if hasattr(jt, "shape_claim"):
                 # Dynamic type: per-machine task sizing at claim time
                 # (docs/10 §3). ``collab_lora_finetune``.
@@ -759,6 +958,8 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                         conn, run_id, body.worker_id, contributor.clearance, profile,
                         settings, worker_image_tag=worker["image_tag"],
                         agreed_at=contributor.agreed_at,
+                        free_devices=free, gpu_count=gpu_count,
+                        active_task_ids=active_task_ids,
                     )
                 except rounds.NotEligible as exc:
                     verdicts.append(
@@ -775,11 +976,23 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                 # Static type: ``plan`` output claimed as-is -- take one unleased
                 # ``tasks`` row for this job (docs/10 §3, §4).
                 spec, task_inputs = _claim_static_task(
-                    conn, jt, store, job, body.worker_id, settings
+                    conn, jt, store, job, body.worker_id, settings,
+                    free_devices=free, gpu_count=gpu_count,
+                    backfilled=backfilled,
                 )
                 sdk = {"job_type": jt.name, "version": jt.version}
 
             if spec is not None:
+                # This job is no longer blocked, so it is no longer
+                # accumulating (docs/14 §6). Whatever it had reserved on this
+                # worker is now either allocated to the task just leased or
+                # was never needed; either way the reservation has done its
+                # job and must not outlive it, or every other job stays
+                # excluded for the rest of the TTL while this one -- which
+                # sees through its own reservation -- is unaffected. A no-op
+                # for the overwhelming majority of claims, which reserved
+                # nothing.
+                devices_mod.release_reservations(conn, body.worker_id, job["id"])
                 # First lease flips the job queued -> running (docs/07 §1). Its
                 # own transaction; eligibility.record comes after, never between
                 # (docs/07 §1 freezes that ordering).
@@ -990,12 +1203,33 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         knows.
         """
         workers = conn.execute("SELECT * FROM workers ORDER BY last_seen DESC").fetchall()
+        # Which card holds which task, fleet-wide, in one query rather than
+        # one per worker (docs/14 §9): this is the operator's only view of a
+        # donated multi-GPU box, and a stuck allocation on card 2 of a machine
+        # nobody looks at directly has to be visible from here or it is
+        # invisible, full stop.
+        held_by = {
+            (r["worker_id"], r["device_index"]): r["task_id"]
+            for r in conn.execute(
+                "SELECT worker_id, device_index, task_id FROM task_devices "
+                "WHERE released_at IS NULL"
+            ).fetchall()
+        }
         out = []
         for w in workers:
             profile = json.loads(w["compute_profile_json"])
             weight, _ver = ledger.current_weight(conn, w["id"])
             if weight == 0.0:
                 weight, _comp, _ver = ledger.machine_weight_for(profile)
+            devices_out = [
+                {
+                    "index": d["device_index"],
+                    "name": d["device_name"],
+                    "vram_mb": d["vram_mb"],
+                    "task_id": held_by.get((w["id"], d["device_index"])),
+                }
+                for d in devices_mod.inventory(conn, w["id"])
+            ]
             out.append({
                 "worker_id": w["id"],
                 "backend": profile.get("backend"),
@@ -1010,6 +1244,12 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                 "standing": w.get("standing") or "good",
                 "weighted_hours_total": ledger.accrued(conn, machine_id=w["id"]),
                 "system_weight": weight,
+                # Per-device state (docs/14 §9): one entry per live
+                # ``worker_devices`` row, ``task_id`` null when that card is
+                # free. A single-device worker gets a one-element list --
+                # nothing about the common case changes shape, it is simply
+                # the same information the flat fields above already carried.
+                "devices": devices_out,
             })
         tp = conn.execute("SELECT * FROM throughput").fetchall()
         return {
@@ -1157,6 +1397,13 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                  row["display_name"], now, now, now,
                  identity.fingerprint_from_profile(profile)),
             )
+            # docs/14 §5.6, the same reconcile ``register`` does. Easy to miss
+            # because this is the *other* path that creates a ``workers`` row:
+            # an enrolled machine that never reconciled would have zero
+            # ``worker_devices`` rows, hence zero free devices, hence a refusal
+            # on every job forever -- a machine that enrolls successfully and
+            # then silently never works.
+            devices_mod.reconcile_inventory(conn, machine_id, profile)
             machine_key = identity.new_machine_key()
             conn.execute(
                 """INSERT INTO machine_keys (machine_id, key_hash, enabled, created_at)
@@ -1702,12 +1949,26 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
     def admin_queue(conn: ConnDep,
                     admin: Annotated[Contributor, Depends(require_admin)]) -> dict:
         """The admin-ordered queue with leased-task counts (docs/06, docs/07
-        §4). A job stuck at zero leased tasks is the signal to ``reorder``."""
+        §4). A job stuck at zero leased tasks is the signal to ``reorder``.
+
+        ``gpu_count`` and ``leased_devices`` (docs/14 §9) turn "stuck" into a
+        diagnosable question on a multi-GPU fleet: a wide job sitting at
+        ``leased_tasks > 0`` but ``leased_devices < leased_tasks * gpu_count``
+        is a job that got a task but not the whole card set it asked for --
+        impossible under this document's invariant once a lease exists
+        (allocation happens inside the same transaction as the lease, docs/14
+        §5.3), so seeing it here is a ledger bug caught by the operator's own
+        read path rather than only by ``invariants.py``.
+        """
         rows = conn.execute(
             """SELECT j.id, j.job_type, j.status, j.priority_rank, j.owner_id,
-                      j.created_at, j.constraints_json,
+                      j.created_at, j.constraints_json, j.gpu_count,
                       (SELECT COUNT(*) FROM tasks t
-                        WHERE t.job_id = j.id AND t.status = 'leased') AS leased_tasks
+                        WHERE t.job_id = j.id AND t.status = 'leased') AS leased_tasks,
+                      (SELECT COUNT(*) FROM task_devices td
+                         JOIN tasks t ON t.id = td.task_id
+                        WHERE t.job_id = j.id
+                          AND td.released_at IS NULL) AS leased_devices
                FROM jobs j
                WHERE j.status IN ('queued', 'running')
                ORDER BY j.priority_rank ASC, j.created_at ASC"""
@@ -1799,6 +2060,9 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         if body.monthly_task_hours is not None and body.monthly_task_hours < 0:
             raise HTTPException(
                 status_code=422, detail="monthly_task_hours must not be negative")
+        if body.max_concurrent_gpus is not None and body.max_concurrent_gpus < 0:
+            raise HTTPException(
+                status_code=422, detail="max_concurrent_gpus must not be negative")
         row = conn.execute(
             "SELECT user_id FROM submitters WHERE user_id = ?", (user_id,)
         ).fetchone()
@@ -1808,23 +2072,25 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
         with immediate(conn):
             conn.execute(
                 """INSERT INTO submitter_quotas
-                     (user_id, max_concurrent_tasks, monthly_task_hours, note,
-                      updated_by, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?)
+                     (user_id, max_concurrent_tasks, monthly_task_hours,
+                      max_concurrent_gpus, note, updated_by, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(user_id) DO UPDATE SET
                      max_concurrent_tasks = excluded.max_concurrent_tasks,
                      monthly_task_hours   = excluded.monthly_task_hours,
+                     max_concurrent_gpus  = excluded.max_concurrent_gpus,
                      note                 = excluded.note,
                      updated_by           = excluded.updated_by,
                      updated_at           = excluded.updated_at""",
                 (user_id, body.max_concurrent_tasks, body.monthly_task_hours,
-                 body.note, admin.id, now),
+                 body.max_concurrent_gpus, body.note, admin.id, now),
             )
         events.hub.publish("submitter.change", user_id=user_id)
         return {
             "user_id": user_id,
             "max_concurrent_tasks": body.max_concurrent_tasks,
             "monthly_task_hours": body.monthly_task_hours,
+            "max_concurrent_gpus": body.max_concurrent_gpus,
             "used_hours_this_month": round(fairness.month_hours(conn, user_id), 3),
             "updated_by": admin.id, "updated_at": now,
         }
@@ -1932,7 +2198,7 @@ def _selectable_jobs(conn: sqlite3.Connection, pinned_job_id: str | None,
     """
     rows = conn.execute(
         """SELECT j.id, j.job_type, j.priority_rank, j.created_at, j.owner_id,
-                  j.constraints_json, j.image_id, j.spec_json,
+                  j.constraints_json, j.image_id, j.spec_json, j.gpu_count,
                   r.id AS run_id, r.base_model,
                   i.scan_status AS image_scan_status,
                   i.finalized_at AS image_finalized_at,
@@ -1979,18 +2245,33 @@ def _selectable_jobs(conn: sqlite3.Connection, pinned_job_id: str | None,
 
 
 def _resume_held(conn: sqlite3.Connection, held: sqlite3.Row, worker: sqlite3.Row,
-                 contributor: Contributor, profile: dict, settings: Settings):
+                 contributor: Contributor, profile: dict, settings: Settings, *,
+                 active_task_ids=None):
     """Re-serve a collab task the machine already holds (docs/07 §1, "Re-serving
     is per-type"). The ``tasks`` row alone cannot rebuild the payload, so
     dispatch to the owning job type -- which returns a fresh spec, and
-    ``_task_payload`` a fresh presign, never a replay of the expired URLs."""
+    ``_task_payload`` a fresh presign, never a replay of the expired URLs.
+
+    ``active_task_ids`` is forwarded to ``shape_claim`` unchanged: it is what
+    lets ``claim_task``'s own held-lease check (docs/14 §5.3) agree with the
+    caller's reconcile about which lease is being resumed here, rather than
+    mistaking this call for a request to mint an additional one.
+
+    ``free_devices`` is empty here, and that is the honest value rather than a
+    placeholder: a resume hands back a lease the machine already holds, so its
+    ``task_devices`` rows already exist and there is nothing to allocate. An
+    empty free set is also the correct *safety* answer -- if this call ever
+    fell through to the minting path instead of the held-lease branch, it must
+    refuse rather than quietly open a second lease against devices it was
+    never told were free."""
     if held["run_id"] is None:
         return None
     try:
         return resolve("collab_lora_finetune").shape_claim(
             conn, held["run_id"], worker["id"], contributor.clearance,
             profile, settings, worker_image_tag=worker["image_tag"],
-            agreed_at=contributor.agreed_at,
+            agreed_at=contributor.agreed_at, active_task_ids=active_task_ids,
+            free_devices=[],
         )
     except rounds.NotEligible:
         return None
@@ -2009,11 +2290,15 @@ def _resume_held_static(conn: sqlite3.Connection, store: Store,
     ).fetchone()
     if job is None or job["status"] not in ("queued", "running"):
         return None
-    spec = _static_task_spec(held, settings)
+    # No fresh allocation here -- this lease's device(s) are already held
+    # (docs/14 §5.3 only allocates when a lease is *minted*), so the payload
+    # just reports what the ledger already has on record for this task id.
+    spec = _static_task_spec(held, settings, devices_mod.held_devices(conn, held["id"]))
     return spec, jt.inputs_for(held, store), jt
 
 
-def _static_task_spec(row: sqlite3.Row, settings: Settings) -> TaskSpec:
+def _static_task_spec(row: sqlite3.Row, settings: Settings,
+                      devices: list[int]) -> TaskSpec:
     lease = row["lease_expires_at"]
     return TaskSpec(
         id=row["id"],
@@ -2022,11 +2307,49 @@ def _static_task_spec(row: sqlite3.Row, settings: Settings) -> TaskSpec:
         attempt_group=row["attempt_group"],
         max_runtime_sec=int(row["max_runtime_sec"] or settings.lease_duration_sec),
         lease_expires_at=rounds._parse(lease) if lease else None,
+        devices=devices,
     )
 
 
+def _next_unleased_task(conn: sqlite3.Connection, job: sqlite3.Row) -> sqlite3.Row | None:
+    """The task ``_claim_static_task`` would select right now for ``job`` --
+    read-only, no lease taken. Shared by two callers: the claim walk's
+    capacity gate peeks at it (outside any transaction) to ask whether
+    backfill (docs/14 §6) could rescue a job the plain free set would refuse,
+    and ``_claim_static_task`` itself runs the identical query again, inside
+    its own ``immediate()``, to actually take the row.
+
+    Those two calls can legitimately disagree: a concurrent claim can take
+    the peeked row between this function's two call sites, leaving
+    ``_claim_static_task`` to select a different one. That is why the walk's
+    peek is only ever a *gate* decision (should this job be allowed to reach
+    ``_claim_static_task`` at all) and never trusted for the allocation
+    itself -- see ``_claim_static_task``'s own re-check of ``max_runtime_sec``
+    once it holds the write lock and knows the real row.
+    """
+    return conn.execute(
+        """SELECT * FROM tasks
+            WHERE job_id = ? AND attempts < ?
+              AND ( status IN ('planned', 'expired', 'abandoned', 'preempted')
+                    OR (status = 'submitted' AND EXISTS (
+                          SELECT 1 FROM submissions s
+                           WHERE s.task_id = tasks.id AND s.accepted = 0)) )
+              -- A *failed* probe is a ``submitted`` row with
+              -- ``accepted = 0``, which is exactly what this recycles. But
+              -- its shard was accepted long ago from the source task; handing
+              -- it out again as ordinary work would burn attempts re-doing
+              -- finished work because one machine got it wrong.
+              AND id NOT IN (SELECT task_id FROM spot_check_issues)
+            ORDER BY created_at, id LIMIT 1""",
+        (job["id"], close.MAX_TASK_ATTEMPTS),
+    ).fetchone()
+
+
 def _claim_static_task(conn: sqlite3.Connection, jt, store: Store,
-                       job: sqlite3.Row, worker_id: str, settings: Settings):
+                       job: sqlite3.Row, worker_id: str, settings: Settings, *,
+                       free_devices: list[int],
+                       gpu_count: int = 1,
+                       backfilled: bool = False):
     """Atomically take one unleased task for this job and lease it to the
     machine. Returns ``(spec, inputs)`` or ``(None, None)``.
 
@@ -2035,7 +2358,33 @@ def _claim_static_task(conn: sqlite3.Connection, jt, store: Store,
     rejection -- a static type mints no fresh row per claim the way collab does,
     so without recycling these the shard would orphan and the job would never
     complete. Bounded by ``close.MAX_TASK_ATTEMPTS`` (a hard per-shard failure
-    path is Phase D)."""
+    path is Phase D).
+
+    ``free_devices`` / ``gpu_count`` come from the walk's capacity gate
+    (docs/14 §5.2-§5.3), already validated there. The allocation happens
+    inside this function's own ``immediate()`` block, the same transaction
+    that flips the row to ``leased`` -- not around it.
+
+    ``free_devices`` is required and has no default. A caller that omits it is a bug at that call site, not a machine with no
+    cards -- and the two must not look alike. Defaulting it to an empty list
+    would turn a forgotten argument into a silent, permanent refusal: the
+    worker gets 204 forever and nothing anywhere errors. Required, so the
+    mistake is a TypeError at the call site instead.
+
+    ``backfilled`` says the gate widened ``free_devices`` past the plain free
+    set using a *peek* at "the next unleased task" (docs/14 §6), taken
+    outside this function's write lock. A concurrent claim could have taken
+    that exact row in between, leaving the row selected below with a
+    different -- possibly unset, possibly longer -- ``max_runtime_sec`` than
+    the one the peek justified the widening with. When ``backfilled`` is set,
+    this re-asks ``free_devices`` for the *real* selected row's own
+    ``max_runtime_sec``, under the write lock, and intersects it with what
+    the walk passed in -- so a mis-peeked long task can only ever end up with
+    the devices its own real deadline actually earns it, never the wider set
+    a different, shorter task would have. Skipped when ``backfilled`` is
+    ``False``: the ordinary, non-backfill path pays no extra query for a
+    feature it is not using.
+    """
     now = rounds.utcnow()
     # A known-answer probe, if the dice come up (docs/13 §5). Issued *instead
     # of* the ordinary reserve rather than alongside it: a machine gets one
@@ -2043,52 +2392,78 @@ def _claim_static_task(conn: sqlite3.Connection, jt, store: Store,
     # by the shape of the response, which is the one thing it must not be.
     probe_id = spotcheck.maybe_issue(conn, job, worker_id, settings, now)
     if probe_id is not None:
+        # ``maybe_issue`` does not allocate through the device ledger yet.
+        # ``settings.spotcheck_rate`` defaults to 0.0 and nothing in this
+        # codebase turns it on outside ``test_spotcheck.py``'s own direct
+        # unit tests, so this branch cannot fire from the live claim path
+        # today -- but an operator who sets ``spotcheck_rate > 0`` on a build
+        # that includes this step gets a probe task with no ``task_devices``
+        # row: ``free_devices`` reports its device as still free while the
+        # probe is running, and the very next claim can double-book it. This
+        # is a blocker for turning spotcheck on, not merely a gap; see the
+        # step 4 report. ``held_devices`` returns ``[]`` here honestly,
+        # rather than a fabricated allocation.
         probe = conn.execute("SELECT * FROM tasks WHERE id = ?", (probe_id,)).fetchone()
-        return _static_task_spec(probe, settings), jt.inputs_for(probe, store)
-    with immediate(conn):
-        row = conn.execute(
-            """SELECT * FROM tasks
-                WHERE job_id = ? AND attempts < ?
-                  AND ( status IN ('planned', 'expired', 'abandoned', 'preempted')
-                        OR (status = 'submitted' AND EXISTS (
-                              SELECT 1 FROM submissions s
-                               WHERE s.task_id = tasks.id AND s.accepted = 0)) )
-                  -- A *failed* probe is a ``submitted`` row with
-                  -- ``accepted = 0``, which is exactly what this recycles. But
-                  -- its shard was accepted long ago from the source task; handing
-                  -- it out again as ordinary work would burn attempts re-doing
-                  -- finished work because one machine got it wrong.
-                  AND id NOT IN (SELECT task_id FROM spot_check_issues)
-                ORDER BY created_at, id LIMIT 1""",
-            (job["id"], close.MAX_TASK_ATTEMPTS),
-        ).fetchone()
-        if row is None:
-            return None, None
-        expires = now + timedelta(seconds=settings.lease_duration_sec)
-        changed = conn.execute(
-            # ``attempts`` does not move for a preempted shard (docs/13 §4.4).
-            # The attempt budget bounds *the shard's* failures; letting the
-            # scheduler spend it would fail a shard after five decisions nobody
-            # made about that shard -- and ``MAX_TASK_ATTEMPTS`` is 5.
-            #
-            # ``leased_at`` is the share accounting's only input (docs/13 §1.2).
-            # It cannot be derived from ``created_at`` here: a static type's
-            # tasks are planned at enqueue and leased minutes or days later.
-            "UPDATE tasks SET status = 'leased', worker_id = ?, "
-            "lease_expires_at = ?, leased_at = ?, "
-            "attempts = attempts + CASE WHEN status = 'preempted' THEN 0 ELSE 1 END "
-            "WHERE id = ? AND status = ?",
-            (worker_id, rounds._iso(expires), rounds._iso(now),
-             row["id"], row["status"]),
-        ).rowcount
-        if not changed:
-            return None, None
-        conn.execute(
-            "UPDATE workers SET last_seen = ? WHERE id = ?",
-            (rounds._iso(now), worker_id),
-        )
-        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (row["id"],)).fetchone()
-    return _static_task_spec(row, settings), jt.inputs_for(row, store)
+        probe_devices = devices_mod.held_devices(conn, probe_id)
+        return _static_task_spec(probe, settings, probe_devices), jt.inputs_for(probe, store)
+    try:
+        with immediate(conn):
+            row = _next_unleased_task(conn, job)
+            if row is None:
+                return None, None
+            expires = now + timedelta(seconds=settings.lease_duration_sec)
+            changed = conn.execute(
+                # ``attempts`` does not move for a preempted shard (docs/13 §4.4).
+                # The attempt budget bounds *the shard's* failures; letting the
+                # scheduler spend it would fail a shard after five decisions nobody
+                # made about that shard -- and ``MAX_TASK_ATTEMPTS`` is 5.
+                #
+                # ``leased_at`` is the share accounting's only input (docs/13 §1.2).
+                # It cannot be derived from ``created_at`` here: a static type's
+                # tasks are planned at enqueue and leased minutes or days later.
+                "UPDATE tasks SET status = 'leased', worker_id = ?, "
+                "lease_expires_at = ?, leased_at = ?, "
+                "attempts = attempts + CASE WHEN status = 'preempted' THEN 0 ELSE 1 END "
+                "WHERE id = ? AND status = ?",
+                (worker_id, rounds._iso(expires), rounds._iso(now),
+                 row["id"], row["status"]),
+            ).rowcount
+            if not changed:
+                return None, None
+            # Inside the same transaction as the ``leased`` flip above (docs/14
+            # §5.3), not around it. A lost race (``AllocationRaced``) rolls the
+            # whole block back -- the flip included -- via ``immediate()``'s own
+            # exception handling, so a race never leaves this row ``leased``
+            # with no device behind it (module docstring's re-lease-recycled-
+            # rows concern, now doubled by the ledger).
+            devices_for_allocation = free_devices
+            if backfilled:
+                # The peek that justified widening ``free_devices`` ran before
+                # this transaction took the write lock, against whatever task
+                # was next at that moment -- not necessarily ``row`` above, if
+                # a concurrent claim landed in between (this docstring's own
+                # ``backfilled`` note). Re-derive the free set from ``row``'s
+                # *real* ``max_runtime_sec``, now that it cannot change under
+                # us, and keep only the devices both computations agree on --
+                # never more than the walk already believed was free, and
+                # never a device this specific row's own deadline does not
+                # actually earn it.
+                verified = set(devices_mod.free_devices(
+                    conn, worker_id, job["id"], max_runtime_sec=row["max_runtime_sec"],
+                ))
+                devices_for_allocation = [i for i in free_devices if i in verified]
+            allocated = devices_mod.allocate(conn, worker_id, row["id"], gpu_count,
+                                             devices_for_allocation)
+            if allocated is None:
+                raise devices_mod.AllocationRaced()
+            conn.execute(
+                "UPDATE workers SET last_seen = ? WHERE id = ?",
+                (rounds._iso(now), worker_id),
+            )
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (row["id"],)).fetchone()
+    except devices_mod.AllocationRaced:
+        return None, None
+    return _static_task_spec(row, settings, allocated), jt.inputs_for(row, store)
 
 
 def _pinned_sdk_version(job: sqlite3.Row) -> int | None:
@@ -2281,6 +2656,9 @@ def _task_payload(spec: TaskSpec, store: Store, settings: Settings, *,
             "dataset_ref": spec.dataset_ref,
             "base_adapter_url": url,
             "base_adapter_expires_at": expires.isoformat(),
+            # The device indices this lease actually holds (docs/14 §5.4) --
+            # ``[0]`` for every worker in today's single-device fleet.
+            "devices": spec.devices,
         }
         if sdk is not None:
             payload["sdk"] = sdk
@@ -2307,6 +2685,8 @@ def _task_payload(spec: TaskSpec, store: Store, settings: Settings, *,
         if spec.lease_expires_at else None,
         "heartbeat_interval_sec": settings.heartbeat_interval_sec,
         "required_image": None,
+        # docs/14 §5.4 -- see the collab payload's identical field above.
+        "devices": spec.devices,
     }
 
 

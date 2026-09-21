@@ -228,6 +228,7 @@ class CoordinatorClient:
         capabilities: dict[str, Any] | None = None,
         cached_base_models: list[str] | None = None,
         run_id: str | None = None,
+        active_task_ids: list[str] | None = None,
     ) -> tuple[dict[str, Any] | None, int]:
         """Ask for work.
 
@@ -235,6 +236,16 @@ class CoordinatorClient:
         the **204** case and is entirely normal (6.2 L4): there is no eligible
         work right now, which on an unscheduled volunteer fleet is the common
         state rather than an error.
+
+        ``active_task_ids`` (docs/14 §5.1) is how a worker holding more than one
+        lease at once -- a multi-GPU host's supervisor, one child per device --
+        tells the coordinator which held leases it already knows about, so the
+        held-lease reconcile only re-serves the ones it does not: a crashed
+        child's lease, not a sibling still training. Omitted (``None`` or
+        empty) rather than sent as ``[]``, which reproduces a v1 worker's wire
+        shape exactly -- ``ClaimRequest.active_task_ids`` defaults an absent
+        field to ``[]`` on the coordinator side, so the two are indistinguishable
+        there and there is no reason for a single-lease worker to say so.
         """
         body: dict[str, Any] = {"worker_id": worker_id}
         if capabilities is not None:
@@ -243,6 +254,8 @@ class CoordinatorClient:
             body["cached_base_models"] = cached_base_models
         if run_id:
             body["run_id"] = run_id
+        if active_task_ids:
+            body["active_task_ids"] = active_task_ids
 
         resp = self.request("POST", "/v1/tasks/claim", body, expect=(200, 204))
         if resp.status == 204:

@@ -34,7 +34,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import multiprocessing
 import os
+import queue as queue_mod
 import random
 import sys
 import threading
@@ -68,6 +70,13 @@ PAUSE_POLL_SEC = 60
 # coordinator would turn the heartbeat thread into a busy loop against the API,
 # from every worker in the fleet at once.
 MIN_HEARTBEAT_INTERVAL_SEC = 5
+
+# How long the supervisor (docs/14 §2, a multi-device host) waits between
+# checks of its own child processes -- reaping a finished one, or seeing
+# whether a slot freed up. Short and local: this is polling process state
+# already on this machine, not the coordinator, so there is no fleet-wide
+# thundering-herd concern the way there is for IDLE_SLEEP_SEC.
+SUPERVISE_POLL_SEC = 1.0
 
 # Reasons a worker declines a task at step 5. Reported on abandon so a
 # contributor asking "why do I never get work" has an answer.
@@ -137,6 +146,10 @@ class WorkerConfig:
     max_rounds: int | None = None
     verify_tls: bool = True
     skip_bench: bool = False
+    # Skips allocation_ceiling_mb's doubling-until-OOM search (docs/14 §2). On
+    # a single-GPU host that is one search; on a 4-card host it is four, and
+    # an operator who has already characterized the box needs to say so.
+    skip_alloc: bool = False
     # Host-visible scratch for contained jobs (docs/11 §2.3). Unset means this
     # machine did not opt into running submitter code, and the profile it
     # registers says so -- see ``Worker.create``.
@@ -289,6 +302,160 @@ def _requires_image(job_type: str) -> bool:
     return bool(getattr(REGISTRY.get(job_type), "requires_image", False))
 
 
+# --------------------------------------------------------------------------
+# Step 7: a multi-device host runs one child process per lease (docs/14 §2).
+#
+# A single-device worker (``Worker._slot_count() <= 1``, true of every fleet
+# member before this step and of most after it) never touches any of this --
+# ``Worker.run`` dispatches straight to ``_run_single``, byte-for-byte what
+# ``run`` has always done. Only a worker reporting more than one device takes
+# the branch below, so the existing single-task claim/train/submit cadence,
+# and every test built on it, is provably unaffected.
+#
+# Why a fresh child per lease rather than one long-lived child per device
+# slot: ``coordinator.devices.allocate`` hands out "the lowest count indices
+# from the free set" (its own docstring) -- there is no way for a worker to
+# ask the coordinator for a specific device index on its next claim. A
+# persistent per-slot child that pinned ``CUDA_VISIBLE_DEVICES`` once, at
+# startup, could therefore be handed a *different* physical device on a later
+# lease and have no way to follow it: a process's CUDA context, once
+# initialized against one visible set, cannot be repinned. Spawning fresh for
+# every lease sidesteps that entirely -- each child reads its own lease's
+# ``devices`` field and pins exactly that, every time.
+# --------------------------------------------------------------------------
+
+
+def _pin_env(backend: str | None, devices: list[int]) -> dict[str, str] | None:
+    """The in-process pin for one lease's child (docs/14 §2's table).
+
+    Returns the environment overrides the child must set, *before* anything
+    calls into CUDA/HIP/XPU, so that its default device resolves to the
+    physical index(es) this lease actually holds. Importing ``torch`` does
+    not touch the driver -- only the first real CUDA-family call does, and
+    that happens lazily, deep inside ``run_round``'s dispatch -- so setting
+    these as literally the first statements in ``_run_child`` is early enough,
+    with room to spare.
+
+    ``None`` means refuse rather than run unconfined. docs/14 §2 says a
+    backend with no known pinning form "refuses to launch rather than falling
+    back to 'all devices'" -- written about the *container* pin column, but
+    the reasoning is about the backend having no known pin at all, not about
+    which launch mechanism is asking, so it applies here too: a child that can
+    see every card while the ledger believes this lease holds only ``devices``
+    is exactly the double-booking the whole allocation ledger (docs/14 §1)
+    exists to prevent. ``mps`` and ``cpu`` are deliberately not refusals --
+    see the branch below.
+    """
+    if not devices:
+        return {}
+    csv = ",".join(str(d) for d in sorted(devices))
+    if backend == "cuda":
+        return {"CUDA_VISIBLE_DEVICES": csv}
+    if backend == "rocm":
+        # Both names: a PyTorch ROCm build answers to CUDA_VISIBLE_DEVICES as
+        # well as HIP_VISIBLE_DEVICES -- the same reason probe.py drives ROCm
+        # through the torch.cuda API (module docstring, "AMD chose that so
+        # CUDA code runs unmodified").
+        return {"HIP_VISIBLE_DEVICES": csv, "CUDA_VISIBLE_DEVICES": csv}
+    if backend == "xpu":
+        return {"ZE_AFFINITY_MASK": csv}
+    if backend in ("mps", "cpu"):
+        # Neither has an in-process pin token (docs/14 §2's table lists both
+        # as "n/a"). ``mps`` is always exactly one unindexed device by
+        # construction -- unified memory, nothing to select between. ``cpu``
+        # genuinely has none: a box whose operator raised
+        # ``GANYMEDE_CPU_SLOTS`` runs its children unpinned, contending for
+        # the same cores rather than isolated onto their own -- a real,
+        # documented gap (see the step report), not an oversight here.
+        return {}
+    # An unrecognised backend name reporting a device to pin. Refuse per the
+    # docstring above rather than guess.
+    return None
+
+
+class _Child:
+    """One lease's child process, from the supervisor's side.
+
+    Deliberately not a dataclass with the process/queue as identity fields --
+    equality and hashing on a live ``multiprocessing.Process`` are not
+    something anything here needs, and a dataclass's generated ``__eq__``
+    would be actively wrong for one.
+    """
+
+    __slots__ = ("task", "process", "queue", "result")
+
+    def __init__(self, task: dict[str, Any], process: "multiprocessing.Process",
+                 result_queue: Any):
+        self.task = task
+        self.process = process
+        self.queue = result_queue
+        # Set from ``result_queue`` once the child reports in (``_run_child``'s
+        # ``finally``). Its presence at reap time is the signal that
+        # ``run_round`` ran to completion inside the child -- see ``Worker._reap``.
+        self.result: dict[str, Any] | None = None
+
+
+def _run_child(config: WorkerConfig, worker_id: str, heartbeat_interval: int,
+               profile: dict[str, Any], task: dict[str, Any],
+               pin_env: dict[str, str], result_queue: Any, log_level: int) -> None:
+    """Entry point for one lease's child process (``Worker._spawn``).
+
+    Everything passed in is plain, picklable data -- never the parent's own
+    ``CoordinatorClient`` (holds a socket opener) or ``ControlFiles`` (holds a
+    ``threading.Event``), neither of which is guaranteed to survive a spawn
+    boundary intact even where pickling does not outright fail. A fresh
+    ``Worker`` is built here instead, from the same pieces ``Worker.create``
+    itself would have assembled, and calls the very same ``run_round`` a
+    single-device worker calls directly -- M4a's exception policy (module
+    docstring; ``run_round``'s own docstring) runs completely unmodified
+    either way, ported into the child rather than rewritten around it.
+
+    The devices are pinned first, before anything else runs -- see
+    ``_pin_env``'s docstring for why "first" is early enough and why it has
+    to be no later than this.
+    """
+    for key, value in pin_env.items():
+        os.environ[key] = value
+
+    # A spawned interpreter starts with no logging configuration of its own;
+    # without this, every log line run_round emits (and there are many, by
+    # design -- module docstring) vanishes silently inside the child. The
+    # task id prefix is what lets an operator tell two children's interleaved
+    # output apart in one combined log stream.
+    logging.basicConfig(
+        level=log_level,
+        format=f"%(asctime)s %(levelname)-7s %(name)s "
+               f"[task {str(task.get('task_id'))[:8]}] %(message)s",
+    )
+
+    worker = Worker(
+        config=config,
+        client=CoordinatorClient(config.coordinator_url, config.key,
+                                 verify_tls=config.verify_tls),
+        control=ControlFiles(config.state_dir),
+        profile=profile,
+        worker_id=worker_id,
+        heartbeat_interval=heartbeat_interval,
+    )
+    try:
+        worker.run_round(task)
+    finally:
+        # Best-effort, deliberately outside any narrower try/except: whatever
+        # happens above, tell the parent this process got far enough for
+        # run_round to have resolved the lease one way or another (submitted,
+        # abandoned, or moot because the round already closed underneath it --
+        # see run_round's own docstring). The parent's backstop in
+        # ``Worker._reap`` is what covers the child that never reaches this
+        # line at all -- a SIGKILL, an OS OOM kill, a crash below Python's own
+        # exception machinery -- and a queue write that itself fails costs
+        # nothing but this child's base-model affinity hint.
+        try:
+            loaded = worker.model_cache.loaded if worker.model_cache is not None else set()
+            result_queue.put({"loaded": sorted(loaded)})
+        except Exception:  # noqa: BLE001
+            pass
+
+
 @dataclass
 class Worker:
     config: WorkerConfig
@@ -313,6 +480,12 @@ class Worker:
     # criterion -- so an uncached worker would have M4b measuring the
     # safetensors reader.
     model_cache: Any = None
+    # Step 7, a multi-device host only: this worker's in-flight children,
+    # keyed by task id. Empty for the entire lifetime of a single-device
+    # worker -- ``_run_single`` never touches it -- which is what lets
+    # ``active_task_ids`` (``run()``'s claim call) stay a plain, cheap
+    # ``sorted(self.active)`` rather than something that has to ask.
+    active: dict[str, "_Child"] = field(default_factory=dict)
 
     @property
     def rounds_done(self) -> int:
@@ -334,7 +507,8 @@ class Worker:
             os.environ.setdefault("HF_HOME", config.cache_dir)
 
         log.info("probing hardware")
-        profile = probe_mod.run_probe(config.backend, skip_bench=config.skip_bench)
+        profile = probe_mod.run_probe(config.backend, skip_bench=config.skip_bench,
+                                      skip_alloc=config.skip_alloc)
         # docs/11 §4: what the coordinator's claim gate reads to decide whether
         # this machine may be handed submitter code. Both halves are required
         # -- a runtime that answers *and* somewhere to stage a job's files --
@@ -492,9 +666,22 @@ class Worker:
         }.get(job_type, self._run_train_round)
 
         task_id = task["task_id"]
+        container = None
+        if _requires_image(job_type):
+            # Only a contained job has a container to name (docs/11 §4's
+            # split); for the other two types ``None`` is correct and the
+            # crumb it writes carries no container for the reaper to act on.
+            # Computed the same way the heartbeat thread's own cancel handler
+            # and the job type's ``JobContainer`` compute it -- from the task
+            # id alone, before anything has necessarily started -- so all
+            # three land on the same name without sharing an instance.
+            from ganymede.worker.sandbox import container_name_for
+
+            container = container_name_for(task_id)
         beat = Heartbeater(
             self.client, task_id, self.heartbeat_interval,
             crumb_root=Path(self.config.job_scratch) if self.config.job_scratch else None,
+            container=container,
         ).start()
         started = time.monotonic()
 
@@ -737,6 +924,39 @@ class Worker:
         inputs = InputRefs(artifacts=task.get("artifacts") or {},
                            params=task.get("params") or {})
 
+        def on_cancel(mode: str) -> None:
+            # docs/11 §3 step 3, wired for real: act on the container from the
+            # heartbeat thread the instant a cancel latches, rather than
+            # waiting for ``_supervise``'s own poll (below) to come round.
+            # ``JobContainer`` needs nothing ``start`` would have set up --
+            # ``cancel`` only shells out by name -- and the name is
+            # deterministic from the task id, so this targets the same
+            # container ``jt.run`` is about to create (or already has)
+            # without sharing that instance.
+            #
+            # The container may not exist yet: a cancel can land during the
+            # archive pull, which has no should_stop check of its own and can
+            # run for up to PULL_TIMEOUT_SEC. `docker kill`/`stop` on an
+            # unknown name is a nonzero exit, not a raise -- `JobContainer.cancel`
+            # never inspects the return code -- so this is a harmless no-op
+            # until the container exists, at which point `_supervise` catches
+            # it on its very first check regardless (before any sleep).
+            #
+            # Building the config fresh rather than hoisting it above this
+            # closure keeps a `SandboxError` (an unset `GANYMEDE_JOB_SCRATCH`,
+            # say) from ever reaching the heartbeat thread's caller: it is
+            # caught here, not left to the best-effort log-and-swallow in
+            # `Heartbeater._run`, which exists for handlers that did not think
+            # about this and not as this one's actual error handling.
+            try:
+                cfg = sandbox.SandboxConfig.from_env()
+                sandbox.JobContainer(task_id=task_id, config=cfg).cancel(mode)
+            except sandbox.SandboxError as exc:
+                log.warning("task %s: could not act on the %s cancel from the "
+                           "heartbeat thread: %s", task_id, mode, exc)
+
+        beat.on_cancel = on_cancel
+
         def on_step(rows_done: int, _loss: float) -> None:
             # Rows the container has flushed to /scratch/out so far. Liveness
             # does not depend on this -- the Heartbeater is a thread on its own
@@ -770,7 +990,13 @@ class Worker:
         # That is precisely the failure M4a's handlers were written to prevent,
         # arriving by a new route.
         try:
-            result = jt.run(parsed, inputs, on_step, should_stop)
+            # ``backend`` is the machine's, not the lease's -- read off the
+            # worker's own profile, the same source ``_spawn``'s ``_pin_env``
+            # call reads for the in-process pin (docs/14 §2). ``parsed``
+            # already carries ``devices`` off the task payload itself
+            # (``ContainedTask.from_payload``), which is the per-lease half.
+            result = jt.run(parsed, inputs, on_step, should_stop,
+                           backend=self.profile.get("backend"))
         except ContainedCancelled:
             # A stop we asked for. The ``stopped`` block below decides what it
             # means for the lease.
@@ -939,8 +1165,37 @@ class Worker:
         time.sleep(delay * (1 - IDLE_SLEEP_JITTER + random.random() * IDLE_SLEEP_JITTER * 2))
 
     def run(self) -> int:
-        self.register()
+        """Register, then dispatch on how many devices this box reported.
 
+        ``_slot_count() <= 1`` is every worker before this step and most of
+        them after it, and takes ``_run_single`` -- unmodified from what
+        ``run`` itself used to be, word for word, so a single-device
+        worker's claim cadence, shutdown and model-cache reuse are provably
+        identical to today's rather than merely believed to be. Only a
+        worker reporting more than one device (docs/14 §2's ``devices``)
+        takes ``_run_supervisor``, the new path.
+
+        **Two loops now have to stay in agreement, and that is this design's
+        standing cost.** A fix applied to one and not the other is the failure
+        this split invites, and it will not show up in a single-device test
+        run, which is most of them. The split is paid for by the model cache:
+        ``allocate`` hands out the lowest free indices, so a child cannot be
+        pinned to a fixed device across leases (``CUDA_VISIBLE_DEVICES`` is
+        read once, when the CUDA context initialises), which makes one child
+        per *lease* the only sound shape -- and that gives up
+        ``modelcache``'s process-lifetime reuse. Making the single-device
+        path bypass the supervisor entirely is what keeps the fleet's
+        overwhelming majority from paying for a capability they do not use.
+        If the claim protocol ever lets a worker ask for a *named* device,
+        persistent per-slot children become possible and these two loops
+        should become one again.
+        """
+        self.register()
+        if self._slot_count() <= 1:
+            return self._run_single()
+        return self._run_supervisor()
+
+    def _run_single(self) -> int:
         while True:
             if self.control.should_stop():
                 log.info("stopping: %s", self.control.reason())
@@ -1009,6 +1264,262 @@ class Worker:
                          self.config.max_rounds, self.tasks_done)
                 return 0
 
+    # ---------------- step 7: the supervisor (a multi-device host) ----------------
+
+    def _slot_count(self) -> int:
+        """How many leases this worker tries to hold at once.
+
+        A cost guard, not the correctness one: the coordinator's own capacity
+        gate (docs/14 §5.2) is what actually stops over-claiming -- a plain
+        204, ``insufficient_free_devices``, whenever every device this worker
+        has is already spoken for. A supervisor that simply kept claiming
+        until it got that 204 would be self-limiting on its own.
+
+        This exists anyway because a claim that is going to be refused is
+        still a round trip, and because ``devices.allocate`` (docs/14 §4)
+        hands out whatever is free -- with no bound here, a fast poller could
+        open far more children than this box has devices for, each briefly
+        believing it holds a lease, before the coordinator's refusal even
+        lands. One child per device this box's own probe measured
+        (``probe.run_probe``'s ``devices`` list) is the number that actually
+        matches the hardware: never a constant, since the fleet ranges from
+        one donated card to an operator-raised ``GANYMEDE_CPU_SLOTS`` box, and
+        a hardcoded figure would either starve the second or over-claim on
+        the first.
+
+        Not exact, and does not need to be: a ``gpu_count > 1`` job can take
+        more devices than one free slot's worth in a single lease, and this
+        count has no way to know that in advance. ``len(self.active) < slots``
+        only decides whether the supervisor tries the next claim; the
+        coordinator's ledger is the arbiter of what actually fits.
+        """
+        devices = self.profile.get("devices")
+        if isinstance(devices, list) and devices:
+            return len(devices)
+        return 1
+
+    def _spawn(self, task: dict[str, Any]) -> None:
+        """Start one lease's child process, pinned to the devices the
+        coordinator allocated it (docs/14 §5.4's ``devices`` field on the
+        claim payload).
+
+        A method, not an inlined ``multiprocessing`` call, so a test can
+        replace it: ``StubClient`` cannot cross a real spawn boundary intact
+        (a copy of it in the child would record calls nobody in the test ever
+        reads back), so anything that spawns for real is untestable against
+        it, and the supervisor loop's own decisions are worth testing without
+        paying for a real process every time.
+        """
+        task_id = task["task_id"]
+        devices = task.get("devices") or []
+        pin = _pin_env(self.profile.get("backend"), devices)
+        if pin is None:
+            # docs/14 §2: refuse rather than run this lease with every card on
+            # the box visible while the ledger believes it holds only
+            # ``devices`` -- see ``_pin_env``'s docstring.
+            log.error(
+                "task %s: backend %r has no known way to pin devices %s; "
+                "refusing to run it unconfined -- abandoning",
+                task_id, self.profile.get("backend"), devices,
+            )
+            self._abandon(task_id)
+            return
+
+        ctx = multiprocessing.get_context("spawn")
+        result_queue = ctx.Queue()
+        process = ctx.Process(
+            target=_run_child,
+            args=(self.config, self.worker_id, self.heartbeat_interval,
+                  self.profile, task, pin, result_queue,
+                  logging.getLogger().getEffectiveLevel()),
+            # A safety net, not the primary mechanism: ``_run_supervisor``
+            # already waits out every child it knows about on every exit path
+            # (``_drain``). ``daemon=True`` only covers the case where the
+            # parent itself exits without reaching that -- an unhandled
+            # exception elsewhere in the supervisor loop -- so a bug there
+            # does not also leak an orphaned training process.
+            daemon=True,
+            name=f"ganymede-lease-{task_id[:8]}",
+        )
+        process.start()
+        self.active[task_id] = _Child(task, process, result_queue)
+
+    def _reap(self) -> None:
+        """Pull in every child that has finished since the last check.
+
+        Drains each live child's queue on every pass, not only once it has
+        exited: the child's ``result_queue.put`` (``_run_child``'s
+        ``finally``) races this method's own poll, and reading only right
+        after the process dies could miss an item that lands a moment later.
+        Doing it here means a late item is simply picked up on the *next*
+        pass instead of lost, so ``child.result`` only ever goes from unset to
+        set, never needs a retry of its own.
+        """
+        for task_id, child in list(self.active.items()):
+            while True:
+                try:
+                    child.result = child.queue.get_nowait()
+                except queue_mod.Empty:
+                    break
+                except (OSError, ValueError):
+                    # The queue's pipe can already be torn down on a process
+                    # that was killed hard enough; nothing more to read.
+                    break
+
+            if child.process.is_alive():
+                continue
+
+            if child.result is None:
+                # run_round resolves every terminal path itself before
+                # returning or raising -- submit, abandon, or a drop that
+                # means the coordinator already invalidated the lease (its
+                # own docstring). The one thing it cannot do anything about is
+                # not getting that far at all: a SIGKILL, an OS OOM kill, a
+                # crash below Python's exception machinery. This is that
+                # backstop -- and it is safe to call even when the child in
+                # fact already abandoned or submitted: ``rounds.abandon``'s
+                # own ``WHERE ... status = 'leased'`` makes a second call on
+                # an already-resolved lease a no-op, the same guarantee
+                # ``Worker._abandon``'s docstring already leans on elsewhere.
+                log.warning(
+                    "task %s: its child exited (code %s) without reporting; "
+                    "abandoning as a backstop", task_id, child.process.exitcode,
+                )
+                self._abandon(task_id)
+            else:
+                # What this child proved before it finished is still true
+                # even if the lease itself was dropped or abandoned -- a
+                # model that loaded is a model this host will not have to
+                # download again (``_cached_base_models``'s own reasoning).
+                self.cached_base_models |= set(child.result.get("loaded") or [])
+
+            self.tasks_done += 1
+            # Same accounting as `_run_single`, and for the same reason
+            # (that method's own comment): whatever the outcome, this was a
+            # round the worker took part in.
+            if child.task.get("run_id") is not None and child.task.get("round_idx") is not None:
+                self.rounds_worked.add((child.task["run_id"], int(child.task["round_idx"])))
+            else:
+                self.rounds_worked.add((child.task["task_id"], -1))
+
+            child.process.join(timeout=1)
+            del self.active[task_id]
+
+    def _drain(self) -> None:
+        """Block until every in-flight child has finished, reaping as they do.
+
+        No signal is sent to any child here. Every child shares this worker's
+        one stop/pause sentinel pair (``ControlFiles``, built from the same
+        ``config.state_dir`` in ``_run_child``) -- a contributor's kill switch
+        stops the *machine*, not one task, so it is deliberately not routed
+        through the parent at all. A child mid-round notices on its own very
+        next ``should_stop()`` check (exactly as a single-device worker does
+        today) and abandons its own lease before exiting; this just waits for
+        that, the same as a single-device worker's own shutdown does by
+        simply returning from ``run_round``.
+
+        Unbounded, on purpose: a single-device worker has no timeout on a
+        stop landing mid-download either (``can_honor``'s docstring; nothing
+        checks ``should_stop`` there today), so a supervisor that gave up
+        after some fixed wait would be a new, narrower guarantee than the one
+        thing being replaced actually offers.
+        """
+        while self.active:
+            self._reap()
+            if self.active:
+                time.sleep(SUPERVISE_POLL_SEC)
+
+    def _run_supervisor(self) -> int:
+        """One child process per free device, claimed for as long as the
+        coordinator keeps handing this worker more work.
+
+        Structurally ``_run_single``'s loop, widened from "one task in
+        flight" to "up to ``_slot_count()`` tasks in flight" -- same stop/
+        pause checks, same decline handling, same ``--once`` / ``--max-rounds``
+        contract. What changed is that a lease's work happens in a child
+        (``_spawn``) instead of inline, and the bookkeeping ``_run_single``
+        updates right after ``run_round`` returns is updated here at reap
+        time instead (``_reap``), which is the same moment for a worker that
+        can only ever have one lease in flight -- and the natural
+        generalisation once it can have several.
+        """
+        while True:
+            self._reap()
+
+            if self.control.should_stop():
+                log.info("stopping: %s", self.control.reason())
+                self._drain()
+                return 0
+
+            if self.control.should_pause():
+                log.info("paused: %s", self.control.reason())
+                # Nothing to release here the way `_run_single` releases its
+                # own model cache: this process never builds one (`_cache` is
+                # only ever called from inside a child), and each child's GPU
+                # memory goes back to the driver the ordinary way -- the
+                # process exiting -- once it notices the same pause sentinel
+                # and abandons (`_drain`'s docstring).
+                time.sleep(PAUSE_POLL_SEC)
+                continue
+
+            if self.config.max_rounds and self.rounds_done >= self.config.max_rounds:
+                log.info("reached max_rounds=%s after %d task(s)",
+                         self.config.max_rounds, self.tasks_done)
+                self._drain()
+                return 0
+
+            if len(self.active) >= self._slot_count():
+                # Every slot busy: nothing to do but wait for one to free up.
+                # Short and local -- this is polling this box's own process
+                # table, not the coordinator, so there is none of
+                # IDLE_SLEEP_SEC's fleet-wide thundering-herd concern.
+                time.sleep(SUPERVISE_POLL_SEC)
+                continue
+
+            try:
+                task, retry_after = self.client.claim(
+                    self.worker_id,
+                    capabilities=self.profile,
+                    cached_base_models=sorted(self._cached_base_models()),
+                    run_id=self.config.run_id,
+                    # docs/14 §5.1: every lease this worker already knows it
+                    # holds, so the coordinator's held-lease reconcile
+                    # re-serves only a lease it does *not* know about -- a
+                    # crashed child's, never a sibling still training.
+                    active_task_ids=sorted(self.active),
+                )
+            except CoordinatorError as exc:
+                log.warning("claim failed: %s", exc)
+                self._idle(IDLE_SLEEP_SEC)
+                continue
+
+            if task is None:
+                log.debug("no work; sleeping %ss", retry_after or IDLE_SLEEP_SEC)
+                self._idle(retry_after)
+                if self.config.once:
+                    return 0
+                continue
+
+            honored, reason = self.can_honor(task)
+            if not honored:
+                log.warning("declining task %s: %s", task["task_id"], reason)
+                self._abandon(task["task_id"])
+                if self.config.once:
+                    return 0
+                self._idle(IDLE_SLEEP_SEC)
+                continue
+
+            self._spawn(task)
+
+            if self.config.once:
+                # "one claim then exit" (the flag's own help text) means
+                # exiting with that one lease actually finished, not merely
+                # started -- otherwise the process would exit with a lease
+                # still training, which looks like the abandoned-mid-round
+                # case to anyone watching it from outside.
+                self._drain()
+                return 0
+
 
 # --------------------------------------------------------------------------
 # CLI
@@ -1039,6 +1550,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="stop after taking part in this many coordinator rounds; "
                         "a worker may take several tasks within one")
     p.add_argument("--skip-bench", action="store_true", help="skip the benchmark during probing")
+    p.add_argument("--skip-alloc", action="store_true",
+                   help="skip the allocation-ceiling search during probing -- "
+                        "on a multi-GPU host this search runs once per device")
     p.add_argument("--insecure", action="store_true",
                    help="skip TLS verification -- for a self-signed coordinator only")
     p.add_argument("--probe-only", action="store_true",
@@ -1058,7 +1572,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.probe_only:
         import json
 
-        print(json.dumps(probe_mod.run_probe(args.backend, skip_bench=args.skip_bench), indent=2))
+        print(json.dumps(
+            probe_mod.run_probe(args.backend, skip_bench=args.skip_bench,
+                                skip_alloc=args.skip_alloc),
+            indent=2,
+        ))
         return 0
 
     config = WorkerConfig.from_env(
@@ -1066,7 +1584,7 @@ def main(argv: list[str] | None = None) -> int:
         image_tag=args.image_tag, state_dir=args.state_dir, cache_dir=args.cache_dir,
         backend=args.backend, once=args.once or None, max_rounds=args.max_rounds,
         verify_tls=False if args.insecure else None, skip_bench=args.skip_bench or None,
-        node_id=args.node_id,
+        skip_alloc=args.skip_alloc or None, node_id=args.node_id,
     )
 
     # require_device's fail-loud twin, for the other thing a rented fleet gets

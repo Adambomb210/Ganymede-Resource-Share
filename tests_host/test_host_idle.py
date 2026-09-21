@@ -109,6 +109,25 @@ def test_a_malformed_window_fails_open_rather_than_closed():
 # --------------------------------------------------------------------------
 
 
+def _fake_nvidia_smi(gpu_csv: str, apps_csv: str):
+    """Build a ``subprocess.run`` stand-in that answers the two distinct
+    ``nvidia-smi`` calls ``_gpu_device_status`` now makes: ``--query-gpu``
+    (the index/uuid map) and ``--query-compute-apps`` (who is running where).
+    A single fixed return value, as the pre-rewrite tests used, silently
+    breaks once there are two different queries in flight -- the index map
+    would be parsed out of compute-app rows and vice versa."""
+    def _run(argv, **kwargs):
+        cmd = " ".join(argv)
+        if "--query-gpu=" in cmd:
+            return subprocess.CompletedProcess(argv, 0, stdout=gpu_csv, stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout=apps_csv, stderr="")
+    return _run
+
+
+# One GPU, uuid "GPU-0", the shape every single-device test below uses.
+_ONE_GPU_CSV = "0, GPU-0\n"
+
+
 def test_missing_nvidia_smi_means_free_not_busy(monkeypatch):
     """A Mac, an AMD box, or a CPU-only host has no nvidia-smi at all. If that
     read as "busy" it would permanently exclude exactly the machines the
@@ -135,7 +154,7 @@ def test_an_other_process_on_the_gpu_means_busy(monkeypatch):
     monkeypatch.setattr(idle.shutil, "which", lambda name: "/usr/bin/nvidia-smi")
     monkeypatch.setattr(
         idle.subprocess, "run",
-        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="1234, steam.exe\n", stderr=""),
+        _fake_nvidia_smi(_ONE_GPU_CSV, "GPU-0, 1234, steam.exe\n"),
     )
     busy, reason = idle._gpu_busy(_config())
     assert busy is True
@@ -144,10 +163,7 @@ def test_an_other_process_on_the_gpu_means_busy(monkeypatch):
 
 def test_an_empty_compute_apps_list_means_free(monkeypatch):
     monkeypatch.setattr(idle.shutil, "which", lambda name: "/usr/bin/nvidia-smi")
-    monkeypatch.setattr(
-        idle.subprocess, "run",
-        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="", stderr=""),
-    )
+    monkeypatch.setattr(idle.subprocess, "run", _fake_nvidia_smi(_ONE_GPU_CSV, ""))
     busy, _ = idle._gpu_busy(_config())
     assert busy is False
 
@@ -159,6 +175,86 @@ def test_require_gpu_free_false_skips_the_check_entirely(monkeypatch):
     monkeypatch.setattr(idle, "_gpu_busy", explode)
     cfg = _config(require_gpu_free=False)
     assert idle._gpu_check(cfg) is None
+
+
+# --------------------------------------------------------------------------
+# GPU free, per device (docs/14 §9): one busy card no longer parks the whole
+# multi-GPU box idle.
+# --------------------------------------------------------------------------
+
+
+_FOUR_GPU_CSV = "0, GPU-0\n1, GPU-1\n2, GPU-2\n3, GPU-3\n"
+
+
+def test_one_busy_card_on_a_four_gpu_box_still_reads_free(monkeypatch):
+    """The bug this rewrite exists to fix: the pre-rewrite aggregate marked
+    the whole machine busy the moment *any* card was, which on a donated
+    4-GPU box meant one contributor game on card 2 silently idled cards 0, 1
+    and 3 forever -- the worker never got the chance to start and offer the
+    coordinator the free cards at all."""
+    monkeypatch.setattr(idle.shutil, "which", lambda name: "/usr/bin/nvidia-smi")
+    monkeypatch.setattr(
+        idle.subprocess, "run",
+        _fake_nvidia_smi(_FOUR_GPU_CSV, "GPU-2, 555, steam.exe\n"),
+    )
+    busy, reason = idle._gpu_busy(_config())
+    assert busy is False
+    assert "1/4" in reason
+    assert "gpu2: steam.exe" in reason
+
+
+def test_every_card_busy_on_a_four_gpu_box_reads_busy(monkeypatch):
+    monkeypatch.setattr(idle.shutil, "which", lambda name: "/usr/bin/nvidia-smi")
+    apps = "\n".join(
+        f"GPU-{i}, {100 + i}, other-job-{i}.exe" for i in range(4)
+    ) + "\n"
+    monkeypatch.setattr(idle.subprocess, "run", _fake_nvidia_smi(_FOUR_GPU_CSV, apps))
+    busy, reason = idle._gpu_busy(_config())
+    assert busy is True
+    assert "other-job-0.exe" in reason
+
+
+def test_a_ganymede_process_is_excluded_per_card_not_just_globally(monkeypatch):
+    """The native-runtime attribution filter (``_looks_like_ganymede``) still
+    has to work once a process line carries a uuid ahead of the pid/name
+    pair -- a card running only our own worker must read as free, not busy,
+    on a multi-GPU box exactly as it does on a single-GPU one."""
+    monkeypatch.setattr(idle.shutil, "which", lambda name: "/usr/bin/nvidia-smi")
+    apps = "GPU-0, 42, python-ganymede-worker\nGPU-1, 43, steam.exe\n"
+    monkeypatch.setattr(
+        idle.subprocess, "run", _fake_nvidia_smi(_FOUR_GPU_CSV, apps),
+    )
+    busy, reason = idle._gpu_busy(_config())
+    assert busy is False
+    assert "1/4" in reason
+    assert "gpu1: steam.exe" in reason
+
+
+def test_gpu_device_status_reports_the_free_and_busy_split(monkeypatch):
+    """The per-device primitive directly, not just the aggregate it feeds."""
+    monkeypatch.setattr(idle.shutil, "which", lambda name: "/usr/bin/nvidia-smi")
+    monkeypatch.setattr(
+        idle.subprocess, "run",
+        _fake_nvidia_smi(_FOUR_GPU_CSV, "GPU-2, 555, steam.exe\n"),
+    )
+    status, reason = idle._gpu_device_status(_config())
+    assert reason == ""
+    assert status.total == 4
+    assert status.busy == {2: "steam.exe"}
+
+
+def test_gpu_device_status_none_when_the_index_map_call_fails(monkeypatch):
+    """A failure on the *first* of the two calls (the index/uuid map) must
+    read as unknown, not silently proceed with an empty map that would then
+    misattribute every compute-app row to no device at all."""
+    monkeypatch.setattr(idle.shutil, "which", lambda name: "/usr/bin/nvidia-smi")
+    monkeypatch.setattr(
+        idle.subprocess, "run",
+        lambda argv, **k: subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom"),
+    )
+    status, reason = idle._gpu_device_status(_config())
+    assert status is None
+    assert "exited 1" in reason
 
 
 # --------------------------------------------------------------------------

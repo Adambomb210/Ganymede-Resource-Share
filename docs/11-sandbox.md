@@ -177,16 +177,33 @@ seccomp / AppArmor. The job container inherits all of it. Added for submitter co
    (`leased → cancelled` is terminal in `05`) — no second container on one unit.
 
 Worst-case latency from cancel to the worker acting is one `heartbeat_interval_sec`
-(`06`).
+(`06`). The heartbeat thread acts on the container itself the instant a cancel
+latches, rather than leaving it to the job body's next `should_stop()` poll — a hard
+cancel that waits for the work to come round is not a hard cancel. It reaches the
+container by name, derived from the task id, so it needs no handle on a container the
+job type owns, and it is a harmless no-op if the cancel lands before the container
+exists.
 
 **Wedged worker — not heartbeating, not reaping the job container.**
 
-The worker writes `lease.renewed_at` to its state dir on every heartbeat. On its next
-tick the host agent treats a running job container whose `lease.renewed_at` is older
-than `lease_seconds` as orphaned: `docker kill` the job container, `docker rm -f` the
-worker, and let the following tick start a fresh one. Independently the coordinator
-expires the lease at `lease_seconds` and the task goes `cancelled` (cancel
-outstanding) or `expired`. In this path the soft / hard distinction collapses to hard
+The worker writes a **lease crumb** on every heartbeat — `task_id`, `renewed_at`, and
+the job container's name — **one file per task**, at `leases/<task_id>.json` under the
+job scratch root. Not the state dir, as an earlier draft of this section said: the
+state dir is mounted read-only into the worker precisely so the worker cannot forge
+the contributor's kill switch, so the scratch root is the one directory both the
+worker and the host agent can see and the worker may write.
+
+Per task rather than one file per host, because a host may hold several leases at
+once (`14`). A shared file would have the second task's heartbeat overwrite the
+first's record, leaving the reaper one task's liveness for two containers and no way
+to tell which.
+
+On its next tick the host agent weighs **every** crumb on its own. A running job
+container whose crumb is older than `lease_seconds` is orphaned: `docker kill` then
+`docker rm -f` **that job container** — not the worker, as an earlier draft said —
+and clear that crumb. One sweep may reap more than one container. Independently the
+coordinator expires each lease at `lease_seconds` and the task goes `cancelled`
+(cancel outstanding) or `expired`. In this path the soft / hard distinction collapses to hard
 — a wedged worker gets no graceful drain — and the latency bound is one host-timer
 interval (§7, default 900 s) rather than one heartbeat.
 

@@ -87,11 +87,18 @@ class CollabLoraFinetune:
     # has no `jobs` table, so this keeps claim_task's own run-centric signature
     # and body verbatim. Refusal is still `raise rounds.NotEligible`, recorded
     # in worker_eligibility exactly as today.
+    #
+    # ``free_devices`` / ``gpu_count`` / ``active_task_ids`` are docs/14 §5.3's
+    # additive kwargs (``JobType.shape_claim``'s docstring) -- forwarded
+    # verbatim to ``claim_task``, which owns the allocation inside its own
+    # ``immediate()`` block.
     def shape_claim(self, conn, run_id, worker_id, contributor_clearance, profile,
-                    settings, now=None, worker_image_tag=None, agreed_at=None):
+                    settings, now=None, worker_image_tag=None, agreed_at=None,
+                    *, free_devices, gpu_count=1, active_task_ids=None):
         return claim.claim_task(conn, run_id, worker_id, contributor_clearance,
                                 profile, settings, now, worker_image_tag,
-                                agreed_at=agreed_at)
+                                agreed_at=agreed_at, free_devices=free_devices,
+                                gpu_count=gpu_count, active_task_ids=active_task_ids)
 
     # -- 409 seam (ex-rounds heartbeat/record_submission round-status read) --
     def still_accepting(self, conn, run_id, round_idx):

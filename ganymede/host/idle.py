@@ -149,8 +149,108 @@ def _looks_like_ganymede(compute_app_line: str, config: HostConfig) -> bool:
     return "ganymede" in name or (config.container_name and config.container_name.lower() in name)
 
 
+@dataclass(frozen=True)
+class GpuDeviceStatus:
+    """Per-device answer to "is somebody else on this card" (docs/14 §9).
+
+    ``total`` is however many devices ``nvidia-smi --query-gpu`` enumerated;
+    ``busy`` maps the index of every device carrying a non-Ganymede compute
+    process to one description of it (the first such process on that card --
+    enough for the reason string ``_gpu_busy`` builds from this, and picking
+    only one is deliberate rather than an accident of iteration order: this
+    type answers "which cards, if any", never "how many processes per card").
+    A free index is simply absent from ``busy``.
+    """
+
+    total: int
+    busy: dict[int, str]
+
+
+def _gpu_device_status(config: HostConfig) -> tuple[GpuDeviceStatus | None, str]:
+    """The per-device busy map, plus a reason.
+
+    Returns ``(None, reason)`` when nvidia-smi cannot be asked at all -- the
+    binary is missing, either call times out or raises, or either call exits
+    non-zero -- and ``(status, "")`` otherwise. The reason on every failure
+    path ends "; assuming gpu free", the same convention every other check in
+    this module already uses (see ``_gpu_busy``'s own docstring for why
+    "cannot tell" must never read as "busy"), and it is what lets ``_gpu_busy``
+    hand a contributor a specific, debuggable line ("nvidia-smi not found" vs.
+    "nvidia-smi exited 1" vs. "nvidia-smi failed (timed out)") instead of one
+    generic "unknown" for every way this can fail.
+
+    Two ``nvidia-smi`` calls, not one: ``--query-compute-apps`` can report a
+    process's ``gpu_uuid`` but not its physical index, so the only way to say
+    *which card* a process is on is to resolve the uuid through the separate,
+    authoritative ``--query-gpu`` listing this function asks for first.
+    """
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        return None, "nvidia-smi not found; assuming gpu free"
+
+    try:
+        gpu_proc = subprocess.run(
+            [nvidia_smi, "--query-gpu=index,uuid", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SEC,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"nvidia-smi failed ({exc}); assuming gpu free"
+    if gpu_proc.returncode != 0:
+        return None, f"nvidia-smi exited {gpu_proc.returncode}; assuming gpu free"
+
+    index_map: dict[str, int] = {}
+    for line in gpu_proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        idx_s, _, uuid = line.partition(",")
+        try:
+            index_map[uuid.strip()] = int(idx_s.strip())
+        except ValueError:
+            continue
+
+    try:
+        apps_proc = subprocess.run(
+            [nvidia_smi, "--query-compute-apps=gpu_uuid,pid,process_name",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SEC,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"nvidia-smi failed ({exc}); assuming gpu free"
+    if apps_proc.returncode != 0:
+        return None, f"nvidia-smi exited {apps_proc.returncode}; assuming gpu free"
+
+    busy: dict[int, str] = {}
+    for line in apps_proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Exactly three CSV fields requested above; a process name can itself
+        # contain a comma on some platforms, so everything after the second
+        # comma is the name, not just the third field.
+        parts = [p.strip() for p in line.split(",", 2)]
+        if len(parts) != 3:
+            continue
+        uuid, pid, name = parts
+        idx = index_map.get(uuid)
+        if idx is None:
+            continue
+        # ``_looks_like_ganymede`` wants the "pid, name" shape the old
+        # single-call reason string handed it -- reconstructed explicitly
+        # here, since that function's own rsplit(",", 1) assumes the name is
+        # the line's last field, and the raw line here carries the uuid too.
+        if _looks_like_ganymede(f"{pid}, {name}", config):
+            continue
+        # First process wins the reason string for that card (class
+        # docstring); a card can host more than one, but which one is named
+        # here is cosmetic, not load-bearing.
+        busy.setdefault(idx, name)
+    return GpuDeviceStatus(total=len(index_map), busy=busy), ""
+
+
 def _gpu_busy(config: HostConfig) -> tuple[bool, str]:
-    """No non-Ganymede compute process on the GPU (7.1).
+    """The machine-wide answer this module's other callers still want: is
+    there a non-Ganymede compute process on the GPU (7.1)?
 
     Absence of ``nvidia-smi`` -- or any failure running it -- is answered as
     "free", never "busy". A Mac, an AMD box, or a CPU-only host has no NVIDIA
@@ -158,31 +258,44 @@ def _gpu_busy(config: HostConfig) -> tuple[bool, str]:
     exclude every one of those from ever contributing, which is exactly
     backwards for a project whose whole point is broad hardware compatibility
     (6.9). The check can only ever prove the GPU busy, never prove it free.
+
+    **Multi-GPU semantics, docs/14 §9.** "Busy" here now means *every* card
+    ``nvidia-smi`` reports carries a non-Ganymede process, not merely one of
+    several. On a single-GPU host the two readings are identical -- one busy
+    card is the only card, so this is a byte-for-byte-unchanged answer for
+    the fleet's overwhelming majority. On a multi-GPU host, the old
+    "any busy card marks the machine busy" reading meant one contributor
+    running a game on card 3 of a four-card box silently stopped the worker
+    from ever starting on cards 0-2 -- the whole donated machine going idle
+    over one occupied slot, forever, since the worker never gets the chance
+    to register a device inventory that would let the coordinator route
+    around the busy one. ``require_gpu_free``'s own comment in ``config.py``
+    is updated to say this too, since that setting is what a contributor
+    reads before deciding whether they still want the check on.
+
+    This is a *start/stop* gate, not a routing decision -- it answers "should
+    the worker container run at all", never "which card should it use". A
+    card this function finds busy is not communicated to the worker's own
+    probe once it starts (``worker/probe.py`` enumerates every device the
+    backend reports, unconditionally), so the coordinator can still allocate
+    the occupied card to a job. See the step's own report for why that gap is
+    recorded rather than closed here.
     """
-    nvidia_smi = shutil.which("nvidia-smi")
-    if not nvidia_smi:
-        return False, "nvidia-smi not found; assuming gpu free"
-
-    try:
-        proc = subprocess.run(
-            [nvidia_smi, "--query-compute-apps=pid,process_name", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=SUBPROCESS_TIMEOUT_SEC,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, f"nvidia-smi failed ({exc}); assuming gpu free"
-
-    if proc.returncode != 0:
-        return False, f"nvidia-smi exited {proc.returncode}; assuming gpu free"
-
-    apps = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-    others = [line for line in apps if not _looks_like_ganymede(line, config)]
-    if not others:
+    status, reason = _gpu_device_status(config)
+    if status is None:
+        return False, reason
+    if status.total == 0 or not status.busy:
         return False, "gpu free"
+    if len(status.busy) >= status.total:
+        names = list(status.busy.values())
+        extra = f" (+{len(names) - 1} more)" if len(names) > 1 else ""
+        return True, f"gpu in use: {names[0]}{extra}"
 
-    extra = f" (+{len(others) - 1} more)" if len(others) > 1 else ""
-    return True, f"gpu in use: {others[0]}{extra}"
+    # At least one card is free even though not every card is (the fix this
+    # rewrite exists for) -- named explicitly, since "why did it start with a
+    # busy card in the fleet" has to have an answer in the log.
+    detail = ", ".join(f"gpu{i}: {name}" for i, name in sorted(status.busy.items()))
+    return False, f"gpu free ({len(status.busy)}/{status.total} device(s) busy: {detail})"
 
 
 def _gpu_check(config: HostConfig) -> IdleReport | None:

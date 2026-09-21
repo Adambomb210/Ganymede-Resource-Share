@@ -28,6 +28,26 @@ AMD chose that so CUDA code runs unmodified. The only reliable discriminator is
 ``torch.version.hip``, so ROCm is checked *before* CUDA -- reverse them and every
 AMD machine in the fleet reports itself as NVIDIA, and the throughput table keys
 two different architectures under one name.
+
+A multi-GPU host (docs/14 §2)
+------------------------------
+Each ``Backend`` also carries ``list_devices``, which answers "how many, and
+which ``torch.device`` objects" the way ``describe`` answers "what is this one
+like". ROCm and CUDA share an implementation -- same reason ``describe`` does --
+XPU calls its own ``device_count``, MPS is always exactly one device (unified
+memory has no index to enumerate), and CPU defaults to one and is raisable by an
+operator (``GANYMEDE_CPU_SLOTS``) because ``_describe_cpu`` reports ``vram_mb``
+as total system RAM: N slots would each claim the whole machine's memory, so
+raising it is a deliberate act, never a default.
+
+``run_probe`` measures every device ``list_devices`` returns, in a plain
+sequential loop -- never concurrently. ``allocation_ceiling_mb`` doubles a real
+allocation until it fails; two such searches racing on the same box would each
+see a fraction of the true ceiling, and that understated number is exactly what
+``budget.is_eligible`` and ``constraints._vram_mb`` prefer over ``vram_mb``, so
+a concurrent probe would silently make a machine ineligible for work it could
+actually do. Device 0's measurements populate the profile's flat fields, byte-
+identical to what a single-GPU probe has always produced -- see ``run_probe``.
 """
 
 from __future__ import annotations
@@ -81,7 +101,27 @@ class Backend:
     detect: Callable[[], bool]
     device: Callable[[], torch.device]
     describe: Callable[[torch.device], dict[str, Any]]
+    # Every ``torch.device`` this backend has right now, index order (docs/14
+    # §2). ``device`` above stays what it always was -- this backend's default
+    # device, used by every caller that predates multi-GPU reporting -- so
+    # ``list_devices`` is additive rather than a replacement, and a machine
+    # whose enumeration errors (module docstring's "registration always
+    # succeeds") falls back to ``[device()]`` in ``run_probe``, never to zero
+    # devices.
+    list_devices: Callable[[], list[torch.device]]
+    # True when every device this backend reports draws on ONE pool of memory
+    # rather than each having its own -- CPU slots and Apple's unified memory.
+    # It decides whether the per-device ``vram_mb`` figures may be summed:
+    # four CPU slots each reporting the machine's whole RAM would have
+    # ``constraints.total_vram_gb`` advertise four times the memory that
+    # exists, and a submitter predicate like ``total_vram_gb >= 100`` would
+    # match a 32 GB box.
     allocation_is_catchable: bool
+    # Defaults False: a card's VRAM is normally its own, which is both the
+    # common case and the safe one to get by default -- summing discrete
+    # memory is exactly right, while wrongly summing a shared pool
+    # over-advertises it.
+    shares_memory_pool: bool = False
     synchronize: Callable[[torch.device], None] = lambda device: None
     empty_cache: Callable[[], None] = lambda: None
     # "supported" backends are exercised in CI or on real hardware we have.
@@ -172,11 +212,62 @@ def _describe_cpu(device: torch.device) -> dict[str, Any]:
     }
 
 
+# --------------------------------------------------------------------------
+# Per-backend device enumeration (docs/14 §2)
+# --------------------------------------------------------------------------
+
+
+def _cuda_devices() -> list[torch.device]:
+    """One entry per ``torch.cuda.device_count()``, in index order.
+
+    Shared by ``cuda`` and ``rocm`` for the same reason ``_describe_rocm``
+    exists as its own function rather than an alias of ``_describe_cuda``: the
+    *count* is identical either way (AMD's ROCm build exposes the same
+    ``torch.cuda`` API), even though what each index *is* differs enough to
+    need its own describe.
+    """
+    return [torch.device("cuda", i) for i in range(torch.cuda.device_count())]
+
+
+def _xpu_devices() -> list[torch.device]:
+    return [torch.device("xpu", i) for i in range(torch.xpu.device_count())]
+
+
+def _mps_devices() -> list[torch.device]:
+    """Always exactly one, unindexed -- unified memory, no per-card identity
+    (docs/14 §2's table)."""
+    return [torch.device("mps")]
+
+
+def _cpu_slot_count() -> int:
+    """1 by default; raisable by an operator via ``GANYMEDE_CPU_SLOTS``.
+
+    A CPU box could genuinely run several tasks at once, but ``_describe_cpu``
+    reports ``vram_mb`` as total system RAM -- there is no per-slot figure to
+    report instead -- so N slots would each claim the whole machine's memory
+    as their own budget. That is a real overcommit, not a rounding error, so
+    raising it has to be an operator's deliberate act rather than something
+    this probe guesses at. An unset or malformed value is read as 1: the same
+    "never refuse to register" doctrine as everything else in this module
+    applies to a misconfigured env var as much as to a broken driver.
+    """
+    raw = os.environ.get("GANYMEDE_CPU_SLOTS", "1")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 1
+
+
+def _cpu_devices() -> list[torch.device]:
+    return [torch.device("cpu") for _ in range(_cpu_slot_count())]
+
+
 # Ordered. ROCm precedes CUDA deliberately -- see the module docstring.
 BACKENDS: tuple[Backend, ...] = (
     Backend(
         name="rocm", detect=_is_rocm, device=lambda: torch.device("cuda"),
-        describe=_describe_rocm, allocation_is_catchable=True,
+        describe=_describe_rocm, list_devices=_cuda_devices,
+        allocation_is_catchable=True,
         synchronize=torch.cuda.synchronize, empty_cache=torch.cuda.empty_cache,
         maturity="untested",
         notes="AMD via a PyTorch ROCm build. Detected by torch.version.hip; the "
@@ -184,12 +275,14 @@ BACKENDS: tuple[Backend, ...] = (
     ),
     Backend(
         name="cuda", detect=_is_cuda, device=lambda: torch.device("cuda"),
-        describe=_describe_cuda, allocation_is_catchable=True,
+        describe=_describe_cuda, list_devices=_cuda_devices,
+        allocation_is_catchable=True,
         synchronize=torch.cuda.synchronize, empty_cache=torch.cuda.empty_cache,
     ),
     Backend(
         name="xpu", detect=_has_xpu, device=lambda: torch.device("xpu"),
-        describe=_describe_xpu, allocation_is_catchable=True,
+        describe=_describe_xpu, list_devices=_xpu_devices,
+        allocation_is_catchable=True,
         synchronize=lambda device: torch.xpu.synchronize(device),
         empty_cache=lambda: torch.xpu.empty_cache(),
         maturity="untested",
@@ -197,9 +290,10 @@ BACKENDS: tuple[Backend, ...] = (
     ),
     Backend(
         name="mps", detect=_has_mps, device=lambda: torch.device("mps"),
-        describe=_describe_mps,
+        describe=_describe_mps, list_devices=_mps_devices,
         # Unified memory: exhausting it is exhausting the machine's RAM, and the
         # OOM killer is not catchable.
+        shares_memory_pool=True,
         allocation_is_catchable=False,
         synchronize=lambda device: torch.mps.synchronize(),
         empty_cache=lambda: torch.mps.empty_cache(),
@@ -207,7 +301,9 @@ BACKENDS: tuple[Backend, ...] = (
     ),
     Backend(
         name="cpu", detect=lambda: True, device=lambda: torch.device("cpu"),
-        describe=_describe_cpu, allocation_is_catchable=False,
+        describe=_describe_cpu, list_devices=_cpu_devices,
+        shares_memory_pool=True,
+        allocation_is_catchable=False,
         synchronize=_noop_sync,
         notes="Always available. Rarely above a run's throughput floor, but it "
               "registers, and 6.8 notes such a machine may still be able to run evals.",
@@ -467,22 +563,41 @@ def _package_version() -> str | None:
         return None
 
 
-def run_probe(
-    prefer_backend: str | None = None,
-    *,
-    skip_bench: bool = False,
-    skip_alloc: bool = False,
-) -> dict[str, Any]:
-    """The full self-test, in the shape the coordinator's ComputeProfile expects.
-
-    Target is under a minute. Nothing here raises: a machine whose every
-    measurement failed still produces a profile, registers, and is simply never
-    eligible -- which is the designed outcome, and a far better support
-    experience than silence.
+def _device_share(value: object, divisor: int) -> int | None:
+    """One device's share of a pooled figure, or the figure itself when the
+    pool is not shared (``divisor == 1``). ``None`` in, ``None`` out: a
+    measurement that was skipped or failed stays absent rather than becoming
+    a fabricated zero, which ``is_eligible`` would read as a real capacity
+    claim of nothing.
     """
-    backend = detect_backend(prefer_backend or os.environ.get("GANYMEDE_BACKEND"))
-    device = backend.device()
+    if value is None:
+        return None
+    try:
+        return int(int(value) // max(1, divisor))
+    except (TypeError, ValueError):
+        return None
 
+
+def _probe_one_device(backend: Backend, device: torch.device, *,
+                      skip_bench: bool, skip_alloc: bool) -> dict[str, Any]:
+    """describe + precision_support + allocation_ceiling_mb + bench_score for
+    one ``device``, in the exact shape ``run_probe`` has always returned for
+    its single (flat-field) device. Factored out so that device 0 of a multi-
+    GPU box goes through *this same code*, unmodified, and the flat profile
+    fields it feeds stay byte-identical to a pre-multi-GPU probe (docs/14 §2).
+
+    Every one of the four measurements runs here, for every device --
+    including precision and bench, which is 4x the work on a 4-card box. That
+    is a deliberate choice, not an oversight: this module's whole premise
+    (module docstring) is that the worker *measures* and the coordinator
+    *believes it*, and copying device 0's numbers onto devices 1..N would
+    quietly violate that for exactly the boxes where it matters most --
+    several cards sharing one power and cooling budget throttle
+    independently, so an untested assumption that "the same card model means
+    the same number" is precisely the kind of claim this module exists not to
+    make. ``skip_bench`` / ``skip_alloc`` (now reaching every device, not just
+    one) are the operator's existing lever for that cost, not a new one.
+    """
     try:
         described = backend.describe(device)
     except Exception as exc:  # noqa: BLE001
@@ -496,13 +611,10 @@ def run_probe(
         else bench_score(backend, device)
 
     return {
-        "backend": backend.name,
         "device_name": described.get("device_name", "unknown"),
         "vram_mb": int(described.get("vram_mb") or 0),
         "compute_capability": described.get("compute_capability"),
         "driver": described.get("driver"),
-        "torch_ver": torch.__version__,
-        "package_version": _package_version(),
         "supports": precision["supports"],
         "probe": {
             **alloc,
@@ -512,4 +624,94 @@ def run_probe(
             "platform": f"{platform.system()} {platform.machine()}",
             **({"describe_error": described["describe_error"]} if "describe_error" in described else {}),
         },
+    }
+
+
+def run_probe(
+    prefer_backend: str | None = None,
+    *,
+    skip_bench: bool = False,
+    skip_alloc: bool = False,
+) -> dict[str, Any]:
+    """The full self-test, in the shape the coordinator's ComputeProfile expects.
+
+    Target is under a minute per device. Nothing here raises: a machine whose
+    every measurement failed still produces a profile, registers, and is
+    simply never eligible -- which is the designed outcome, and a far better
+    support experience than silence.
+
+    Measures every device ``backend.list_devices()`` reports, **strictly
+    sequentially** (docs/14 §2) -- a plain loop, never a thread pool or async
+    gather. ``allocation_ceiling_mb`` finds the real ceiling by doubling a
+    live allocation until it fails; run two of those searches concurrently on
+    one box and each only sees whatever fraction of memory the other left
+    behind, understating the true ceiling. That understated number is exactly
+    what ``budget.is_eligible`` and ``constraints._vram_mb`` prefer over the
+    spec-sheet ``vram_mb``, so a concurrent probe would silently make a
+    machine ineligible for work it could actually do -- the opposite of this
+    module's "registration always succeeds" doctrine.
+    """
+    backend = detect_backend(prefer_backend or os.environ.get("GANYMEDE_BACKEND"))
+
+    try:
+        targets = backend.list_devices()
+    except Exception:  # noqa: BLE001 - an enumeration that errors registers as one device
+        targets = []
+    if not targets:
+        targets = [backend.device()]
+
+    devices = [
+        _probe_one_device(backend, device, skip_bench=skip_bench, skip_alloc=skip_alloc)
+        for device in targets
+    ]
+
+    # The flat fields, populated from device 0 (docs/14 §2). They feed the
+    # uuid5 fingerprint that derives worker_id in app.register; changing them
+    # for a machine that already exists in the fleet would re-register it as
+    # a new worker and orphan its reputation, enrollment and accrual history.
+    # ``_probe_one_device`` is the same function (unmodified) a single-GPU
+    # probe has always called, so this block is byte-identical to the profile
+    # this function produced before multi-GPU reporting existed.
+    primary = devices[0]
+    # One pool split N ways, or N independent pools. See the ``devices`` block.
+    pool_divisor = len(devices) if backend.shares_memory_pool else 1
+    return {
+        "backend": backend.name,
+        "device_name": primary["device_name"],
+        "vram_mb": primary["vram_mb"],
+        "compute_capability": primary["compute_capability"],
+        "driver": primary["driver"],
+        "torch_ver": torch.__version__,
+        "package_version": _package_version(),
+        "supports": primary["supports"],
+        "probe": primary["probe"],
+        # Per-device inventory (docs/14 §2). Key names are load-bearing --
+        # cross-checked against ``coordinator.devices.reconcile_inventory``,
+        # the consumer, both in its fallback synthesis and in what it writes
+        # to ``worker_devices``.
+        #
+        # ``vram_mb`` here is a *share*, not a copy of the flat figure, on a
+        # backend whose devices draw on one pool (``shares_memory_pool``).
+        # The flat field above describes the machine and must not change --
+        # it is a uuid5 fingerprint input -- but these are summed by
+        # ``constraints.total_vram_gb``, so four CPU slots each reporting the
+        # machine's whole RAM would advertise four times the memory that
+        # exists and a ``total_vram_gb >= 100`` predicate would match a 32 GB
+        # box. Dividing is also the honest per-slot budget: a slot really can
+        # only use its share without starving its siblings. Discrete-memory
+        # backends (CUDA, ROCm, XPU) are untouched -- each card's VRAM is
+        # genuinely its own, and summing those is exactly right.
+        "devices": [
+            {
+                "index": i,
+                "name": d["device_name"],
+                "vram_mb": _device_share(d["vram_mb"], pool_divisor),
+                "compute_capability": d["compute_capability"],
+                "supports": d["supports"],
+                "alloc_max_mb": _device_share(
+                    d["probe"].get("alloc_max_mb"), pool_divisor),
+                "bench_score": d["probe"].get("bench_score"),
+            }
+            for i, d in enumerate(devices)
+        ],
     }

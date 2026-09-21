@@ -249,3 +249,280 @@ def test_partial_upgrade_from_v2_runs_only_whats_pending(old_db):
     applied = migrations.apply_pending(conn)
     assert applied == [v for v, _n, _f in migrations.MIGRATIONS if v > 2]
     assert migrations.current_version(conn) == migrations.LATEST_VERSION
+
+
+# --------------------------------------------------------------------------
+# 009 -- multi-GPU hosts (docs/14)
+# --------------------------------------------------------------------------
+
+
+def _upgrade_to_pre_009(conn: sqlite3.Connection) -> None:
+    """Bring a database to exactly the version below 009, so a test can seed
+    rows through the ordinary schema before running 009 in isolation. Walks
+    ``MIGRATIONS`` rather than hard-coding "8": the file's own convention
+    (``test_fresh_reaches_latest_version``) is that a literal version number
+    trains a reader to bump it without looking."""
+    migrations._ensure_cursor(conn)
+    for _version, _name, fn in migrations.MIGRATIONS:
+        if fn is migrations._m009_multi_gpu_hosts:
+            break
+        fn(conn)
+
+
+@pytest.mark.parametrize("table,columns", [
+    ("worker_devices", {"worker_id", "device_index", "device_name", "vram_mb",
+                         "compute_capability", "supports_json", "alloc_max_mb",
+                         "bench_score", "retired_at"}),
+    ("task_devices", {"task_id", "worker_id", "device_index", "allocated_at",
+                       "released_at", "release_reason"}),
+    ("device_reservations", {"worker_id", "device_index", "job_id",
+                              "reserved_at", "expires_at"}),
+])
+def test_fresh_has_every_009_table_with_the_right_columns(fresh, table, columns):
+    assert columns <= _cols(fresh, table)
+
+
+def test_fresh_has_the_009_columns(fresh):
+    assert "gpu_count" in _cols(fresh, "jobs")
+    assert "gpu_count" in _cols(fresh, "tasks")
+    assert "max_concurrent_gpus" in _cols(fresh, "submitter_quotas")
+
+
+def test_gpu_count_defaults_to_1_on_existing_rows(old_db):
+    """A row that existed before 009 ran gets the same default a brand-new row
+    would -- "nothing has changed" for a fleet of single-GPU hosts."""
+    conn, _cid, _wid = old_db
+    init_schema(conn)
+    row = conn.execute("SELECT gpu_count FROM tasks WHERE id = 't1'").fetchone()
+    assert row["gpu_count"] == 1
+
+
+def test_worker_backfill_produces_one_device_per_existing_worker(old_db):
+    conn, _cid, wid = old_db
+    init_schema(conn)
+    rows = conn.execute(
+        "SELECT * FROM worker_devices WHERE worker_id = ?", (wid,)
+    ).fetchall()
+    assert len(rows) == 1
+    d = rows[0]
+    assert d["device_index"] == 0
+    # old_db's profile is {"backend": "cuda", "device_name": "RTX 3060", "vram_mb": 12288}
+    assert d["device_name"] == "RTX 3060"
+    assert d["vram_mb"] == 12288
+    assert d["compute_capability"] is None
+    assert json.loads(d["supports_json"]) == []
+    assert d["alloc_max_mb"] is None
+    assert d["bench_score"] is None
+
+
+def test_worker_backfill_falls_back_when_profile_is_unparseable(fresh):
+    """An unparseable/missing profile must not abort the migration -- it lands
+    on the same "unknown" / 0 pair ``probe.run_probe`` itself uses when its own
+    ``describe()`` fails, which is fail-closed rather than fabricated."""
+    cid = uuid.uuid4().hex
+    fresh.execute(
+        "INSERT INTO contributors (id, name, key_hash, enabled, clearance, created_at) "
+        "VALUES (?, 'bob', ?, 1, 'open', 'now')", (cid, hash_key("bob-key")),
+    )
+    wid = uuid.uuid4().hex
+    fresh.execute(
+        "INSERT INTO workers (id, contributor_id, compute_profile_json, "
+        "first_seen, last_seen) VALUES (?, ?, 'not json', 'now', 'now')",
+        (wid, cid),
+    )
+    fresh.commit()
+    migrations._backfill_worker_devices(fresh)
+    d = fresh.execute(
+        "SELECT * FROM worker_devices WHERE worker_id = ?", (wid,)
+    ).fetchone()
+    assert d["device_name"] == "unknown"
+    assert d["vram_mb"] == 0
+    assert json.loads(d["supports_json"]) == []
+
+
+def test_live_lease_backfill_carries_the_original_leased_at(old_db):
+    """A pre-009 database with a leased task gets a task_devices row whose
+    allocated_at is the task's own leased_at (docs/14 §3), not the migration's
+    clock, so the history this table starts is honest."""
+    conn, _cid, wid = old_db
+    _upgrade_to_pre_009(conn)
+    sentinel = "2024-03-03T03:03:03+00:00"
+    conn.execute("UPDATE tasks SET leased_at = ? WHERE id = 't1'", (sentinel,))
+    conn.commit()
+
+    migrations._m009_multi_gpu_hosts(conn)
+
+    row = conn.execute(
+        "SELECT * FROM task_devices WHERE task_id = 't1'"
+    ).fetchone()
+    assert row is not None
+    assert row["worker_id"] == wid
+    assert row["device_index"] == 0
+    assert row["allocated_at"] == sentinel
+    assert row["released_at"] is None
+
+
+def test_live_lease_backfill_falls_back_to_created_at_when_leased_at_is_null(old_db):
+    conn, _cid, wid = old_db
+    _upgrade_to_pre_009(conn)
+    conn.execute(
+        "UPDATE tasks SET leased_at = NULL, created_at = ? WHERE id = 't1'",
+        ("2024-01-09T09:09:09+00:00",),
+    )
+    conn.commit()
+
+    migrations._m009_multi_gpu_hosts(conn)
+
+    row = conn.execute(
+        "SELECT allocated_at FROM task_devices WHERE task_id = 't1'"
+    ).fetchone()
+    assert row["allocated_at"] == "2024-01-09T09:09:09+00:00"
+
+
+def test_live_lease_backfill_skips_a_leased_task_with_no_worker(old_db):
+    """tasks.worker_id is nullable; task_devices.worker_id is not. A leased row
+    with no worker is a data anomaly this migration must not raise on."""
+    conn, _cid, _wid = old_db
+    _upgrade_to_pre_009(conn)
+    conn.execute("UPDATE tasks SET worker_id = NULL WHERE id = 't1'")
+    conn.commit()
+
+    migrations._m009_multi_gpu_hosts(conn)  # must not raise
+
+    n = conn.execute(
+        "SELECT COUNT(*) FROM task_devices WHERE task_id = 't1'"
+    ).fetchone()[0]
+    assert n == 0
+
+
+def test_partial_index_rejects_a_second_unreleased_row_for_the_same_device(fresh):
+    """The load-bearing invariant (docs/14 §1, §3): SQLite itself, not
+    application logic, refuses a second live occupant of one (worker, device).
+    Inserts real parent rows first, since ``connect()`` runs with
+    foreign_keys=ON and an invented parent id would fail on the FK rather than
+    exercise the index. Two distinct task_ids, so this reads as two different
+    tasks contending for one card -- which is the case the index exists for."""
+    cid = uuid.uuid4().hex
+    fresh.execute(
+        "INSERT INTO contributors (id, name, key_hash, enabled, clearance, created_at) "
+        "VALUES (?, 'carol', ?, 1, 'open', 'now')", (cid, hash_key("carol-key")),
+    )
+    wid = uuid.uuid4().hex
+    fresh.execute(
+        "INSERT INTO workers (id, contributor_id, compute_profile_json, "
+        "first_seen, last_seen) VALUES (?, ?, '{}', 'now', 'now')", (wid, cid),
+    )
+    for tid in ("ta", "tb"):
+        fresh.execute(
+            "INSERT INTO tasks (id, buckets_json, local_steps, status, "
+            "worker_id, attempts, created_at) "
+            "VALUES (?, '[]', 1, 'leased', ?, 1, 'now')", (tid, wid),
+        )
+    fresh.commit()
+
+    fresh.execute(
+        "INSERT INTO task_devices (task_id, worker_id, device_index, allocated_at) "
+        "VALUES ('ta', ?, 0, 'now')", (wid,),
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        fresh.execute(
+            "INSERT INTO task_devices (task_id, worker_id, device_index, allocated_at) "
+            "VALUES ('tb', ?, 0, 'now')", (wid,),
+        )
+
+
+def test_one_task_may_hold_the_same_device_twice_over_its_lifetime(fresh):
+    """Task ids are recycled, so the ledger must tolerate a (task, device) pair
+    appearing more than once.
+
+    ``_claim_static_task`` re-leases the *same* ``tasks`` row after an expiry,
+    an abandon or a preemption rather than minting a new id. A shard that is
+    expired and then re-claimed onto the card it was already using is ordinary
+    operation, and it produces two honest rows: the first released, the second
+    live. This is why ``task_devices`` is keyed on a surrogate rowid -- a
+    composite key over (task_id, device_index) would have rejected the second
+    allocation with an IntegrityError, taking out the re-claim.
+    """
+    cid = uuid.uuid4().hex
+    fresh.execute(
+        "INSERT INTO contributors (id, name, key_hash, enabled, clearance, created_at) "
+        "VALUES (?, 'dave', ?, 1, 'open', 'now')", (cid, hash_key("dave-key")),
+    )
+    wid = uuid.uuid4().hex
+    fresh.execute(
+        "INSERT INTO workers (id, contributor_id, compute_profile_json, "
+        "first_seen, last_seen) VALUES (?, ?, '{}', 'now', 'now')", (wid, cid),
+    )
+    fresh.execute(
+        "INSERT INTO tasks (id, buckets_json, local_steps, status, worker_id, "
+        "attempts, created_at) VALUES ('recycled', '[]', 1, 'leased', ?, 2, 'now')",
+        (wid,),
+    )
+    fresh.commit()
+
+    # First lease of this task on device 0, since released.
+    fresh.execute(
+        "INSERT INTO task_devices (task_id, worker_id, device_index, allocated_at, "
+        "released_at, release_reason) VALUES ('recycled', ?, 0, 't0', 't1', 'expired')",
+        (wid,),
+    )
+    # Re-claimed onto the same card. Must not raise.
+    fresh.execute(
+        "INSERT INTO task_devices (task_id, worker_id, device_index, allocated_at) "
+        "VALUES ('recycled', ?, 0, 't2')", (wid,),
+    )
+    fresh.commit()
+
+    rows = fresh.execute(
+        "SELECT released_at FROM task_devices WHERE task_id = 'recycled' "
+        "ORDER BY allocated_at"
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[0]["released_at"] == "t1"
+    assert rows[1]["released_at"] is None, "the re-claim is the live occupant"
+
+
+def test_partial_index_permits_many_released_rows_for_the_same_device(fresh):
+    """A released row drops out of the partial index, so many of them can
+    accumulate for one device -- that is the append-only history docs/14 §3
+    describes, and it must coexist with the live-occupant uniqueness above."""
+    cid = uuid.uuid4().hex
+    fresh.execute(
+        "INSERT INTO contributors (id, name, key_hash, enabled, clearance, created_at) "
+        "VALUES (?, 'dave', ?, 1, 'open', 'now')", (cid, hash_key("dave-key")),
+    )
+    wid = uuid.uuid4().hex
+    fresh.execute(
+        "INSERT INTO workers (id, contributor_id, compute_profile_json, "
+        "first_seen, last_seen) VALUES (?, ?, '{}', 'now', 'now')", (wid, cid),
+    )
+    for tid in ("tc", "td", "te"):
+        fresh.execute(
+            "INSERT INTO tasks (id, buckets_json, local_steps, status, "
+            "worker_id, attempts, created_at) "
+            "VALUES (?, '[]', 1, 'submitted', ?, 1, 'now')", (tid, wid),
+        )
+    fresh.commit()
+
+    # Two released rows for the same device: both have released_at set, so
+    # neither is visible to the unique index and both insert cleanly.
+    fresh.execute(
+        "INSERT INTO task_devices "
+        "(task_id, worker_id, device_index, allocated_at, released_at) "
+        "VALUES ('tc', ?, 0, 'now', 'now')", (wid,),
+    )
+    fresh.execute(
+        "INSERT INTO task_devices "
+        "(task_id, worker_id, device_index, allocated_at, released_at) "
+        "VALUES ('td', ?, 0, 'now', 'now')", (wid,),
+    )
+    # A third, currently live, is also fine -- exactly one unreleased row.
+    fresh.execute(
+        "INSERT INTO task_devices (task_id, worker_id, device_index, allocated_at) "
+        "VALUES ('te', ?, 0, 'now')", (wid,),
+    )
+    n = fresh.execute(
+        "SELECT COUNT(*) FROM task_devices WHERE worker_id = ? AND device_index = 0",
+        (wid,),
+    ).fetchone()[0]
+    assert n == 3

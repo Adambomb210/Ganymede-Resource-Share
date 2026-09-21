@@ -9,6 +9,7 @@ loop can be wrong in ways that cost a round rather than crash.
 from __future__ import annotations
 
 import json
+import queue
 import threading
 
 import pytest
@@ -290,7 +291,7 @@ def test_the_lease_crumb_is_written_on_each_beat(fast_heartbeat, tmp_path):
 
     time.sleep(0.2)
     beat.stop()
-    crumb = sandbox.read_lease_crumb(tmp_path)
+    crumb = sandbox.read_lease_crumb(tmp_path, "t1")
     assert crumb["task_id"] == "t1"
     assert crumb["container"] == "ganymede-job-t1"
 
@@ -681,6 +682,19 @@ def test_a_missing_key_fails_at_startup_with_a_name(monkeypatch, tmp_path):
         Worker.create(WorkerConfig(coordinator_url="http://c", key=""))
 
 
+def test_skip_alloc_reaches_the_probe():
+    """``skip_alloc`` was accepted by ``probe.run_probe`` since docs/14 §2's
+    predecessor but had no way to reach it from a real worker start -- a
+    4-card inventory probe is now four ceiling searches, and an operator who
+    has already characterized the box needs to be able to skip all of them."""
+    worker = Worker.create(WorkerConfig(
+        coordinator_url="http://c", key="k", backend="cpu",
+        skip_alloc=True, skip_bench=True,
+    ))
+    assert worker.profile["probe"]["method"] == "skipped"
+    assert worker.profile["probe"]["alloc_max_mb"] is None
+
+
 def test_a_storage_outage_costs_the_round_not_the_worker(tmp_path, stub_trainer):
     """§6.4: an unreachable object store is something a worker rides out.
 
@@ -1065,6 +1079,146 @@ def test_a_contained_shard_is_submitted_through_the_same_path_as_a_batch_one(
     assert not any(c[0] == "upload" for c in client.calls), "uploaded twice"
 
 
+def test_run_contained_passes_the_workers_backend_not_the_tasks(
+    tmp_path, monkeypatch
+):
+    """docs/14 §2: the container pin needs the *machine's* backend, which
+    lives on ``self.profile`` -- the task payload carries only ``devices``
+    (the per-lease half). ``_run_contained`` must supply both to
+    ``contained_batch.run.run`` rather than leave the backend for
+    ``sandbox.device_argv`` to guess at."""
+    from ganymede.jobtypes.contained_batch import run as cb_run
+
+    captured = {}
+
+    def fake_run(task, inputs, on_step=None, should_stop=None, **kw):
+        captured.update(kw)
+        return type("R", (), {
+            "rows": 1, "digest": "d" * 64, "output_ref": "out/j1/c1.jsonl",
+            "seconds": 1.0, "exit_code": 0, "metrics": {"rows": 1},
+        })()
+
+    monkeypatch.setattr(cb_run, "run", fake_run)
+
+    client = StubClient(tasks=[CONTAINED_TASK])
+    worker = _contained_worker(tmp_path, client)
+    worker.profile["backend"] = "cuda"
+    assert worker.run() == 0
+
+    assert captured.get("backend") == "cuda"
+
+
+def test_a_contained_tasks_heartbeat_carries_its_container_name(
+    tmp_path, stub_contained, monkeypatch
+):
+    """Without this, ``Heartbeater._crumb()`` always writes ``container:
+    null`` and ``host.agent.reap_orphaned_jobs`` bails out immediately on it
+    (``if not container: return []``) -- the wedged-worker backstop would
+    never fire for a contained job. ``run_round`` must wire the name in for
+    ``contained_batch``, deterministically from the task id, and nothing else
+    needs to change for the other two job types to keep getting ``None``."""
+    from ganymede.worker import sandbox
+
+    real_init = Heartbeater.__init__
+    captured: list[str | None] = []
+
+    def spy_init(self, *args, **kwargs):
+        captured.append(kwargs.get("container"))
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(Heartbeater, "__init__", spy_init)
+
+    client = StubClient(tasks=[CONTAINED_TASK])
+    worker = _contained_worker(tmp_path, client, job_scratch=str(tmp_path))
+    assert worker.run() == 0
+
+    # ``test_the_lease_crumb_is_written_on_each_beat`` already covers that a
+    # ``Heartbeater`` given a container writes it into the crumb; what was
+    # actually broken is that ``run_round`` never gave it one for real work,
+    # which is what this pins -- at the constructor, not by racing the
+    # background thread's own timer for a tick.
+    assert captured == [sandbox.container_name_for("c1")]
+
+
+def test_a_non_contained_tasks_heartbeat_carries_no_container(
+    tmp_path, stub_trainer, monkeypatch
+):
+    """The inverse: ``collab_lora_finetune`` and ``batch_inference`` have no
+    container to name, and ``None`` must stay correct for them."""
+    captured: list[str | None] = []
+    real_init = Heartbeater.__init__
+
+    def spy_init(self, *args, **kwargs):
+        captured.append(kwargs.get("container"))
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(Heartbeater, "__init__", spy_init)
+
+    worker = make_worker(tmp_path, job_scratch=str(tmp_path))
+    assert worker.run_round(TASK)["accepted"] is True
+    assert captured == [None]
+
+
+def test_the_heartbeat_thread_is_wired_to_cancel_the_job_container(
+    tmp_path, stub_contained, monkeypatch
+):
+    """Defect 1: ``Heartbeater.on_cancel`` used to be assigned only in tests --
+    in production nothing ever set it, so a latched cancel sat inert until
+    ``_supervise``'s own poll came round. Exercised directly against
+    ``_run_contained`` (rather than through a live thread) to avoid making the
+    test a race against the real heartbeat interval; what it checks is that
+    the handler ``_run_contained`` wires in actually reaches the container,
+    which is the part that was missing."""
+    from ganymede.worker import sandbox
+
+    calls: list[tuple] = []
+
+    class FakeJobContainer:
+        def __init__(self, task_id, config):
+            calls.append(("init", task_id))
+
+        def cancel(self, mode, grace_sec=None):
+            calls.append(("cancel", mode))
+
+    monkeypatch.setattr(sandbox, "JobContainer", FakeJobContainer)
+    monkeypatch.setenv("GANYMEDE_JOB_SCRATCH", str(tmp_path))
+
+    client = StubClient()
+    worker = _contained_worker(tmp_path, client, job_scratch=str(tmp_path))
+    beat = Heartbeater(client, "c1", interval_sec=0)
+
+    worker._run_contained(CONTAINED_TASK, beat, 0.0)
+
+    assert beat.on_cancel is not None
+    beat.on_cancel("hard")
+    assert ("init", "c1") in calls
+    assert ("cancel", "hard") in calls
+
+
+def test_cancelling_before_the_container_exists_does_not_reach_the_worker(
+    tmp_path, stub_contained, monkeypatch
+):
+    """The scenario the fix is really for: a cancel can land during the
+    archive pull, before ``jt.run`` has called ``start`` -- there is no
+    should_stop check during that download at all. ``JobContainer.cancel``
+    against an unknown name is a nonzero exit, not a raise (``sandbox.py``'s
+    kill path), so the handler must swallow whatever the real sandbox module
+    does here without disturbing the round; this pins that a genuine
+    ``SandboxError`` (an unset ``GANYMEDE_JOB_SCRATCH``, say) is caught inside
+    the handler itself rather than left to ``Heartbeater``'s best-effort
+    log-and-swallow around it."""
+    monkeypatch.delenv("GANYMEDE_JOB_SCRATCH", raising=False)
+
+    client = StubClient()
+    worker = _contained_worker(tmp_path, client, job_scratch=str(tmp_path))
+    beat = Heartbeater(client, "c1", interval_sec=0)
+
+    worker._run_contained(CONTAINED_TASK, beat, 0.0)
+
+    assert beat.on_cancel is not None
+    beat.on_cancel("hard")  # must not raise despite no GANYMEDE_JOB_SCRATCH
+
+
 @pytest.mark.parametrize("mode", ["soft", "hard"])
 def test_a_cancelled_contained_task_abandons_and_never_submits(
     tmp_path, stub_contained, monkeypatch, mode
@@ -1148,3 +1302,302 @@ def test_max_rounds_counts_shards_for_a_roundless_type(tmp_path, stub_infer):
     assert worker.run() == 0
     assert worker.rounds_done == 2
     assert worker.tasks_done == 2
+
+
+# --------------------------------------------------------------------------
+# Step 7: a multi-device host runs a supervisor (docs/14 §2)
+#
+# Two kinds of test below. ``_pin_env`` and ``_slot_count`` are pure
+# functions, tested directly. The supervisor loop itself is tested against a
+# fake ``_spawn`` rather than real ``multiprocessing`` -- ``StubClient``
+# cannot cross a real spawn boundary intact (a copy of it in the child would
+# record calls nobody in this test ever reads back), so everything that
+# checks *decisions* (claiming up to slot count, ``active_task_ids``, crash
+# isolation, draining on stop) is written against a substitute that stays
+# in-process, exactly the reasoning ``Worker._spawn``'s own docstring gives.
+# A real multi-process run lives in ``tests/test_worker_supervisor.py``.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("backend,devices,expected", [
+    ("cuda", [2], {"CUDA_VISIBLE_DEVICES": "2"}),
+    ("cuda", [0, 3], {"CUDA_VISIBLE_DEVICES": "0,3"}),
+    ("rocm", [1], {"HIP_VISIBLE_DEVICES": "1", "CUDA_VISIBLE_DEVICES": "1"}),
+    ("xpu", [0], {"ZE_AFFINITY_MASK": "0"}),
+    ("mps", [0], {}),
+    ("cpu", [0], {}),
+    ("cpu", [0, 1], {}),  # GANYMEDE_CPU_SLOTS > 1: no token exists to pin with.
+])
+def test_pin_env_matches_docs_14s_table(backend, devices, expected):
+    assert loop_mod._pin_env(backend, devices) == expected
+
+
+def test_pin_env_is_a_noop_with_nothing_to_pin():
+    """No devices on the lease -- unreachable in practice (a lease always
+    holds at least one), but the function must not invent a pin for a device
+    that was never named."""
+    assert loop_mod._pin_env("cuda", []) == {}
+
+
+def test_pin_env_refuses_an_unrecognised_backend_with_devices_to_pin():
+    """docs/14 §2: a backend with no known pinning form refuses to launch
+    rather than falling back to 'all devices' -- written about the container
+    pin column, but the reasoning is about the backend having no known pin at
+    all, so it is applied here too (see the step report)."""
+    assert loop_mod._pin_env("some_future_backend", [0, 1]) is None
+
+
+def test_slot_count_defaults_to_one_with_no_devices_reported(tmp_path):
+    """A pre-multi-GPU profile (or a probe that failed to enumerate) --
+    exactly today's single-device worker."""
+    assert make_worker(tmp_path)._slot_count() == 1
+
+
+def test_slot_count_is_one_for_a_single_reported_device(tmp_path):
+    worker = make_worker(tmp_path)
+    worker.profile["devices"] = [{"index": 0}]
+    assert worker._slot_count() == 1
+
+
+def test_slot_count_matches_the_reported_device_count(tmp_path):
+    worker = make_worker(tmp_path)
+    worker.profile["devices"] = [{"index": 0}, {"index": 1}, {"index": 2}]
+    assert worker._slot_count() == 3
+
+
+def test_a_single_device_worker_never_spawns_a_child(tmp_path, stub_trainer):
+    """Backward compatibility, proved by construction rather than merely
+    observed: ``run`` dispatches to ``_run_single`` at slot count 1, which is
+    ``run``'s own old body, byte for byte, and never calls ``_spawn`` at
+    all."""
+    tasks = [_task_in_round(0), _task_in_round(1)]
+    client = StubClient(tasks=tasks)
+    worker = make_worker(tmp_path, client=client, max_rounds=2)
+    monkey_idle(worker)
+    spawned = []
+    worker._spawn = lambda task: spawned.append(task["task_id"])
+
+    assert worker.run() == 0
+    assert spawned == []
+    assert worker.rounds_done == 2
+    assert worker.tasks_done == 2
+
+
+class FakeProcess:
+    """Stands in for ``multiprocessing.Process``: a real OS process is never
+    started, so ``StubClient`` calls made through it stay visible to the
+    test, the same way `_run_single`'s always have been."""
+
+    def __init__(self):
+        self._alive = True
+        self.exitcode: int | None = None
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def join(self, timeout: float | None = None) -> None:
+        pass
+
+    def finish(self, exitcode: int = 0) -> None:
+        self._alive = False
+        self.exitcode = exitcode
+
+
+class FakeQueue:
+    """Stands in for the ``multiprocessing.Queue`` a real child reports
+    through (``_run_child``'s ``finally``)."""
+
+    def __init__(self):
+        self._items: list = []
+
+    def get_nowait(self):
+        if not self._items:
+            raise queue.Empty()
+        return self._items.pop(0)
+
+    def put(self, item) -> None:
+        self._items.append(item)
+
+
+def make_supervised_worker(tmp_path, client, devices: int = 2, **config_kwargs) -> Worker:
+    """A ``Worker`` with a multi-device profile and a fake ``_spawn``, so the
+    supervisor loop (``_run_supervisor``) runs for real while every child it
+    creates is a ``FakeProcess``/``FakeQueue`` pair the test fully controls.
+
+    ``worker._spawned`` records every task id ``_spawn`` was asked to start,
+    in order -- the cheapest possible check that the loop tried to fill every
+    slot it was supposed to.
+    """
+    profile = {**PROFILE, "devices": [{"index": i} for i in range(devices)]}
+    worker = Worker(
+        config=WorkerConfig(coordinator_url="http://c", key="k", **config_kwargs),
+        client=client,
+        control=ControlFiles(tmp_path, install_signal_handlers=False),
+        profile=profile,
+    )
+    worker.worker_id = "w1"
+    worker._spawned = []
+
+    def fake_spawn(task):
+        worker._spawned.append(task["task_id"])
+        worker.active[task["task_id"]] = loop_mod._Child(task, FakeProcess(), FakeQueue())
+
+    worker._spawn = fake_spawn
+    return worker
+
+
+def test_a_multi_device_worker_claims_up_to_its_slot_count_concurrently(tmp_path, monkeypatch):
+    """Two devices, two tasks claimed and started before either has to
+    finish -- and the second claim reports the first as already held
+    (docs/14 §5.1's ``active_task_ids``), which is only reachable once a
+    worker can hold more than one lease at a time."""
+    tasks = [_task_in_round(0, "t0"), _task_in_round(0, "t1")]
+    client = StubClient(tasks=tasks)
+    worker = make_supervised_worker(tmp_path, client, devices=2)
+
+    def fast_forward(seconds=0):
+        # Reached only once both slots are full and there is nothing left to
+        # claim -- finish both children (one reporting a loaded base model,
+        # to pin down the affinity-hint plumbing too) and stop.
+        items = list(worker.active.items())
+        for task_id, child in items:
+            child.process.finish()
+            child.queue.put({"loaded": ["tiny"] if task_id == "t0" else []})
+        worker.control.request_stop()
+
+    monkeypatch.setattr(loop_mod.time, "sleep", fast_forward)
+
+    assert worker.run() == 0
+    assert worker._spawned == ["t0", "t1"]
+    assert [c["active_task_ids"] for c in client.claims] == [[], ["t0"]]
+    assert worker.tasks_done == 2
+    # Both tasks are round 0 of the same run -- one round, two tasks.
+    assert worker.rounds_done == 1
+    # The affinity hint one child reported is folded in at reap time.
+    assert worker.cached_base_models == {"tiny"}
+
+
+def test_a_crashed_childs_backstop_abandon_never_touches_its_sibling(tmp_path, monkeypatch):
+    """Item 6: a child that exits without ever reaching ``_run_child``'s
+    ``finally`` -- a SIGKILL, an OS OOM kill, a crash below Python's own
+    exception handling -- must not leave the parent believing its lease is
+    still live. Its still-training sibling must be completely unaffected."""
+    tasks = [_task_in_round(0, "crashed"), _task_in_round(0, "sibling")]
+    client = StubClient(tasks=tasks)
+    worker = make_supervised_worker(tmp_path, client, devices=2)
+
+    calls = {"n": 0}
+
+    def fast_forward(seconds=0):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Only "crashed" finishes, and without ever writing to its
+            # queue -- exactly what a child that never reached the
+            # `finally` looks like from the supervisor's side.
+            worker.active["crashed"].process.finish(exitcode=-9)
+        else:
+            if "sibling" in worker.active:
+                worker.active["sibling"].process.finish()
+                worker.active["sibling"].queue.put({"loaded": []})
+            worker.control.request_stop()
+
+    monkeypatch.setattr(loop_mod.time, "sleep", fast_forward)
+
+    assert worker.run() == 0
+    assert worker._spawned == ["crashed", "sibling"]
+    assert ("abandon", "crashed") in client.calls
+    assert ("abandon", "sibling") not in client.calls
+    assert worker.tasks_done == 2
+
+
+def test_a_declined_task_is_abandoned_without_ever_being_spawned(tmp_path, monkeypatch):
+    """The supervisor's own ``can_honor`` gate still runs before ``_spawn`` --
+    a stale profile must not cost a real child process, just as it costs
+    nothing in ``_run_single`` today."""
+    tasks = [{**_task_in_round(0), "base_precision": "nf4"}]
+    client = StubClient(tasks=tasks)
+    worker = make_supervised_worker(tmp_path, client, devices=2)
+    monkeypatch.setattr(loop_mod.time, "sleep",
+                        lambda s: worker.control.request_stop())
+
+    assert worker.run() == 0
+    assert worker._spawned == []
+    assert "abandon" in client.kinds()
+
+
+def test_max_rounds_drains_in_flight_children_before_returning(tmp_path, monkeypatch):
+    """``--max-rounds`` must not exit with a lease still training -- that
+    would look, from outside, exactly like the abandoned-mid-round case."""
+    tasks = [_task_in_round(0, "t0")]
+    client = StubClient(tasks=tasks)
+    worker = make_supervised_worker(tmp_path, client, devices=2, max_rounds=1)
+
+    def fast_forward(seconds=0):
+        child = worker.active.get("t0")
+        if child is not None and child.process.is_alive():
+            child.process.finish()
+            child.queue.put({"loaded": []})
+
+    monkeypatch.setattr(loop_mod.time, "sleep", fast_forward)
+
+    assert worker.run() == 0
+    assert worker.active == {}
+    assert worker.tasks_done == 1
+
+
+def test_stop_stops_new_claims_but_waits_for_an_in_flight_child(tmp_path, monkeypatch):
+    """4.4's guarantee, generalised: the supervisor must not exit while a
+    child is still training just because a second, empty poll came back
+    first."""
+    tasks = [_task_in_round(0, "t0")]
+    client = StubClient(tasks=tasks)
+    worker = make_supervised_worker(tmp_path, client, devices=2)
+
+    def fast_forward(seconds=0):
+        child = worker.active.get("t0")
+        if child is not None and child.process.is_alive():
+            worker.control.request_stop()
+            child.process.finish()
+            child.queue.put({"loaded": []})
+
+    monkeypatch.setattr(loop_mod.time, "sleep", fast_forward)
+
+    assert worker.run() == 0
+    assert worker.tasks_done == 1
+    assert ("abandon", "t0") not in client.calls
+    assert client.kinds().count("claim") == 2  # t0, then a 204 with a free slot
+
+
+def test_pause_stops_new_claims_and_then_stop_drains_what_is_left(tmp_path, monkeypatch):
+    """7.1: stay installed, take no new work -- generalised the same way
+    stop is. Nothing here releases a GPU the parent never held (docs/14 §2's
+    per-child model cache); a paused supervisor's job is only to stop
+    claiming and keep reaping."""
+    tasks = [_task_in_round(0, "t0")]
+    client = StubClient(tasks=tasks)
+    worker = make_supervised_worker(tmp_path, client, devices=2)
+    worker.control.request_pause()
+
+    calls = {"n": 0}
+
+    def fast_forward(seconds=0):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            worker.control.clear()
+        elif calls["n"] == 2:
+            worker.control.request_stop()
+        child = worker.active.get("t0")
+        if child is not None and child.process.is_alive():
+            child.process.finish()
+            child.queue.put({"loaded": []})
+
+    monkeypatch.setattr(loop_mod.time, "sleep", fast_forward)
+
+    assert worker.run() == 0
+    # register, then a pause-poll sleep before the first claim is even
+    # attempted -- pause holds new work, exactly as it does at slot count 1.
+    assert client.calls[0][0] == "register"
+    assert client.kinds().count("claim") == 2  # t0, then a trailing 204
+    assert calls["n"] >= 2, "the pause branch's own sleep never ran"
+    assert worker._spawned == ["t0"]
+    assert worker.tasks_done == 1

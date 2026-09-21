@@ -150,6 +150,41 @@ def run_status(conn: sqlite3.Connection, run_id: str, *, rounds_shown: int = 5,
     )
 
 
+def fleet_devices(conn: sqlite3.Connection) -> list[dict]:
+    """One row per live ``worker_devices`` entry, fleet-wide: which card, on
+    which worker, holds which task right now (docs/14 §4, §9).
+
+    The operator's only view of a donated multi-GPU box, and the only way to
+    answer "why is card 2 dark" without reading logs -- the row whose
+    ``task_id`` is set names the task that has it; a null ``task_id`` is a
+    free card. Joined against ``task_devices`` in one pass rather than one
+    query per device: the fleet this reads is small (this is an operator
+    tool, not the claim path), but there is no reason to pay N+1 for it
+    either.
+    """
+    held_by = {
+        (r["worker_id"], r["device_index"]): r["task_id"]
+        for r in conn.execute(
+            "SELECT worker_id, device_index, task_id FROM task_devices "
+            "WHERE released_at IS NULL"
+        ).fetchall()
+    }
+    out = []
+    for d in conn.execute(
+        """SELECT worker_id, device_index, device_name, vram_mb
+             FROM worker_devices WHERE retired_at IS NULL
+            ORDER BY worker_id, device_index"""
+    ).fetchall():
+        out.append({
+            "worker_id": d["worker_id"],
+            "index": d["device_index"],
+            "name": d["device_name"],
+            "vram_mb": d["vram_mb"],
+            "task_id": held_by.get((d["worker_id"], d["device_index"])),
+        })
+    return out
+
+
 def awake_workers(conn: sqlite3.Connection, *, window_sec: int = AWAKE_WINDOW_SEC,
                   now: datetime | None = None) -> list[str]:
     """Workers that have polled recently.
@@ -215,6 +250,20 @@ def _render(conn: sqlite3.Connection, run_ids: list[str], now: datetime) -> list
     out: list[str] = []
     awake = awake_workers(conn, now=now)
     out.append(f"{len(awake)} worker(s) polled in the last {AWAKE_WINDOW_SEC // 60} min")
+
+    devices = fleet_devices(conn)
+    if devices:
+        out.append("")
+        out.append("devices:")
+        by_worker: dict[str, list[dict]] = {}
+        for d in devices:
+            by_worker.setdefault(d["worker_id"], []).append(d)
+        for worker_id, rows in by_worker.items():
+            busy = sum(1 for r in rows if r["task_id"] is not None)
+            out.append(f"  {worker_id}  {busy}/{len(rows)} card(s) busy")
+            for r in rows:
+                state = f"task {r['task_id']}" if r["task_id"] else "free"
+                out.append(f"    gpu{r['index']}  {r['name']}  {state}")
 
     for run_id in run_ids:
         st = run_status(conn, run_id, now=now)
@@ -288,6 +337,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({
             "checked_at": now.isoformat(),
             "awake_workers": awake_workers(conn, now=now),
+            "devices": fleet_devices(conn),
             "runs": [
                 {
                     "run_id": st.run_id,
