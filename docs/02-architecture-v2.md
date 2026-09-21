@@ -1539,8 +1539,9 @@ class IdleBackend(Protocol):
 
 - **`local`** (v1, own hardware): no non-Ganymede process in
   `nvidia-smi --query-compute-apps`, AND no `pause` sentinel present, AND (optional)
-  inside a configured time window. User-idle detection differs per platform —
-  `GetLastInputInfo` on Windows, `ioreg` on macOS — but the predicate is the same.
+  inside a configured time window, AND the machine as a whole is quiet. User-idle
+  detection differs per platform — `GetLastInputInfo` on Windows, `ioreg` on
+  macOS — but the predicate is the same.
 - **`vast`**, **`tensordock`** (later): query the platform API for active rentals on
   this GPU.
 
@@ -1557,10 +1558,53 @@ daemon downgrades to a message rather than a traceback. The file is the
 mechanism; the command is a convenience that creates it.
 
 **A host agent that is only allowed to be idle is not the same as one that is
-idle.** `is_idle()` answers four questions in order — pause sentinel, active
-time window, GPU free, user idle — and the local backend returns *why*, not just
-whether. "Why do I never get work" is the most common support question a
-volunteer platform gets, and a bare bool has no answer to it.
+idle.** `is_idle()` answers five questions in order — pause sentinel, active
+time window, GPU free, user idle, machine quiet — and the local backend returns
+*why*, not just whether. "Why do I never get work" is the most common support
+question a volunteer platform gets, and a bare bool has no answer to it.
+
+**A free card is not the same thing as an unused computer** (added 2026-09-21).
+The first four checks can all pass on a machine whose owner is in the middle of
+a compile, a video export or a backup: none of that touches the GPU, and none of
+it moves the mouse. `max_cpu_percent` (default 25) is a whole-machine CPU
+ceiling for *starting* a worker. Applications merely being **open** are fine and
+always were — an idle browser with forty tabs, a chat client, a launcher in the
+tray cost a percent or two between them, and the development machine at rest
+measures 1–5%. This is a floor on activity, not on tidiness.
+
+It is **start-only, and that asymmetry is load-bearing.** `report.idle` drives
+two different decisions in `host/agent.py`: whether to start a worker, and
+whether to stop one already running. A CPU ceiling belongs only to the first,
+because our own worker *is* sustained CPU load — a gate that also stopped a
+running worker would measure its load, stop it, watch the machine fall quiet,
+start it again, and oscillate, binning an unfinished round every cycle.
+`_gpu_busy` has the identical hazard and escapes it by recognising our own
+process (`_looks_like_ganymede`); there is no stdlib equivalent for per-process
+CPU, so this check opts out of the stop path instead. `IdleReport` grew a
+`stops_running_worker` field that **defaults to `True`**, so a check must opt
+out of stopping a worker and can never opt in by accident — every other verdict,
+and every rental backend, keeps the behaviour it had. Nothing is lost: the case
+that should stop a running worker is the contributor coming back to their
+machine, and `user_idle_sec` already catches that.
+
+Live on **Windows and Linux only**. `GetSystemTimes` and `/proc/stat` both yield
+a CPU-busy fraction over the sample interval, so `max_cpu_percent` means one
+thing on both. macOS returns *unknown* — hence quiet, like every other unknown
+in that module — rather than falling back to `os.getloadavg()`, which is a
+different quantity (runnable tasks averaged over a minute) and would make the
+same number mean two things with a minute of lag on one of them. macOS is
+already the secondary path here: native runtime, no container GPU (§6.8).
+
+Two traps, both of the same family as the `GetLastInputInfo` bug below. In
+`GetSystemTimes`, **idle time is counted inside kernel time**, not alongside it,
+so the total is `kernel + user` and busy is that minus idle; written the other
+obvious way it still yields a plausible number, just a wrong one. And a
+`FILETIME`'s two halves are unsigned and must be joined explicitly. Verified
+against known load rather than by inspection — 1 of 12 cores pegged reads 8.8%,
+6 reads 51%, 12 reads 100%. The sampler is a single seam
+(`_cpu_busy_fraction`) that the tests replace, so no test ever reads the real
+processor; a suite that passed or failed by what else the machine was doing
+would be worse than no test.
 
 On Linux, user-idle time is **unknown** when `xprintidle` is absent, and unknown
 is treated as idle. A headless Linux box is the single most likely donated

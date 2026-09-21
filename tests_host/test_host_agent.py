@@ -43,8 +43,10 @@ class FakeRuntime:
 
 
 class FakeBackend:
-    def __init__(self, idle: bool, reason: str = ""):
-        self._report = idle_mod.IdleReport(idle=idle, reason=reason or ("idle" if idle else "busy"))
+    def __init__(self, idle: bool, reason: str = "", stops_running_worker: bool = True):
+        self._report = idle_mod.IdleReport(
+            idle=idle, reason=reason or ("idle" if idle else "busy"),
+            stops_running_worker=stops_running_worker)
 
     def is_idle(self):
         return self._report.idle
@@ -153,6 +155,31 @@ def test_the_machine_becoming_busy_stops_the_worker_too():
     result = agent_mod.tick(_config(), runtime=rt, backend=FakeBackend(False), fetch=_fetch("img:v1"))
     assert result.action == "stopped"
     assert rt.stops == 1
+
+
+def test_a_start_only_refusal_leaves_a_running_worker_alone():
+    """The whole-machine CPU ceiling (idle.py ``_cpu_check``) says "do not
+    start", never "stop". Our own worker is sustained CPU load by design, so
+    stopping it here would free the CPU, pass the check on the next tick,
+    restart, and oscillate -- binning an unfinished round each time."""
+    rt = FakeRuntime(running=True, image="img:v1")
+    backend = FakeBackend(False, reason="machine busy: cpu 90%",
+                          stops_running_worker=False)
+    result = agent_mod.tick(_config(), runtime=rt, backend=backend,
+                            fetch=_fetch("img:v1"))
+    assert result.action == "running"
+    assert rt.stops == 0, "a start-only refusal must never stop a worker"
+
+
+def test_a_start_only_refusal_still_prevents_a_start():
+    """The other half: it is a real "no" when nothing is running yet."""
+    rt = FakeRuntime(running=False)
+    backend = FakeBackend(False, reason="machine busy: cpu 90%",
+                          stops_running_worker=False)
+    result = agent_mod.tick(_config(), runtime=rt, backend=backend,
+                            fetch=_fetch("img:v1"))
+    assert result.action == "idle-skip"
+    assert rt.started == []
 
 
 # --------------------------------------------------------------------------

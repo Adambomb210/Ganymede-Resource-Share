@@ -123,6 +123,15 @@ def tick(
     report = backend.report() if hasattr(backend, "report") else _thin_report(backend)
 
     if not report.idle:
+        if status.running and not report.stops_running_worker:
+            # A "no" that is about starting, not about stopping -- today only
+            # the whole-machine CPU ceiling (idle.py's ``_cpu_check``). Our own
+            # worker is sustained CPU load by design, so honouring this one
+            # here would have the agent stop the worker, watch the machine fall
+            # quiet, start it again and oscillate, losing an unfinished round
+            # each time round. Leave it up; the checks that mean "the
+            # contributor wants their machine back" are the ones above.
+            return TickResult("running", f"leaving worker up: {report.reason}")
         if status.running:
             log.info("machine no longer idle (%s); stopping worker", report.reason)
             try:
@@ -439,6 +448,12 @@ def _check(config: HostConfig) -> int:
 
     report = idle_mod.LocalIdleBackend(config).report()
     print(f"idle now    : {'yes' if report.idle else 'no'} ({report.reason})")
+    if not report.idle and not report.stops_running_worker:
+        # Otherwise this reads as "your worker is about to be stopped", which
+        # is the opposite of what a start-only refusal does. --dry-run is how a
+        # contributor answers "why isn't my machine contributing", so the one
+        # verdict that behaves differently has to say so.
+        print("            : start-only -- a worker already running is left alone")
 
     try:
         manifest = manifest_mod.fetch(config)

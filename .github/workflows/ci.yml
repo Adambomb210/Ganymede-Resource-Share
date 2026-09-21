@@ -88,6 +88,19 @@ jobs:
         # the expected answer on a headless box.
         run: python -c "from ganymede.host import idle; s = idle.idle_seconds(); print('idle_seconds ->', s); assert s is None or s >= 0"
 
+      - name: The real CPU sampler for this platform
+        # Same reasoning, and the same reason it matters: `_cpu_busy_fraction`
+        # is a mocked seam everywhere in the unit suite, deliberately -- a test
+        # that read the real processor would pass or fail by what else the
+        # runner happened to be doing. So this is the only place /proc/stat is
+        # actually parsed and GetSystemTimes is actually called. It was
+        # developed on Windows; Linux and macOS have never run it.
+        #
+        # macOS is expected to answer None (load average is a different
+        # quantity and is deliberately not substituted -- docs/02 §7.1), so the
+        # assertion is "a valid answer", not "a number".
+        run: python -c "from ganymede.host import idle; f = idle._cpu_busy_fraction(); print('cpu_busy_fraction ->', f); assert f is None or 0.0 <= f <= 1.0"
+
       # ---------------------------------------------------------------- Linux
       - name: systemd accepts and runs the unit
         if: runner.os == 'Linux'

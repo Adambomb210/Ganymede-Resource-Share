@@ -85,6 +85,7 @@ MIN_FREE_DISK_GB_NATIVE = 25.0
 # Fifteen minutes is longer than a coffee and shorter than a lunch: it will not
 # grab the GPU while someone is reading, and it will not sit out an afternoon.
 DEFAULT_USER_IDLE_SEC = 900
+DEFAULT_MAX_CPU_PERCENT = 25
 
 
 def default_config_path() -> Path:
@@ -191,6 +192,21 @@ class HostConfig:
     # single-GPU host sees no change at all: one busy card is the only card,
     # so "any" and "every" are the same question there.
     require_gpu_free: bool = True
+    # Whole-machine CPU ceiling, in percent, for *starting* a worker: the
+    # machine has to be quiet, not merely have a free card. A contributor who
+    # is compiling, encoding or running a backup is using their computer even
+    # though nothing is on the GPU, and docs/02 §7's "is it okay to start one?"
+    # is a question about the machine, not about one device.
+    #
+    # Having things merely *open* is fine and always was -- an idle browser
+    # with forty tabs, a chat client, a game launcher sitting in the tray all
+    # cost a percent or two. This is a floor on *activity*, not on tidiness.
+    #
+    # Start-only, deliberately: see ``host/idle.py``'s ``_cpu_check`` for why a
+    # running worker must not be stopped by it. Zero or less disables the
+    # check. Live on Windows and Linux; a machine whose CPU cannot be measured
+    # is treated as quiet, like every other unknown in that module.
+    max_cpu_percent: int = DEFAULT_MAX_CPU_PERCENT
     # Optional local-time window, "23:00-07:00". Empty means any hour.
     active_window: str = ""
 

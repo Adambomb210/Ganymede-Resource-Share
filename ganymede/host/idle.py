@@ -13,6 +13,11 @@ reason as the last one:
 2. **active window** -- an optional local-time-of-day restriction.
 3. **GPU free** -- ``nvidia-smi``, when the config asks for it.
 4. **user idle** -- keyboard/mouse inactivity, per platform.
+5. **machine quiet** -- whole-machine CPU below ``max_cpu_percent``. A free
+   card is not the same thing as an unused computer. Unlike every other check
+   here this one is *start-only*: it will decline to start a worker but never
+   stops one already running, because our own worker is exactly the kind of
+   sustained load it measures. See ``_cpu_check``.
 
 Nothing here may raise. Same rule as ``worker/probe.py``: a host agent that
 dies because ``ioreg`` hung leaves the machine contributing nothing until
@@ -28,9 +33,11 @@ import datetime as dt
 import json
 import platform
 import re
+import ctypes
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -66,6 +73,18 @@ class IdleReport:
 
     idle: bool
     reason: str
+    # Whether a *running* worker should be stopped on this verdict.
+    #
+    # Almost every "no" here means the contributor wants their machine back
+    # right now -- the pause sentinel, the active window closing, someone
+    # sitting down at the keyboard -- and the agent stops the worker mid-round
+    # for it, on purpose (see agent.py's note on inverting steps 1 and 2).
+    #
+    # The whole-machine CPU ceiling is the exception, and it defaults to True
+    # so that it stays the exception: a check has to opt out of stopping a
+    # worker, never into it. ``_thin_report`` and any rental backend keep
+    # constructing this two-argument and keep the stop behaviour they had.
+    stops_running_worker: bool = True
 
 
 # --------------------------------------------------------------------------
@@ -467,6 +486,181 @@ def idle_seconds() -> float | None:
     return None
 
 
+# --------------------------------------------------------------------------
+# 5. Whole-machine CPU
+# --------------------------------------------------------------------------
+
+# How long to watch the CPU for. Paid once per agent tick, against a tick
+# measured in tens of seconds, so the cost is noise.
+#
+# A longer window, or a delta cached between ticks, would be a better estimator
+# of *average* load -- but average load is not the question. What this gate is
+# for is sustained activity: a compile, an encode, a backup, a game. Those peg
+# cores continuously, so any window at all catches them, and a quarter second
+# catches them just as surely as a minute would. What a short window gets wrong
+# is the brief spike, which it reads as "busy" -- and that is the cheap
+# direction to be wrong, because the cost is one deferred tick and the agent
+# comes back. Caching across ticks would also mean hidden state in a module
+# whose every other answer is a fresh measurement, and an unknown first call.
+CPU_SAMPLE_SEC = 0.25
+
+
+class _FILETIME(ctypes.Structure):
+    _fields_ = [("dwLowDateTime", ctypes.c_uint32),
+                ("dwHighDateTime", ctypes.c_uint32)]
+
+
+def _filetime_ticks(ft: "_FILETIME") -> int:
+    """The two halves of a FILETIME as the single 64-bit count it represents.
+
+    ctypes will not do this for us and the halves are unsigned, so the shift
+    has to be explicit -- the same class of footgun as ``GetTickCount``
+    returning through a signed default ``restype``.
+    """
+    return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+
+def _cpu_times_windows() -> tuple[int, int] | None:
+    """``(busy_ticks, total_ticks)`` since boot, or ``None``.
+
+    **The trap in ``GetSystemTimes``**: idle time is counted *inside* kernel
+    time, not alongside it. So the total is ``kernel + user`` -- adding idle to
+    that double-counts it -- and busy is that total minus idle. Written the
+    other obvious way round it still produces a plausible number, just a wrong
+    one.
+    """
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_system_times = kernel32.GetSystemTimes
+    except (AttributeError, OSError):
+        return None
+    get_system_times.argtypes = [ctypes.POINTER(_FILETIME)] * 3
+    get_system_times.restype = ctypes.c_int          # BOOL
+    idle_t, kernel_t, user_t = _FILETIME(), _FILETIME(), _FILETIME()
+    if not get_system_times(ctypes.byref(idle_t), ctypes.byref(kernel_t),
+                            ctypes.byref(user_t)):
+        return None
+    idle = _filetime_ticks(idle_t)
+    total = _filetime_ticks(kernel_t) + _filetime_ticks(user_t)
+    return total - idle, total
+
+
+def _cpu_times_linux() -> tuple[int, int] | None:
+    """``(busy_jiffies, total_jiffies)`` from ``/proc/stat``'s aggregate line.
+
+    ``iowait`` counts as idle, which is the conventional reading and the one
+    that keeps this gate about the CPU: a machine copying a large file is
+    barely using its processor, and blocking a donated GPU on disk traffic is
+    not what anyone means by "the computer is in use".
+    """
+    try:
+        with open("/proc/stat", "r", encoding="utf-8", errors="replace") as fh:
+            first = fh.readline()
+    except OSError:
+        return None
+    parts = first.split()
+    if not parts or parts[0] != "cpu" or len(parts) < 5:
+        return None
+    try:
+        fields = [int(x) for x in parts[1:]]
+    except ValueError:
+        return None
+    total = sum(fields)
+    idle = fields[3] + fields[4]                     # idle + iowait
+    if total <= 0:
+        return None
+    return total - idle, total
+
+
+def _cpu_times() -> tuple[int, int] | None:
+    system = platform.system()
+    if system == "Windows":
+        return _cpu_times_windows()
+    if system == "Linux":
+        return _cpu_times_linux()
+    # macOS deliberately returns None rather than falling back to
+    # ``os.getloadavg()``. Load average is a different quantity (runnable
+    # tasks, averaged over a minute) and putting it behind the same
+    # ``max_cpu_percent`` knob would make "25" mean two different things
+    # depending on the platform, with a minute of lag on one of them. macOS is
+    # already the secondary path here -- native runtime, no container GPU
+    # (docs/02 §6.8) -- so it keeps the pre-existing behaviour: unknown, hence
+    # quiet.
+    return None
+
+
+def _cpu_busy_fraction() -> float | None:
+    """Fraction of the machine's CPU capacity in use, in ``[0, 1]``, or
+    ``None`` when this platform cannot say.
+
+    The single seam the tests replace -- nothing above this line should ever
+    read the real processor during a test run, or the suite starts passing or
+    failing according to what else the machine happens to be doing.
+    """
+    first = _cpu_times()
+    if first is None:
+        return None
+    time.sleep(CPU_SAMPLE_SEC)
+    second = _cpu_times()
+    if second is None:
+        return None
+    busy = second[0] - first[0]
+    total = second[1] - first[1]
+    if total <= 0:
+        # Counters that did not move: too short a sample, or a rollback.
+        # Not an answer, so do not invent one.
+        return None
+    return min(1.0, max(0.0, busy / total))
+
+
+def _cpu_check(config: HostConfig) -> IdleReport | None:
+    """Is the whole machine quiet enough to *start* a worker on?
+
+    The GPU being free says a card is available. It does not say the
+    contributor is not using their computer -- a compile, a video export, a
+    backup and a game launcher updating itself are all invisible to
+    ``nvidia-smi`` and all mean "in use".
+
+    **Start-only, and this is the important part.** ``report.idle`` drives two
+    different decisions in agent.py: whether to start a worker, and whether to
+    stop one that is already running. A CPU ceiling belongs only to the first.
+    Our own worker is a CPU-heavy process by design, so a gate that also
+    stopped a running worker would measure its load, stop it, watch the machine
+    go quiet, start it again, and oscillate -- with the contributor losing an
+    unfinished round every cycle. ``_gpu_busy`` has the same hazard and solves
+    it by recognising our own process (``_looks_like_ganymede``); there is no
+    stdlib equivalent for per-process CPU, so this check opts out of the stop
+    path instead, which is the honest version of the same idea.
+
+    Nothing is lost by that. The case that should stop a running worker is the
+    contributor coming back to their machine, and ``user_idle_sec`` already
+    catches it. What this adds is unattended sustained load -- and killing a
+    mid-round job for a backup would cost the contributor credit and throw the
+    round's work away.
+    """
+    if config.max_cpu_percent <= 0:
+        return None
+    busy = _cpu_busy_fraction()
+    if busy is None:
+        # Unknown is quiet, matching ``_user_idle_check`` -- a machine nobody
+        # can measure should not be parked forever for a reason no contributor
+        # could act on.
+        return None
+    pct = busy * 100.0
+    if pct >= config.max_cpu_percent:
+        return IdleReport(
+            False,
+            f"machine busy: cpu {pct:.0f}% (>= {config.max_cpu_percent}% threshold)",
+            stops_running_worker=False,
+        )
+    return None
+
+
+# --------------------------------------------------------------------------
+# User idle
+# --------------------------------------------------------------------------
+
+
 def _user_idle_check(config: HostConfig) -> IdleReport | None:
     if config.user_idle_sec <= 0:
         return None
@@ -493,11 +687,15 @@ def evaluate(config: HostConfig, *, now: dt.datetime | None = None) -> IdleRepor
         lambda: _active_window_check(config, now),
         lambda: _gpu_check(config),
         lambda: _user_idle_check(config),
+        # Last: the only one that costs a wall-clock wait (CPU_SAMPLE_SEC), so
+        # it is never paid on a tick that some cheaper check already settled.
+        lambda: _cpu_check(config),
     ):
         verdict = check()
         if verdict is not None:
             return verdict
-    return IdleReport(True, "idle: no pause, in window, gpu free, user idle")
+    return IdleReport(
+        True, "idle: no pause, in window, gpu free, user idle, cpu quiet")
 
 
 class LocalIdleBackend:

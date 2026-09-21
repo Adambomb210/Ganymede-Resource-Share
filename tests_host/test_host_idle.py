@@ -33,6 +33,7 @@ def _config(**overrides) -> HostConfig:
 def test_a_clean_machine_with_no_restrictions_is_idle(tmp_path, monkeypatch):
     monkeypatch.setattr(idle, "_gpu_busy", lambda config: (False, "gpu free"))
     monkeypatch.setattr(idle, "idle_seconds", lambda: 10_000.0)
+    monkeypatch.setattr(idle, "_cpu_busy_fraction", lambda: 0.01)
     cfg = _config(state_dir=str(tmp_path))
     report = idle.evaluate(cfg)
     assert report.idle is True
@@ -44,6 +45,7 @@ def test_the_pause_file_beats_every_other_check(tmp_path, monkeypatch):
     switch (7.1), and it must not be shadowed by anything checked later."""
     monkeypatch.setattr(idle, "_gpu_busy", lambda config: (False, "gpu free"))
     monkeypatch.setattr(idle, "idle_seconds", lambda: 10_000.0)
+    monkeypatch.setattr(idle, "_cpu_busy_fraction", lambda: 0.01)
     cfg = _config(state_dir=str(tmp_path), active_window="", require_gpu_free=False, user_idle_sec=0)
     (tmp_path / "pause").touch()
 
@@ -55,6 +57,7 @@ def test_the_pause_file_beats_every_other_check(tmp_path, monkeypatch):
 def test_is_idle_is_a_thin_wrapper_over_report(tmp_path, monkeypatch):
     monkeypatch.setattr(idle, "_gpu_busy", lambda config: (False, "gpu free"))
     monkeypatch.setattr(idle, "idle_seconds", lambda: 10_000.0)
+    monkeypatch.setattr(idle, "_cpu_busy_fraction", lambda: 0.01)
     cfg = _config(state_dir=str(tmp_path))
     backend = idle.LocalIdleBackend(cfg)
     assert backend.is_idle() == backend.report().idle
@@ -509,3 +512,160 @@ def test_the_windows_probe_sets_an_unsigned_restype():
     restype = ctypes.windll.kernel32.GetTickCount.restype
     assert restype in (ctypes.c_uint, ctypes.c_ulong), restype
     assert ctypes.c_uint(0xFFFFFFFF).value > 0  # i.e. the type really is unsigned
+
+
+# --------------------------------------------------------------------------
+# Whole-machine CPU: a free card is not the same thing as an unused computer
+# --------------------------------------------------------------------------
+
+
+def _cpu_config(tmp_path, **kw):
+    """A config with every check but the CPU one disabled, so what comes back
+    from ``evaluate`` is unambiguously the CPU gate's doing."""
+    base = dict(state_dir=str(tmp_path), active_window="",
+                require_gpu_free=False, user_idle_sec=0)
+    base.update(kw)
+    return _config(**base)
+
+
+def test_a_machine_with_a_free_gpu_but_a_busy_cpu_does_not_start_work(
+        tmp_path, monkeypatch):
+    """The whole point of the check. A contributor compiling, encoding or
+    running a backup is using their computer, and none of that is visible to
+    ``nvidia-smi``."""
+    monkeypatch.setattr(idle, "_cpu_busy_fraction", lambda: 0.90)
+    report = idle.evaluate(_cpu_config(tmp_path, max_cpu_percent=25))
+    assert report.idle is False
+    assert "cpu" in report.reason and "90%" in report.reason
+
+
+def test_background_applications_merely_sitting_there_do_not_block_work(
+        tmp_path, monkeypatch):
+    """"Having some stuff in context is fine." An idle browser with forty tabs,
+    a chat client and a launcher in the tray cost a percent or two between
+    them; this is a floor on *activity*, not on tidiness. Measured on the
+    development machine at rest: 1-5%."""
+    monkeypatch.setattr(idle, "_cpu_busy_fraction", lambda: 0.05)
+    assert idle.evaluate(_cpu_config(tmp_path, max_cpu_percent=25)).idle is True
+
+
+def test_the_cpu_gate_will_not_stop_a_worker_that_is_already_running(
+        tmp_path, monkeypatch):
+    """The hazard that shapes this whole check, pinned.
+
+    Our own worker is sustained CPU load by design. If a CPU verdict could
+    stop a running worker, the agent would stop it, watch the machine fall
+    quiet, start it again, and oscillate -- throwing away an unfinished round
+    every cycle. ``_gpu_busy`` dodges the same trap by recognising our own
+    process; there is no stdlib per-process CPU accounting, so this check opts
+    out of the stop path instead.
+    """
+    monkeypatch.setattr(idle, "_cpu_busy_fraction", lambda: 0.99)
+    report = idle.evaluate(_cpu_config(tmp_path, max_cpu_percent=25))
+    assert report.idle is False
+    assert report.stops_running_worker is False
+
+
+def test_every_other_reason_to_be_busy_still_stops_a_running_worker(
+        tmp_path, monkeypatch):
+    """The flip side: opting out of the stop path has to be something a check
+    does deliberately, never the default. Someone sitting down at the keyboard
+    is precisely the case that should take the machine back mid-round."""
+    monkeypatch.setattr(idle, "_gpu_busy", lambda config: (False, "gpu free"))
+    monkeypatch.setattr(idle, "idle_seconds", lambda: 1.0)
+    monkeypatch.setattr(idle, "_cpu_busy_fraction", lambda: 0.01)
+    report = idle.evaluate(_config(state_dir=str(tmp_path), active_window="",
+                                   require_gpu_free=False, user_idle_sec=900))
+    assert report.idle is False
+    assert report.stops_running_worker is True
+
+    (tmp_path / "pause").touch()
+    assert idle.evaluate(_cpu_config(tmp_path)).stops_running_worker is True
+
+
+def test_a_cpu_that_cannot_be_measured_counts_as_quiet(tmp_path, monkeypatch):
+    """Same judgement call as ``_user_idle_check``'s unknown-is-idle: a machine
+    nobody can measure must not be parked forever for a reason no contributor
+    could act on. macOS takes this path deliberately -- load average is a
+    different quantity and would make ``max_cpu_percent`` mean two things."""
+    monkeypatch.setattr(idle, "_cpu_busy_fraction", lambda: None)
+    assert idle.evaluate(_cpu_config(tmp_path, max_cpu_percent=25)).idle is True
+
+
+def test_zero_disables_the_cpu_gate_without_sampling_anything(
+        tmp_path, monkeypatch):
+    """Consistent with ``user_idle_sec``: zero means "do not ask". It must not
+    merely ignore the answer -- the sample costs a wall-clock wait on every
+    tick forever, so a disabled check has to skip it."""
+    def _boom():
+        raise AssertionError("sampled the CPU with the gate disabled")
+    monkeypatch.setattr(idle, "_cpu_busy_fraction", _boom)
+    assert idle.evaluate(_cpu_config(tmp_path, max_cpu_percent=0)).idle is True
+
+
+def test_the_threshold_is_the_boundary_it_says_it_is(tmp_path, monkeypatch):
+    """At exactly the threshold the machine counts as busy, so a contributor
+    who sets 25 gets a gate that fires at 25 and not at 26."""
+    for pct, expected_idle in ((0.24, True), (0.25, False), (0.26, False)):
+        monkeypatch.setattr(idle, "_cpu_busy_fraction", lambda p=pct: p)
+        got = idle.evaluate(_cpu_config(tmp_path, max_cpu_percent=25)).idle
+        assert got is expected_idle, f"{pct:.0%} should be idle={expected_idle}"
+
+
+# --- the sampler itself, without touching the real processor ---------------
+
+
+def test_the_windows_filetime_halves_are_combined_as_an_unsigned_64_bit_count():
+    """The ``GetTickCount`` footgun's cousin. ctypes will not join the halves
+    for us and both are unsigned, so the shift has to be explicit -- and a
+    high half with the top bit set is exactly where a signed reading breaks."""
+    ft = idle._FILETIME()
+    ft.dwHighDateTime, ft.dwLowDateTime = 0xFFFFFFFF, 0xFFFFFFFF
+    assert idle._filetime_ticks(ft) == 0xFFFFFFFFFFFFFFFF
+    ft.dwHighDateTime, ft.dwLowDateTime = 0x80000000, 0
+    assert idle._filetime_ticks(ft) == 0x8000000000000000
+
+
+def test_the_busy_fraction_is_a_delta_between_two_samples(monkeypatch):
+    """Counters are cumulative since boot, so only the difference means
+    anything. Half the elapsed ticks busy is 50%, whatever the absolute
+    values happen to be."""
+    samples = iter([(1_000, 10_000), (1_500, 11_000)])
+    monkeypatch.setattr(idle, "_cpu_times", lambda: next(samples))
+    monkeypatch.setattr(idle.time, "sleep", lambda _s: None)
+    assert idle._cpu_busy_fraction() == pytest.approx(0.5)
+
+
+def test_counters_that_did_not_move_are_unknown_rather_than_zero(monkeypatch):
+    """A zero-length interval divides by zero. "Not an answer" is the honest
+    result; reporting 0% would claim the machine is idle on no evidence."""
+    samples = iter([(1_000, 10_000), (1_000, 10_000)])
+    monkeypatch.setattr(idle, "_cpu_times", lambda: next(samples))
+    monkeypatch.setattr(idle.time, "sleep", lambda _s: None)
+    assert idle._cpu_busy_fraction() is None
+
+
+def test_a_platform_that_cannot_answer_says_so_without_sleeping(monkeypatch):
+    monkeypatch.setattr(idle, "_cpu_times", lambda: None)
+
+    def _boom(_s):
+        raise AssertionError("slept before discovering the platform cannot answer")
+    monkeypatch.setattr(idle.time, "sleep", _boom)
+    assert idle._cpu_busy_fraction() is None
+
+
+def test_the_linux_reader_treats_iowait_as_idle(monkeypatch, tmp_path):
+    """The conventional reading, and the one that keeps this gate about the
+    CPU: a machine copying a large file is barely using its processor, and
+    blocking a donated GPU on disk traffic is not what "in use" means."""
+    stat = tmp_path / "stat"
+    #             user nice system  idle  iowait irq softirq steal
+    stat.write_text("cpu  100  0    100    700   100   0     0      0\n"
+                    "cpu0 1 2 3 4 5 6 7 8\n", encoding="utf-8")
+    real_open = idle.open if hasattr(idle, "open") else open
+    monkeypatch.setattr("builtins.open",
+                        lambda f, *a, **k: real_open(stat, *a, **k)
+                        if f == "/proc/stat" else real_open(f, *a, **k))
+    busy, total = idle._cpu_times_linux()
+    assert total == 1000
+    assert busy == 200, "iowait must land on the idle side, with idle"
