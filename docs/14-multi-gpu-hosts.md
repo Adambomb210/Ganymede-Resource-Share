@@ -220,6 +220,37 @@ assumed by anything above:**
   allocation are both present, since trusting an explicit operator setting over the
   ledger is deliberate but should not be silent.
 
+**A device index is worker-local, and both pins compose through the worker's own
+visibility restriction (review-added).** `probe.run_probe` enumerates
+`range(torch.cuda.device_count())` — whatever *this worker process* can see. So on a box
+where the worker was launched with `CUDA_VISIBLE_DEVICES=4,5,6,7` (an operator lending
+Ganymede half an 8-card machine), the inventory reports four devices as indices **0-3**,
+and those are the numbers the coordinator allocates and returns in a lease.
+
+Neither pin inherits that restriction. `CUDA_VISIBLE_DEVICES` does not nest — a process
+that sets it has the value read against the box's *full physical* device list — and the
+NVIDIA container runtime addresses cards by absolute physical index or UUID, ignoring the
+worker's own setting entirely. Written raw, a lease holding local index `2` would send
+both the in-process child and the container to physical card **2**, a card deliberately
+withheld from Ganymede, rather than card 6. Nothing errors; the lease simply runs on
+hardware it does not hold, contending with whatever else is there.
+
+So the ambient list, where one is set, is the translation table: local index `i` means
+its `i`-th entry. `sandbox.compose_visible` is that translation, shared by
+`loop._pin_env` and `device_argv` so the two cannot drift, and positional rather than
+numeric so a UUID-valued list composes unchanged (`--gpus device=` accepts a UUID
+wherever it accepts an index). A local index with no entry in the ambient list is a
+**refusal**, the same answer both pins already give an unpinnable backend — guessing is
+how a lease lands on a card it does not hold. With nothing set, every local index is
+already physical and both pins emit exactly their previous values, byte for byte, which
+is every ordinary deployment.
+
+The ROCm and XPU container branches are **not** composed this way, and that is a named
+gap: they need a DRM render-node number, an ambient list may hold UUIDs no `renderD`
+formula can consume, and the `128 + N` formula is itself still unverified on real
+hardware (above). Compounding two unverified mappings would raise the risk rather than
+lower it.
+
 ---
 
 ## 3. Schema (migration 009)
@@ -250,6 +281,12 @@ CREATE TABLE task_devices (
 CREATE UNIQUE INDEX idx_task_devices_busy
     ON task_devices(worker_id, device_index) WHERE released_at IS NULL;
 CREATE INDEX idx_task_devices_history ON task_devices(worker_id, allocated_at);
+-- `release` looks a task's live rows up by task id on every terminal path;
+-- neither index above serves that. Partial on the same predicate as
+-- idx_task_devices_busy, so it stays the size of the held set rather than of
+-- the append-only history behind it (§4, §8.3).
+CREATE INDEX idx_task_devices_live
+    ON task_devices(task_id) WHERE released_at IS NULL;
 
 CREATE TABLE device_reservations (
     worker_id    TEXT    NOT NULL REFERENCES workers(id),
@@ -419,7 +456,8 @@ holding one card each.** The walk has no notion of "head" — its list is
 `_selectable_jobs` sorted by `effective_rank`. So:
 
 > **Only the first job in walk order refused for `insufficient_free_devices` may
-> reserve, and at most one job may hold reservations on a given worker at a time.**
+> reserve, at most one job may hold reservations on a given worker at a time, and a
+> job may only reserve on a worker whose own live inventory could ever satisfy it.**
 
 The `device_reservations` primary key gives per-device uniqueness but not that second
 property; `devices.reserve` enforces it under its own write lock.
@@ -438,6 +476,20 @@ behalf would hold a card no wider job needs, for no reason. Reservation is for t
 ordinary backfill structurally cannot serve: a job needing several devices at once,
 where single-card jobs taking each one as it frees *is* the starvation.
 
+**Only a job this worker could ever satisfy may reserve — `gpu_count <= len(inventory)`
+for *this* worker, not the fleet's widest.** Added by review after the rest of this
+section shipped; the original two conditions were written against the deadlock case
+("four wide jobs holding one card each") and never contemplated a job that cannot fit
+the worker at all. `create_job` only checks a new job against `max_inventory_width`, the
+fleet-wide maximum, so a `gpu_count = 4` job is admitted while any 4-card host exists —
+and then meets every narrower host for the rest of its life, refused
+`insufficient_free_devices` there structurally, forever. Since reservation admits one
+holder per worker and one reserver per poll, that job would take the 3-card box's
+reservation slot on *every* poll, and the `gpu_count = 3` job behind it in walk order —
+which fits exactly — would never accumulate anything. That is this section's own
+starvation, pointed at the wrong job. Comparing against the worker's own live inventory
+is the whole fix: a job that cannot run here never holds here.
+
 **What gets reserved is the plain free set, never the backfill-widened one.** A device
 this job can see only because some other short job might finish in time is not a device
 it may claim as reserved for itself.
@@ -453,6 +505,29 @@ devices re-accumulates from scratch.
 on every poll, so the TTL only has to survive one poll gap rather than the whole
 accumulation window — and staying well under `lease_duration_sec` (900s) means a dead
 reserver dark-cards a device for minutes, not for most of a lease.
+
+### 6.1 Re-registration, and what a vanished card must not keep holding
+
+`devices.reconcile_inventory` runs inside `register`'s existing write transaction and
+brings `worker_devices` in line with what the worker just reported. A device index the
+worker reported before and does not report now — a box that reboots with a dead card,
+or comes back with one card lent to something else — is **retired**, and everything
+still standing against that index is dropped with it:
+
+1. `worker_devices.retired_at` is stamped, so `inventory` and therefore `free_devices`
+   stop offering it;
+2. any live `task_devices` row on it is released with reason `reconciled`, so the card
+   is not permanently allocated to a task that will never submit or expire against it;
+3. **any `device_reservations` row on it is deleted.**
+
+(3) is not tidiness. `reserve`'s holder check is *worker-wide* — "at most one job may
+hold reservations on a given worker at a time" — and it purges only rows past
+`expires_at`. An unexpired reservation orphaned on a retired index therefore keeps its
+job reading as the holder of the entire worker, so every *other* job is refused a
+reservation there, for up to the reservation TTL, on the strength of a claim over a card
+that no longer exists. `has_other_reservations` answers `True` for that window too, so
+the walk also pays for a backfill peek that cannot find a target. It self-heals at the
+TTL rather than dark-carding permanently, which is exactly what made it easy to miss.
 
 ---
 
@@ -495,6 +570,18 @@ evidence rather than re-litigated from first principles:
 ### 8.1 In-process multi-device training
 
 One 4-card `collab_lora_finetune` task. Deferred by decision, not by oversight.
+
+**And enforced, as of review, rather than merely unbuilt.** `CollabLoraFinetune` declares
+`max_gpu_count = 1` and `create_job` refuses a wider job with a 422 — a third `gpu_count`
+check beside the two in §9, read as an optional class attribute exactly the way
+`requires_image` already is, so a type that says nothing is bounded only by the fleet.
+Without it the deferral was silent: a `gpu_count = 4` collab job passed submission
+(the fleet *is* that wide), `claim_task` allocated four cards to one task, and
+`trainer.model.pick_device` then trained on one of them — three cards allocated, idle,
+and correctly reported busy by the ledger for the whole lease. Refusing at submission
+rather than at claim follows the same reasoning as the fleet-width check: the submitter
+gets a reason now instead of a row that polls forever. §7's several one-card leases
+remain the supported way to fill a wide box with this job type.
 
 Scope it to **model parallelism**, not data parallelism: for LoRA the memory cost is the
 *frozen base*, since the adapter is tiny and `ADAPTER_DTYPE` is fp32. DDP gives 4x speed
@@ -624,6 +711,37 @@ card carries a foreign process, not merely one of several. On a single-GPU host 
 readings are identical (one busy card is the only card), so the fleet's overwhelming
 majority — one donated card, this document's own opening line — sees no behavioural
 change at all.
+
+**A compute process is one nvidia-smi attributes memory to (review-added, and it fixed
+a live bug on Windows).** `--query-compute-apps` now asks for `used_memory` as well, and
+a row carrying no figure — `[N/A]`, `[Insufficient Permissions]` — is not counted. The
+spec's rule has always been about CUDA processes specifically (`01`: *"No non-Ganymede
+CUDA process holds the GPU"*), and this is what makes the implementation match it.
+
+On Linux nothing changes: the driver reports real per-process memory, so every genuine
+CUDA client keeps its row. On **Windows/WDDM it is the difference between a check that
+works and one that can never pass.** Measured on a real RTX 3060 / Windows 11 box:
+`--query-compute-apps` returned **forty** rows — `explorer.exe`, the shell, a browser,
+Discord, Slack, Steam — because WDDM enumerates every process holding a graphics
+context, not just compute clients; and it attributed `[N/A]` memory to *all* of them,
+including a genuine `torch` CUDA process started on the same box for the comparison. So
+nothing in that output distinguishes the desktop compositor from a training run.
+
+Because `require_gpu_free` defaults to `True`, the old rule meant `_gpu_check` returned
+`IdleReport(idle=False, reason="gpu in use: [Insufficient Permissions]")` on any Windows
+desktop — permanently. The host agent never started the worker, on the platform most
+likely to have an idle gaming GPU to donate, and the reason string named a process
+nvidia-smi could not even read. Every existing test passed throughout, because all of
+them fed the parser hand-written Linux-shaped CSV; `tests_host/test_host_idle.py` now
+carries a fixture captured verbatim from the real machine.
+
+The residual risk is stated plainly: on Windows this gate can no longer prove the card
+busy at all, so a contributor's own headless CUDA job is not detected by it. They are
+still protected by the pause sentinel, the active window, and `_user_idle_check` — and
+anyone actively at the machine is caught by the last of those. That is the trade this
+module's own rule already prescribes: *"the check can only ever prove the GPU busy,
+never prove it free"*, and treating "I can't check" as "busy" *"would quietly exclude
+every one of those from ever contributing, which is exactly backwards."*
 
 **This is a start/stop gate, not a routing decision, and that gap is deliberate rather
 than closed here.** `_gpu_busy` answers "should the worker container run at all," never

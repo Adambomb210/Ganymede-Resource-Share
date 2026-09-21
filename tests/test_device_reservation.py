@@ -214,20 +214,39 @@ def test_a_reservation_does_not_outlive_the_claim_it_was_accumulating_for(
 # ==========================================================================
 
 
+def _wide_job_holding_a_reservation(client, conn, skey, wkey):
+    """A 2-device worker with device 1 already busy, and a ``gpu_count = 2``
+    job that is therefore refused and reserves the one card it can see.
+
+    The worker is sized so the wide job *could* run here once device 1 frees.
+    That matters: docs/14 §6's third eligibility condition is that a job may
+    only reserve on a worker whose own live inventory could ever satisfy it,
+    so a 1-device box paired with a ``gpu_count = 2`` job -- the shape these
+    tests originally used to manufacture a reservation cheaply -- no longer
+    produces one at all. This is also the configuration §6's own narrative
+    describes ("a blocked wide job accumulates a reservation on devices as
+    they free"), rather than one where the job could never fit regardless.
+    """
+    worker_id = _register(client, wkey)
+    _add_devices(conn, worker_id, [1])
+    _occupy(conn, worker_id, 1)
+
+    wide_jid = _enqueue(client, skey, _spec([{"ref": "w0", "rows": 4}]))
+    conn.execute("UPDATE jobs SET gpu_count = 2 WHERE id = ?", (wide_jid,))
+    conn.commit()
+    return worker_id, wide_jid
+
+
 def test_a_short_task_backfills_onto_a_device_reserved_by_a_wider_job(
     client, store, conn, make_contributor, make_submitter
 ):
     _, skey = make_submitter()
     _, wkey = make_contributor(name="owner")
-    worker_id = _register(client, wkey)  # one device, device 0
+    worker_id, wide_jid = _wide_job_holding_a_reservation(client, conn, skey, wkey)
 
-    wide_jid = _enqueue(client, skey, _spec([{"ref": "w0", "rows": 4}]))
-    conn.execute("UPDATE jobs SET gpu_count = 2 WHERE id = ?", (wide_jid,))
-    conn.commit()
-
-    # First poll: the wide job is the only selectable job, needs 2 devices,
-    # this box has exactly 1 -- refused every time, but eligible (gpu_count >
-    # 1), so it reserves the one device it can see.
+    # First poll: the wide job needs 2 devices and only device 0 is free --
+    # refused, but eligible (gpu_count > 1, and this box has 2 cards, so it
+    # could run here once device 1 frees), so it reserves what it can see.
     resp = _claim(client, wkey, worker_id)
     assert resp.status_code == 204
     assert _reservation_devices(conn, wide_jid) == [0]
@@ -260,11 +279,7 @@ def test_a_long_task_does_not_backfill_onto_a_reserved_device(
 ):
     _, skey = make_submitter()
     _, wkey = make_contributor(name="owner")
-    worker_id = _register(client, wkey)
-
-    wide_jid = _enqueue(client, skey, _spec([{"ref": "w0", "rows": 4}]))
-    conn.execute("UPDATE jobs SET gpu_count = 2 WHERE id = ?", (wide_jid,))
-    conn.commit()
+    worker_id, wide_jid = _wide_job_holding_a_reservation(client, conn, skey, wkey)
     resp = _claim(client, wkey, worker_id)
     assert resp.status_code == 204
     assert _reservation_devices(conn, wide_jid) == [0]
@@ -297,11 +312,7 @@ def test_a_task_with_null_max_runtime_sec_does_not_backfill(
     in time, so it must fail closed exactly like a declared-too-long task."""
     _, skey = make_submitter()
     _, wkey = make_contributor(name="owner")
-    worker_id = _register(client, wkey)
-
-    wide_jid = _enqueue(client, skey, _spec([{"ref": "w0", "rows": 4}]))
-    conn.execute("UPDATE jobs SET gpu_count = 2 WHERE id = ?", (wide_jid,))
-    conn.commit()
+    worker_id, wide_jid = _wide_job_holding_a_reservation(client, conn, skey, wkey)
     resp = _claim(client, wkey, worker_id)
     assert resp.status_code == 204
     assert _reservation_devices(conn, wide_jid) == [0]
@@ -364,11 +375,7 @@ def test_a_dead_jobs_reservation_stops_blocking_after_its_ttl(
 ):
     _, skey = make_submitter()
     _, wkey = make_contributor(name="owner")
-    worker_id = _register(client, wkey)  # one device
-
-    dead_jid = _enqueue(client, skey, _spec([{"ref": "w0", "rows": 4}]))
-    conn.execute("UPDATE jobs SET gpu_count = 2 WHERE id = ?", (dead_jid,))
-    conn.commit()
+    worker_id, dead_jid = _wide_job_holding_a_reservation(client, conn, skey, wkey)
 
     resp = _claim(client, wkey, worker_id)
     assert resp.status_code == 204
@@ -482,3 +489,151 @@ def test_inertness_no_reservation_or_backfill_when_every_job_is_gpu_count_1(
     assert conn.execute(
         "SELECT COUNT(*) AS n FROM device_reservations"
     ).fetchone()["n"] == 0
+
+
+# ==========================================================================
+# A job that can never fit this worker must not hold its reservation slot
+# ==========================================================================
+
+
+def test_an_over_wide_job_does_not_take_the_reservation_slot_of_one_that_fits(
+    client, store, conn, make_contributor, make_submitter
+):
+    """docs/14 §6's third eligibility condition.
+
+    ``create_job`` only checks a new job against the *fleet's* widest
+    inventory, so a ``gpu_count = 4`` job is accepted while any 4-card host
+    exists -- and then meets narrower hosts for the rest of its life, refused
+    ``insufficient_free_devices`` on every one of them, structurally, forever.
+
+    Reservation admits one holder per worker and one reserver per poll, so
+    without the "could this job ever fit *here*" guard the over-wide job wins
+    that slot on every single poll of this 3-card box, and the ``gpu_count =
+    3`` job behind it in walk order -- which fits exactly -- never reserves
+    anything and starves. That is precisely the starvation §6 exists to
+    prevent, aimed at the wrong job.
+    """
+    _, skey = make_submitter()
+    _, wkey = make_contributor(name="owner")
+    worker_id = _register(client, wkey)
+    _add_devices(conn, worker_id, [1, 2])       # a 3-card box
+    busy = _occupy(conn, worker_id, 2)           # one card already working
+
+    # Ranked ahead: needs 4 cards, can never run on this 3-card box.
+    over_jid = _enqueue(client, skey, _spec([{"ref": "o0", "rows": 4}]))
+    # Ranked behind: needs 3, fits this box exactly once device 2 frees.
+    fits_jid = _enqueue(client, skey, _spec([{"ref": "f0", "rows": 4}]))
+    conn.execute("UPDATE jobs SET gpu_count = 4, priority_rank = 1 WHERE id = ?",
+                 (over_jid,))
+    conn.execute("UPDATE jobs SET gpu_count = 3, priority_rank = 2 WHERE id = ?",
+                 (fits_jid,))
+    conn.commit()
+
+    resp = _claim(client, wkey, worker_id)
+    assert resp.status_code == 204
+
+    # Both are refused -- neither can run right now -- but only the one that
+    # could eventually fit here holds the reservation.
+    verdicts = {v.job_id: v for v in eligibility.explain(conn, worker_id).verdicts}
+    assert verdicts[over_jid].reason == "insufficient_free_devices"
+    assert verdicts[fits_jid].reason == "insufficient_free_devices"
+
+    assert _reservation_devices(conn, over_jid) == [], (
+        "a job wider than this whole worker must never reserve here"
+    )
+    assert _reservation_devices(conn, fits_jid) == [0, 1], (
+        "the widest job that could actually run here should be accumulating"
+    )
+
+    # And the accumulation completes: when the busy card frees, the fitting
+    # job claims all three rather than having been starved out of them.
+    _release(conn, busy)
+    resp = _claim(client, wkey, worker_id)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["job_id"] == fits_jid
+    assert resp.json()["devices"] == [0, 1, 2]
+
+
+# ==========================================================================
+# The submission gate: gpu_count validated at POST (docs/14 §5, §8.1, §9)
+# ==========================================================================
+
+
+def _post_job(client, skey, *, job_type="batch_inference", spec=None, **extra):
+    body = {"job_type": job_type,
+            "spec": spec if spec is not None else _spec([{"ref": "a", "rows": 1}])}
+    body.update(extra)
+    return client.post("/v1/jobs", headers=_hdr(skey), json=body)
+
+
+def test_a_non_positive_gpu_count_is_refused_without_consulting_the_fleet(
+    client, conn, make_submitter
+):
+    """A caller bug regardless of what hardware exists -- no worker has
+    registered here at all."""
+    _, skey = make_submitter()
+    r = _post_job(client, skey, gpu_count=0)
+    assert r.status_code == 422
+    assert "at least 1" in r.text
+
+
+def test_a_default_job_is_accepted_on_a_fleet_that_has_never_registered(
+    client, conn, make_submitter
+):
+    """docs/14 §5's "CAREFUL": ``max_inventory_width`` reads ``0`` on a fresh
+    coordinator, and an unconditional width check there would 422 *every*
+    job -- including the default ``gpu_count = 1`` -- on day one."""
+    _, skey = make_submitter()
+    assert _post_job(client, skey).status_code == 200
+
+
+def test_a_job_wider_than_the_whole_fleet_is_refused_at_submission(
+    client, conn, make_contributor, make_submitter
+):
+    """Refused now, rather than left as a row that polls 204 forever and
+    gives the submitter nothing to go on."""
+    _, skey = make_submitter()
+    _, wkey = make_contributor(name="owner")
+    _register(client, wkey)          # one device -> widest inventory is 1
+
+    r = _post_job(client, skey, gpu_count=2)
+    assert r.status_code == 422
+    assert "widest inventory" in r.text
+
+
+def test_collab_lora_finetune_may_not_ask_for_more_than_one_device(
+    client, conn, make_contributor, make_submitter
+):
+    """docs/14 §8.1 defers in-process multi-device training *by decision*,
+    and the trainer picks a single device -- so a wide collab job would
+    allocate cards its task body cannot use and strand them, allocated and
+    idle, for the whole lease while the ledger correctly reports them busy.
+    §7's supported way to use a wide box here is several one-card leases.
+    """
+    _, skey = make_submitter()
+    _, wkey = make_contributor(name="owner")
+    worker_id = _register(client, wkey)
+    _add_devices(conn, worker_id, [1, 2, 3])   # a real 4-card box exists
+
+    # The fleet is wide enough, so only the job type's own limit refuses it.
+    r = _post_job(client, skey, job_type="collab_lora_finetune", spec={},
+                  gpu_count=2)
+    assert r.status_code == 422
+    assert "cannot use" in r.text
+
+    # One device is still fine.
+    assert _post_job(client, skey, job_type="collab_lora_finetune", spec={},
+                     gpu_count=1).status_code == 200
+
+
+def test_a_static_job_type_declares_no_device_limit_of_its_own(
+    client, conn, make_contributor, make_submitter
+):
+    """The clamp is per job type, not a blanket rule -- ``batch_inference``
+    sets no ``max_gpu_count``, so it is bounded only by the fleet."""
+    _, skey = make_submitter()
+    _, wkey = make_contributor(name="owner")
+    worker_id = _register(client, wkey)
+    _add_devices(conn, worker_id, [1, 2, 3])
+
+    assert _post_job(client, skey, gpu_count=4).status_code == 200

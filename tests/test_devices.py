@@ -583,3 +583,105 @@ def test_reserve_purges_a_dead_jobs_expired_reservation_before_the_holder_check(
         (wid,),
     ).fetchone()
     assert row["job_id"] == fresh
+
+
+def test_reconcile_drops_a_reservation_standing_on_a_vanished_device(
+    conn, worker, device, job
+):
+    """A card that disappears from a re-registering worker must not keep its
+    reservation alive (docs/14 §5.6, §6).
+
+    ``reserve``'s holder check is *worker-wide* and purges only rows past
+    ``expires_at``, so an unexpired reservation orphaned on a retired index
+    would keep its job reading as the holder of the whole worker -- refusing
+    every other job a reservation here, for up to the reservation TTL, on the
+    strength of a claim over a card that no longer exists.
+    """
+    wid = worker()
+    device(wid, 0)
+    device(wid, 1)
+    wide = job(name="wide")
+    assert devices.reserve(conn, wid, wide, [0, 1], ttl=300) is True
+
+    # The box reboots and comes back reporting only card 0.
+    devices.reconcile_inventory(
+        conn, wid, {"devices": [{"index": 0, "name": "RTX 3060", "vram_mb": 8192}]}
+    )
+    conn.commit()
+
+    left = conn.execute(
+        "SELECT device_index FROM device_reservations WHERE worker_id = ? "
+        "ORDER BY device_index", (wid,),
+    ).fetchall()
+    assert [r["device_index"] for r in left] == [0], (
+        "the reservation on the vanished card 1 should be gone"
+    )
+
+    # And card 1 vanishing entirely must release the whole worker, not leave
+    # `wide` holding it: once `wide`'s own remaining reservation lapses,
+    # another job can reserve here.
+    conn.execute("DELETE FROM device_reservations WHERE worker_id = ?", (wid,))
+    conn.commit()
+    other = job(name="other")
+    assert devices.reserve(conn, wid, other, [0], ttl=300) is True
+
+
+def test_reconcile_leaves_a_vanished_devices_reservation_from_another_worker_alone(
+    conn, worker, device, job
+):
+    """The delete in ``reconcile_inventory`` is scoped to the worker being
+    reconciled -- a second box holding a reservation on *its* card 1 is
+    untouched when the first box loses its own card 1."""
+    a, b = worker(name="a"), worker(name="b")
+    device(a, 0); device(a, 1)
+    device(b, 0); device(b, 1)
+    j = job()
+    assert devices.reserve(conn, b, j, [1], ttl=300) is True
+
+    devices.reconcile_inventory(
+        conn, a, {"devices": [{"index": 0, "name": "RTX 3060", "vram_mb": 8192}]}
+    )
+    conn.commit()
+
+    rows = conn.execute(
+        "SELECT worker_id, device_index FROM device_reservations"
+    ).fetchall()
+    assert [(r["worker_id"], r["device_index"]) for r in rows] == [(b, 1)]
+
+
+def test_reserving_an_empty_set_holds_the_worker_without_reserving_a_card(
+    conn, worker, job
+):
+    """The claim walk calls ``reserve`` with whatever ``free_devices``
+    returned, and on a fully-busy box that is ``[]``.
+
+    It must not raise, and it must not invent a row. What it *does* do is take
+    the worker's holder slot for this job -- ``reserve`` refuses a second job
+    outright once any row exists, but with no rows there is nothing to refuse
+    against, so an empty reserve is a no-op that another job can still reserve
+    past. That asymmetry is deliberate rather than accidental: a job holding
+    zero cards is not holding anything, and blocking the fleet on it would be
+    the dark-card bug §6 exists to avoid.
+    """
+    wid = worker()
+    j = job()
+    assert devices.reserve(conn, wid, j, [], ttl=300) is True
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM device_reservations WHERE worker_id = ?", (wid,)
+    ).fetchone()["n"] == 0
+
+    # Nothing was held, so another job is free to reserve here.
+    other = job(name="other")
+    assert devices.reserve(conn, wid, other, [0], ttl=300) is True
+
+
+def test_an_empty_reserve_does_not_dislodge_an_existing_holder(conn, worker, job):
+    """The converse: an empty reserve from a *different* job must still be
+    refused while someone holds this worker, or it would read as success and
+    the walk would mark its poll's reservation slot spent for nothing."""
+    wid = worker()
+    holder = job(name="holder")
+    assert devices.reserve(conn, wid, holder, [0], ttl=300) is True
+
+    other = job(name="other")
+    assert devices.reserve(conn, wid, other, [], ttl=300) is False

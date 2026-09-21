@@ -39,6 +39,17 @@ class CollabLoraFinetune:
     spot_checkable = False
     # First-party and in-tree (docs/11 §4).
     requires_image = False
+    # One device per task, enforced at submission (docs/14 §8.1). A task body
+    # here trains on exactly one card -- ``trainer.model.pick_device`` picks a
+    # single default device -- and in-process multi-device training is
+    # deferred *by decision*, not merely unbuilt. Without this, a
+    # ``gpu_count = 4`` job is accepted, ``claim_task`` allocates four cards
+    # to one task, and three of them sit allocated and idle for the whole
+    # lease while the ledger correctly reports them busy. §7's "a multi-GPU
+    # box takes as many leases as it has free devices" is the supported way
+    # to use a wide box here: four *separate* one-card leases, not one
+    # four-card lease.
+    max_gpu_count = 1
 
     # -- spec validation (docs/06 "POST /v1/jobs": the job type validates spec) --
     def validate_spec(self, spec) -> None:

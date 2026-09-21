@@ -340,6 +340,55 @@ def test_worker_backfill_falls_back_when_profile_is_unparseable(fresh):
     assert json.loads(d["supports_json"]) == []
 
 
+def test_a_pre_existing_double_book_backfills_the_earlier_lease_and_darkens_the_later(
+    old_db,
+):
+    """Decision 4 ("a machine holds at most one leased task", docs/07 §1) was
+    an *application* invariant, never a database one -- ``invariants.py``
+    exists precisely because it could be violated -- so a pre-009 database can
+    legitimately arrive with two live leases on one worker.
+
+    Both want ``(worker_id, 0)``, and only one can have it under
+    ``idx_task_devices_busy``. docs/14 §3's rule is that the *earlier* lease
+    wins deterministically (ordered by the same ``COALESCE(leased_at,
+    created_at)``, then ``id``) and ``INSERT OR IGNORE`` drops the second
+    silently rather than refusing to open the database over an anomaly that
+    predates it. The dropped one then shows up as a ``lease_without_device``
+    violation, which is the surfacing mechanism -- not a second dark card
+    nobody can see.
+    """
+    conn, _cid, wid = old_db
+    # The a1b4e36 schema has no ``leased_at`` column yet -- migration 008 adds
+    # it and backfills it from ``created_at`` -- so ``created_at`` is what the
+    # ordering actually turns on here, and both are set explicitly rather than
+    # left to the fixture's opaque 'now' string.
+    conn.execute("UPDATE tasks SET created_at = '2026-01-01T08:00:00Z' WHERE id = 't1'")
+    conn.execute(
+        "INSERT INTO tasks (id, run_id, round_idx, buckets_json, local_steps, "
+        "status, worker_id, attempts, created_at) "
+        "VALUES ('t-late', 'r1', 0, '[]', 1, 'leased', ?, 1, '2026-01-01T09:00:00Z')",
+        (wid,),
+    )
+    conn.commit()
+
+    init_schema(conn)
+
+    rows = conn.execute(
+        "SELECT task_id FROM task_devices WHERE worker_id = ? AND released_at IS NULL",
+        (wid,),
+    ).fetchall()
+    assert [r["task_id"] for r in rows] == ["t1"], (
+        "the earlier lease should win the card"
+    )
+
+    # The migration completed rather than raising, and the anomaly is visible
+    # through the invariant rather than silently forgotten.
+    from ganymede.coordinator import invariants
+
+    found = {(v.check, tuple(v.rows)) for v in invariants.check(conn)}
+    assert ("lease_without_device", ("t-late",)) in found
+
+
 def test_live_lease_backfill_carries_the_original_leased_at(old_db):
     """A pre-009 database with a leased task gets a task_devices row whose
     allocated_at is the task's own leased_at (docs/14 §3), not the migration's

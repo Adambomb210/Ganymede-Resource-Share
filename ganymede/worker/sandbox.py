@@ -168,7 +168,58 @@ def detect_runtime(runner=None, runtime_bin: str | None = None) -> str | None:
 _DISCRETE_BACKENDS = frozenset({"cuda", "rocm", "xpu"})
 
 
-def device_argv(backend: str | None, indices: list[int]) -> list[str] | None:
+#: The visibility variables whose values are *ordinal lists*, so an ambient
+#: restriction has to be composed through rather than overwritten. Keyed by the
+#: variable the pin would set; see ``_compose_visible``.
+ORDINAL_VISIBILITY_VARS = ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES",
+                            "ZE_AFFINITY_MASK")
+
+
+def compose_visible(var: str, local: list[int],
+                     env: "os._Environ[str] | dict[str, str] | None" = None
+                     ) -> str | None:
+    """Translate this lease's *worker-local* device indices into values
+    meaningful to a child, honouring any restriction already on the worker.
+
+    ``CUDA_VISIBLE_DEVICES`` and its siblings do **not** nest. When a process
+    sets one, the driver reads it against the box's *full physical* device
+    list -- not against whatever subset an ancestor's own setting had already
+    narrowed things to. But ``worker.probe.run_probe`` enumerates
+    ``range(torch.cuda.device_count())``, which *is* narrowed: a worker
+    launched with ``CUDA_VISIBLE_DEVICES=4,5,6,7`` reports four devices as
+    indices 0-3, and those are the numbers the coordinator allocates and hands
+    back in a lease. Setting that lease's ``[2]`` straight into the child
+    would resolve to physical card **2** -- a card deliberately withheld from
+    Ganymede -- rather than the intended card 6.
+
+    So the ambient list, when present, is the translation table: local index
+    ``i`` means its ``i``-th entry. With nothing set, every local index is
+    already physical and the value is returned unchanged -- which is every
+    ordinary deployment, byte for byte.
+
+    ``None`` means refuse: a local index with no entry in the ambient list
+    cannot be resolved to any card at all, and guessing is how a lease lands
+    on hardware it does not hold.
+    """
+    env = os.environ if env is None else env
+    raw = (env.get(var) or "").strip()
+    if not raw:
+        return ",".join(str(d) for d in sorted(local))
+    # An ambient list may name devices by UUID as well as by ordinal; either
+    # way the *position* is what a local index refers to, so no parsing of the
+    # entries themselves is needed or wanted.
+    ambient = [p.strip() for p in raw.split(",") if p.strip()]
+    resolved: list[str] = []
+    for i in sorted(local):
+        if i < 0 or i >= len(ambient):
+            return None
+        resolved.append(ambient[i])
+    return ",".join(resolved)
+
+
+def device_argv(backend: str | None, indices: list[int],
+                env: "os._Environ[str] | dict[str, str] | None" = None
+                ) -> list[str] | None:
     """The container flags that confine a job to exactly this lease's devices
     (docs/14 §2's "container pin" column). The container-launch counterpart of
     ``worker.loop._pin_env``, which does the identical job for an in-process
@@ -212,7 +263,19 @@ def device_argv(backend: str | None, indices: list[int]) -> list[str] | None:
         # need it, but a quoted single field parses identically to an
         # unquoted one, so there is no reason to keep two code paths -- one of
         # which is the one this footgun would come back through.
-        csv = ",".join(str(i) for i in idx)
+        # Composed against any restriction already on the *worker* process,
+        # exactly as the in-process pin is (``compose_visible`` above). The
+        # NVIDIA container runtime addresses cards by absolute physical index
+        # or UUID and does not inherit the worker's own
+        # ``CUDA_VISIBLE_DEVICES``, so a worker launched restricted to
+        # ``4,5,6,7`` -- whose probe therefore reported its cards as 0-3 --
+        # would otherwise hand the container physical card 2 for a lease
+        # holding local index 2, instead of card 6. ``--gpus device=`` accepts
+        # a UUID wherever it accepts an index, so a UUID-valued ambient list
+        # composes through unchanged too.
+        csv = compose_visible("CUDA_VISIBLE_DEVICES", idx, env)
+        if csv is None:
+            return None
         return ["--gpus", f'"device={csv}"']
     if backend == "rocm":
         # docs/14 §2. ``/dev/kfd`` is the single shared compute-queue device
@@ -223,6 +286,14 @@ def device_argv(backend: str | None, indices: list[int]) -> list[str] | None:
         # something this step can confirm without a card to test on (see the
         # step report). ``--group-add video`` is what makes those
         # group-owned nodes readable by ``--user 1000:1000`` rather than root.
+        # Not composed through an ambient ``HIP_VISIBLE_DEVICES`` the way the
+        # cuda branch above is: that variable restricts what *torch* enumerates,
+        # while what is needed here is a DRM render-node number, and an ambient
+        # list may hold UUIDs that no ``renderD`` formula can consume. Since the
+        # 128+N formula is itself unverified on real hardware (below), guessing
+        # a second unverified mapping on top of it would compound the risk
+        # rather than reduce it. A restricted ROCm worker is therefore a known
+        # gap, named here the way the formula itself is.
         argv = ["--device=/dev/kfd"]
         argv += [f"--device=/dev/dri/renderD{128 + i}" for i in idx]
         argv += ["--group-add", "video"]

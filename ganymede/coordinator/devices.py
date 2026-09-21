@@ -135,9 +135,12 @@ def free_devices(conn: sqlite3.Connection, worker_id: str, job_id: str,
     reservation nobody has swept yet does not make this job wait behind a
     ghost -- deliberately not trusting ``expire_reservations`` to have run
     first, the same way ``share_fractions`` ages its rollup forward rather
-    than trusting the sweep. This is a deviation from docs/14 §4's one-line
-    description ("minus device_reservations held by other jobs"), which does
-    not mention expiry; see the step's final report.
+    than trusting the sweep. docs/14 §4 specifies exactly this ("minus
+    **unexpired** ``device_reservations`` held by **other** jobs ... it checks
+    ``expires_at`` itself rather than trusting the sweep to have run"); it was
+    written up as a deviation while the doc still said otherwise, and the doc
+    has since been amended, so this is the documented behaviour, not a
+    departure from it.
 
     ``max_runtime_sec`` is backfill (docs/14 §6), and ``None`` -- the
     default -- is the plain rule above with no exception: every call site
@@ -429,6 +432,22 @@ def reconcile_inventory(conn: sqlite3.Connection, worker_id: str, profile: dict,
             """UPDATE task_devices SET released_at = ?, release_reason = 'reconciled'
                 WHERE worker_id = ? AND device_index = ? AND released_at IS NULL""",
             (now_iso, worker_id, idx),
+        )
+        # And drop any reservation standing on the card that just vanished.
+        # Not merely tidiness: ``reserve``'s holder check is *worker-wide*
+        # ("at most one job may hold reservations on a given worker",
+        # docs/14 §6), and it purges only rows past ``expires_at``. An
+        # unexpired reservation left behind on a retired index therefore
+        # keeps its job reading as the holder of this whole worker, so every
+        # *other* job is refused a reservation here -- on the strength of a
+        # claim over a card that no longer exists -- until the TTL lapses.
+        # ``has_other_reservations`` answers True for that window too, so the
+        # walk also pays for a backfill peek that can never find a target.
+        # Same reasoning as the ``task_devices`` release above: a box that
+        # reboots with a dead card must not keep holding anything against it.
+        conn.execute(
+            "DELETE FROM device_reservations WHERE worker_id = ? AND device_index = ?",
+            (worker_id, idx),
         )
 
 

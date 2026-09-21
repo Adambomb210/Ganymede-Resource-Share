@@ -382,10 +382,10 @@ def create_job(conn: sqlite3.Connection, user: Contributor,
     except constraints_mod.ConstraintError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    # ``gpu_count`` (docs/14 §3, §5, §9). Two checks, and only the first needs
-    # no fleet at all: a non-positive width is a caller bug regardless of what
-    # hardware exists, the same distinction ``devices.allocate`` draws between
-    # a bad count and a lost race.
+    # ``gpu_count`` (docs/14 §3, §5, §9, §8.1). Three checks, and only the
+    # first needs no fleet at all: a non-positive width is a caller bug
+    # regardless of what hardware exists, the same distinction
+    # ``devices.allocate`` draws between a bad count and a lost race.
     if body.gpu_count < 1:
         raise HTTPException(status_code=422, detail="gpu_count must be at least 1")
     # The second check needs the fleet, and **only when the fleet has told us
@@ -405,6 +405,24 @@ def create_job(conn: sqlite3.Connection, user: Contributor,
             detail=f"gpu_count {body.gpu_count} exceeds the widest inventory "
                    f"the fleet has ever reported ({widest} device(s)); "
                    "this job could never be claimed",
+        )
+    # A third check, and the only one that is about the *job type* rather than
+    # the hardware: a type whose task body can only ever drive one device says
+    # so with ``max_gpu_count`` (docs/14 §8.1), read the same optional-class-
+    # attribute way ``requires_image`` is. ``collab_lora_finetune`` declares 1
+    # -- in-process multi-device training is deferred by decision there, and
+    # its trainer picks a single device -- so a wider job would allocate cards
+    # it cannot use and strand them, allocated and idle, for the whole lease
+    # while the ledger correctly reports them busy. Refused here rather than
+    # at claim, for the same reason as the width check above: the submitter
+    # gets a reason now instead of a row that polls forever.
+    type_max = getattr(jt, "max_gpu_count", None)
+    if type_max is not None and body.gpu_count > type_max:
+        raise HTTPException(
+            status_code=422,
+            detail=f"job type {jt.name!r} runs one task on at most "
+                   f"{type_max} device(s); gpu_count {body.gpu_count} would "
+                   "allocate cards the task body cannot use",
         )
 
     # Freeze the resolved pair into the spec and never mutate it again
@@ -917,8 +935,8 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                 # ``reconcile_inventory`` runs on both worker-creating paths,
                 # should be unreachable. Naming it is what makes it
                 # diagnosable if it ever happens anyway.
-                reason = ("no_devices_reported"
-                          if not devices_mod.inventory(conn, body.worker_id)
+                worker_width = len(devices_mod.inventory(conn, body.worker_id))
+                reason = ("no_devices_reported" if worker_width == 0
                           else "insufficient_free_devices")
                 # docs/14 §6's reservation half. Eligibility is narrower than
                 # "refused for this reason": a ``gpu_count == 1`` job refused
@@ -934,7 +952,23 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
                 # ``free``) is what gets reserved -- a device this job can
                 # only see because some *other* short job might finish in time
                 # is not a device this job may claim as reserved for itself.
+                # It must also be a job this worker could *ever* satisfy.
+                # ``create_job`` only checks a new job against the fleet's
+                # widest inventory, so a ``gpu_count = 4`` job is accepted
+                # while a 4-card host exists -- and then meets 3-card hosts
+                # for the rest of its life, refused ``insufficient_free_devices``
+                # on every one of them, structurally, forever. Without this
+                # guard that job still takes the reservation slot here, and
+                # since ``reserve`` admits one holder per worker and
+                # ``reservation_claimed_this_poll`` admits one reserver per
+                # poll, it takes it on *every* poll -- starving the narrower
+                # wide job behind it in walk order that would actually fit,
+                # which is the precise starvation §6 exists to prevent, now
+                # aimed at the wrong job. Comparing against this worker's own
+                # live inventory rather than the fleet's widest is the whole
+                # fix: a job that cannot fit here never holds here.
                 if (reason == "insufficient_free_devices" and gpu_count > 1
+                        and gpu_count <= worker_width
                         and not reservation_claimed_this_poll):
                     reservation_claimed_this_poll = True
                     devices_mod.reserve(

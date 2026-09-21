@@ -325,7 +325,9 @@ def _requires_image(job_type: str) -> bool:
 # --------------------------------------------------------------------------
 
 
-def _pin_env(backend: str | None, devices: list[int]) -> dict[str, str] | None:
+def _pin_env(backend: str | None, devices: list[int],
+             env: "os._Environ[str] | dict[str, str] | None" = None
+             ) -> dict[str, str] | None:
     """The in-process pin for one lease's child (docs/14 §2's table).
 
     Returns the environment overrides the child must set, *before* anything
@@ -348,17 +350,31 @@ def _pin_env(backend: str | None, devices: list[int]) -> dict[str, str] | None:
     """
     if not devices:
         return {}
-    csv = ",".join(str(d) for d in sorted(devices))
+    # Shared with the container pin so the two cannot drift -- see
+    # ``sandbox.compose_visible``. Imported here rather than at module scope,
+    # the same way every other ``sandbox`` use in this file is.
+    from ganymede.worker.sandbox import compose_visible as _compose_visible
+    # Composed against any restriction already on this worker rather than
+    # written raw -- see ``_compose_visible``. ``None`` from it is the same
+    # refusal this function's own ``None`` means: a lease we cannot pin
+    # exactly must not run unconfined.
     if backend == "cuda":
-        return {"CUDA_VISIBLE_DEVICES": csv}
+        csv = _compose_visible("CUDA_VISIBLE_DEVICES", devices, env)
+        return None if csv is None else {"CUDA_VISIBLE_DEVICES": csv}
     if backend == "rocm":
         # Both names: a PyTorch ROCm build answers to CUDA_VISIBLE_DEVICES as
         # well as HIP_VISIBLE_DEVICES -- the same reason probe.py drives ROCm
         # through the torch.cuda API (module docstring, "AMD chose that so
-        # CUDA code runs unmodified").
-        return {"HIP_VISIBLE_DEVICES": csv, "CUDA_VISIBLE_DEVICES": csv}
+        # CUDA code runs unmodified"). Composed against HIP's own name first,
+        # falling back to CUDA's, since a ROCm box may carry either.
+        hip = _compose_visible("HIP_VISIBLE_DEVICES", devices, env)
+        if not (os.environ if env is None else env).get("HIP_VISIBLE_DEVICES", "").strip():
+            hip = _compose_visible("CUDA_VISIBLE_DEVICES", devices, env)
+        return None if hip is None else {"HIP_VISIBLE_DEVICES": hip,
+                                         "CUDA_VISIBLE_DEVICES": hip}
     if backend == "xpu":
-        return {"ZE_AFFINITY_MASK": csv}
+        csv = _compose_visible("ZE_AFFINITY_MASK", devices, env)
+        return None if csv is None else {"ZE_AFFINITY_MASK": csv}
     if backend in ("mps", "cpu"):
         # Neither has an in-process pin token (docs/14 §2's table lists both
         # as "n/a"). ``mps`` is always exactly one unindexed device by
@@ -1361,9 +1377,24 @@ class Worker:
                     child.result = child.queue.get_nowait()
                 except queue_mod.Empty:
                     break
-                except (OSError, ValueError):
+                except (OSError, EOFError, ValueError):
                     # The queue's pipe can already be torn down on a process
                     # that was killed hard enough; nothing more to read.
+                    #
+                    # ``EOFError`` is listed explicitly because it is *not* an
+                    # ``OSError`` subclass (it derives straight from
+                    # ``Exception``), and it is the one this path is most
+                    # likely to actually see: ``Queue.get`` checks ``_poll()``
+                    # and only then calls ``_recv_bytes()``, so a child
+                    # SIGKILLed before its ``finally`` ever put a result leaves
+                    # a pipe whose closed write end makes the read end poll
+                    # *ready* while holding zero bytes -- and ``_recv_bytes``
+                    # answers that with ``EOFError``. Uncaught, it would
+                    # propagate out of ``_reap`` into ``_run_supervisor``'s
+                    # loop and kill the supervisor itself, tearing down every
+                    # healthy sibling lease on the box over one dead child --
+                    # the exact opposite of the crash isolation the
+                    # process-per-lease design exists to provide.
                     break
 
             if child.process.is_alive():

@@ -1329,14 +1329,18 @@ def test_max_rounds_counts_shards_for_a_roundless_type(tmp_path, stub_infer):
     ("cpu", [0, 1], {}),  # GANYMEDE_CPU_SLOTS > 1: no token exists to pin with.
 ])
 def test_pin_env_matches_docs_14s_table(backend, devices, expected):
-    assert loop_mod._pin_env(backend, devices) == expected
+    # ``env={}`` rather than the ambient one: these assert the *table*, and a
+    # developer who happens to have CUDA_VISIBLE_DEVICES set should not see
+    # them fail. The composition that variable triggers is tested separately
+    # below.
+    assert loop_mod._pin_env(backend, devices, env={}) == expected
 
 
 def test_pin_env_is_a_noop_with_nothing_to_pin():
     """No devices on the lease -- unreachable in practice (a lease always
     holds at least one), but the function must not invent a pin for a device
     that was never named."""
-    assert loop_mod._pin_env("cuda", []) == {}
+    assert loop_mod._pin_env("cuda", [], env={}) == {}
 
 
 def test_pin_env_refuses_an_unrecognised_backend_with_devices_to_pin():
@@ -1344,7 +1348,62 @@ def test_pin_env_refuses_an_unrecognised_backend_with_devices_to_pin():
     rather than falling back to 'all devices' -- written about the container
     pin column, but the reasoning is about the backend having no known pin at
     all, so it is applied here too (see the step report)."""
-    assert loop_mod._pin_env("some_future_backend", [0, 1]) is None
+    assert loop_mod._pin_env("some_future_backend", [0, 1], env={}) is None
+
+
+# --------------------------------------------------------------------------
+# A visibility restriction already on the worker (docs/14 §2, review-added)
+# --------------------------------------------------------------------------
+
+
+def test_pin_env_composes_through_an_ambient_cuda_restriction():
+    """``CUDA_VISIBLE_DEVICES`` does not nest: a process that sets it has the
+    value read against the box's *full physical* device list, not against
+    whatever an ancestor had already narrowed things to.
+
+    ``probe.run_probe`` enumerates ``range(torch.cuda.device_count())``, which
+    *is* narrowed -- so a worker launched with ``CUDA_VISIBLE_DEVICES=4,5,6,7``
+    reports its four cards as 0-3, and those are the indices the coordinator
+    allocates. Writing a lease's ``[2]`` straight through would land the child
+    on physical card 2, a card deliberately withheld from Ganymede, instead of
+    card 6.
+    """
+    env = {"CUDA_VISIBLE_DEVICES": "4,5,6,7"}
+    assert loop_mod._pin_env("cuda", [2], env=env) == {"CUDA_VISIBLE_DEVICES": "6"}
+    assert loop_mod._pin_env("cuda", [0, 3], env=env) == {"CUDA_VISIBLE_DEVICES": "4,7"}
+
+
+def test_pin_env_composition_is_positional_so_uuid_lists_work_too():
+    """An ambient list may name devices by UUID. A local index refers to a
+    *position* in that list, so nothing needs to parse the entries."""
+    env = {"CUDA_VISIBLE_DEVICES": "GPU-aaa,GPU-bbb,GPU-ccc"}
+    assert loop_mod._pin_env("cuda", [1], env=env) == {"CUDA_VISIBLE_DEVICES": "GPU-bbb"}
+
+
+def test_pin_env_refuses_a_local_index_the_ambient_list_cannot_resolve():
+    """Out of range against the ambient list means there is no card this lease
+    could legally run on -- refuse, the same as an unpinnable backend, rather
+    than guess and land on hardware the worker does not hold."""
+    assert loop_mod._pin_env("cuda", [4], env={"CUDA_VISIBLE_DEVICES": "4,5"}) is None
+
+
+def test_pin_env_is_unchanged_when_nothing_is_ambient():
+    """The ordinary deployment: no restriction set, every local index already
+    physical, byte-for-byte today's value."""
+    for var in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ZE_AFFINITY_MASK"):
+        assert loop_mod._pin_env("cuda", [1, 2], env={var: ""}) ==             {"CUDA_VISIBLE_DEVICES": "1,2"}
+
+
+def test_pin_env_composes_rocm_through_either_variable_name():
+    """A ROCm box may carry the restriction under HIP's name or CUDA's; both
+    resolve, and both names are written on the way out (a PyTorch ROCm build
+    answers to either)."""
+    assert loop_mod._pin_env("rocm", [1], env={"HIP_VISIBLE_DEVICES": "8,9"}) ==         {"HIP_VISIBLE_DEVICES": "9", "CUDA_VISIBLE_DEVICES": "9"}
+    assert loop_mod._pin_env("rocm", [1], env={"CUDA_VISIBLE_DEVICES": "8,9"}) ==         {"HIP_VISIBLE_DEVICES": "9", "CUDA_VISIBLE_DEVICES": "9"}
+
+
+def test_pin_env_composes_xpu_through_ze_affinity_mask():
+    assert loop_mod._pin_env("xpu", [1], env={"ZE_AFFINITY_MASK": "2,3"}) ==         {"ZE_AFFINITY_MASK": "3"}
 
 
 def test_slot_count_defaults_to_one_with_no_devices_reported(tmp_path):

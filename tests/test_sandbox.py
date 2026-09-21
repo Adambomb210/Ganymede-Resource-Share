@@ -231,14 +231,17 @@ def test_an_explicit_empty_override_withholds_gpus_even_with_devices(config):
     ("cpu", [0, 1], []),  # GANYMEDE_CPU_SLOTS > 1: no real core mapping to pin to.
 ])
 def test_device_argv_matches_docs_14s_table(backend, indices, expected):
-    assert sandbox.device_argv(backend, indices) == expected
+    # ``env={}``: these assert the *table*, and a developer with an ambient
+    # CUDA_VISIBLE_DEVICES set should not see them fail. The composition that
+    # variable triggers is tested separately below.
+    assert sandbox.device_argv(backend, indices, env={}) == expected
 
 
 def test_device_argv_is_a_noop_with_nothing_to_pin():
     """Unreachable for a real lease (``devices.allocate`` raises on
     ``count <= 0``), but reachable from a payload built before docs/14 landed
     -- must not invent a pin for a device that was never named."""
-    assert sandbox.device_argv("cuda", []) == []
+    assert sandbox.device_argv("cuda", [], env={}) == []
 
 
 def test_device_argv_refuses_mps_with_a_device_to_pin():
@@ -710,3 +713,51 @@ def test_a_named_device_on_an_unpinnable_backend_still_refuses(job):
     double-book a card already promised to another lease."""
     with pytest.raises(sandbox.SandboxError):
         job.run_argv("img", backend="mps", devices=[0])
+
+
+# --------------------------------------------------------------------------
+# A visibility restriction already on the worker (docs/14 §2, review-added)
+# --------------------------------------------------------------------------
+
+
+def test_device_argv_composes_through_an_ambient_cuda_restriction():
+    """The NVIDIA container runtime addresses cards by absolute physical index
+    and does not inherit the worker's own ``CUDA_VISIBLE_DEVICES``.
+
+    A worker launched restricted to ``4,5,6,7`` reports its cards to the
+    coordinator as local indices 0-3 (``probe.run_probe`` enumerates whatever
+    torch can see). Writing a lease's local ``[2]`` straight into
+    ``--gpus device=`` would hand the container physical card 2 -- one
+    deliberately withheld from Ganymede -- instead of card 6.
+    """
+    env = {"CUDA_VISIBLE_DEVICES": "4,5,6,7"}
+    assert sandbox.device_argv("cuda", [2], env=env) == ["--gpus", '"device=6"']
+    assert sandbox.device_argv("cuda", [0, 3], env=env) == ["--gpus", '"device=4,7"']
+
+
+def test_device_argv_composes_a_uuid_valued_ambient_list():
+    """``--gpus device=`` accepts a UUID wherever it accepts an index, so a
+    UUID-valued restriction composes through unchanged."""
+    env = {"CUDA_VISIBLE_DEVICES": "GPU-aaa,GPU-bbb"}
+    assert sandbox.device_argv("cuda", [1], env=env) == ["--gpus", '"device=GPU-bbb"']
+
+
+def test_device_argv_refuses_a_local_index_the_ambient_list_cannot_resolve():
+    """Refuse, rather than hand the container a card this lease does not hold
+    -- the same answer this function already gives an unpinnable backend."""
+    assert sandbox.device_argv("cuda", [4], env={"CUDA_VISIBLE_DEVICES": "4,5"}) is None
+
+
+def test_device_argv_is_unchanged_when_nothing_is_ambient():
+    """The ordinary deployment, byte for byte."""
+    assert sandbox.device_argv("cuda", [0, 2], env={"CUDA_VISIBLE_DEVICES": ""}) ==         ["--gpus", '"device=0,2"']
+
+
+def test_the_in_process_and_container_pins_share_one_translation():
+    """``loop._pin_env`` and ``device_argv`` must not drift: both resolve a
+    lease's local indices through the same ``compose_visible``."""
+    from ganymede.worker import loop as loop_mod
+
+    env = {"CUDA_VISIBLE_DEVICES": "4,5,6,7"}
+    assert loop_mod._pin_env("cuda", [2], env=env)["CUDA_VISIBLE_DEVICES"] == "6"
+    assert sandbox.device_argv("cuda", [2], env=env) == ["--gpus", '"device=6"']
